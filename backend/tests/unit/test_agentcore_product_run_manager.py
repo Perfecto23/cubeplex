@@ -190,6 +190,41 @@ async def test_worker_cancel_returns_after_native_task_without_dispatch_wait(
 
 
 @pytest.mark.asyncio
+async def test_sandbox_stop_unknown_cas_loss_keeps_unknown_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis, agentcore_worker=True)
+    manager._stop_unknown_runs.clear()
+    dispatch = SimpleNamespace(id="d1", run_id="r1")
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_run",
+        AsyncMock(return_value=dispatch),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.mark_dispatch_stop_unknown",
+        AsyncMock(return_value=False),
+    )
+    session = MagicMock()
+    session.get = AsyncMock(return_value=SimpleNamespace(status="stop_unknown"))
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    import importlib
+
+    db_engine = importlib.import_module("cubeplex.db.engine")
+    monkeypatch.setattr(db_engine, "async_session_maker", MagicMock(return_value=session))
+
+    await manager._mark_sandbox_stop_unknown(
+        run_id="r1",
+        conversation_id="c1",
+        error=RuntimeError("unknown"),
+    )
+
+    assert "r1" in manager._stop_unknown_runs
+    session.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_worker_cancel_ack_waits_for_finished_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

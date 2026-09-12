@@ -278,7 +278,22 @@ class AgentCoreWorker:
             # Persist the worker terminal state before stopping the RunManager
             # control listeners.  A listener may be waiting for cancel_run;
             # that wait must never be the prerequisite for this transition.
-            await mark_dispatch_finished(self._session_maker, dispatch_id=dispatch.id)
+            finished = await mark_dispatch_finished(
+                self._session_maker,
+                dispatch_id=dispatch.id,
+            )
+            if not finished:
+                async with self._session_maker() as latest_session:
+                    latest = await latest_session.get(
+                        AgentCoreDispatch,
+                        dispatch.id,
+                    )
+                if latest is not None and latest.status == "stop_unknown":
+                    return WorkerInvocationResult(
+                        dispatch_id=dispatch.id,
+                        status="stop_unknown",
+                        error_code="stop_unknown",
+                    )
             await self._publish_confirmed_cancel_ack(manager, dispatch)
             return WorkerInvocationResult(dispatch_id=dispatch.id, status="finished")
         except asyncio.CancelledError:
@@ -290,11 +305,23 @@ class AgentCoreWorker:
                 async with self._session_maker() as session:
                     row = await session.get(AgentCoreDispatch, dispatch.id)
                     if row is not None and row.stop_requested:
-                        await mark_dispatch_finished(
+                        finished = await mark_dispatch_finished(
                             self._session_maker,
                             dispatch_id=dispatch.id,
                             error_code="cancelled",
                         )
+                        if not finished:
+                            async with self._session_maker() as latest_session:
+                                latest = await latest_session.get(
+                                    AgentCoreDispatch,
+                                    dispatch.id,
+                                )
+                            if latest is not None and latest.status == "stop_unknown":
+                                return WorkerInvocationResult(
+                                    dispatch_id=dispatch.id,
+                                    status="stop_unknown",
+                                    error_code="stop_unknown",
+                                )
                         await self._publish_confirmed_cancel_ack(manager, dispatch)
                         return WorkerInvocationResult(
                             dispatch_id=dispatch.id,
@@ -303,11 +330,20 @@ class AgentCoreWorker:
                         )
             raise
         except AgentCoreStopUnknown:
-            await mark_dispatch_stop_unknown(
+            fenced = await mark_dispatch_stop_unknown(
                 self._session_maker,
                 dispatch_id=dispatch.id,
                 error_message="native sandbox command teardown is unconfirmed",
             )
+            if not fenced:
+                async with self._session_maker() as session:
+                    latest = await session.get(AgentCoreDispatch, dispatch.id)
+                if latest is not None and latest.status == "finished":
+                    return WorkerInvocationResult(
+                        dispatch_id=dispatch.id,
+                        status="finished",
+                        error_code=latest.error_code,
+                    )
             return WorkerInvocationResult(
                 dispatch_id=dispatch.id,
                 status="stop_unknown",
@@ -325,12 +361,21 @@ class AgentCoreWorker:
             if not execution_started:
                 await self._fail_native_run(dispatch, "worker_start_failed")
             with suppress(Exception):
-                await mark_dispatch_finished(
+                finished = await mark_dispatch_finished(
                     self._session_maker,
                     dispatch_id=dispatch.id,
                     error_code="worker_execution_failed",
                     error_message=type(exc).__name__,
                 )
+                if not finished:
+                    async with self._session_maker() as session:
+                        latest = await session.get(AgentCoreDispatch, dispatch.id)
+                    if latest is not None and latest.status == "stop_unknown":
+                        return WorkerInvocationResult(
+                            dispatch_id=dispatch.id,
+                            status="stop_unknown",
+                            error_code="stop_unknown",
+                        )
             return WorkerInvocationResult(
                 dispatch_id=dispatch.id,
                 status="finished",

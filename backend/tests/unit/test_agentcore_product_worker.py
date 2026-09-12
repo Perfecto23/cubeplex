@@ -100,6 +100,10 @@ async def test_claimed_worker_validates_native_scope_before_manager(
         "_validate_native_scope",
         AsyncMock(side_effect=DispatchValidationError("scope mismatch")),
     )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.worker.mark_dispatch_finished",
+        AsyncMock(),
+    )
     with pytest.raises(Exception, match="scope mismatch"):
         await worker.invoke(
             invocation_payload(dispatch.id),
@@ -286,9 +290,10 @@ async def test_cancel_during_sandbox_provision_persists_before_listener_stop(
     terminal_persisted = asyncio.Event()
     listeners_stopped = asyncio.Event()
 
-    async def mark_finished_side_effect(*_args: object, **_kwargs: object) -> None:
+    async def mark_finished_side_effect(*_args: object, **_kwargs: object) -> bool:
         row.status = "finished"
         terminal_persisted.set()
+        return True
 
     mark_finished = AsyncMock(side_effect=mark_finished_side_effect)
     monkeypatch.setattr(
@@ -336,6 +341,7 @@ async def test_cancel_during_sandbox_provision_persists_before_listener_stop(
     execution = asyncio.create_task(worker._execute_claimed(dispatch))
     await native_started.wait()
     row.stop_requested = True
+    await manager.cancel_run(dispatch.run_id)
     result = await execution
 
     assert native_cancelled.is_set()

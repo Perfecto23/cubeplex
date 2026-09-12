@@ -1307,11 +1307,13 @@ class RunManager:
             current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
             if current is None:
                 return
-            await mark_dispatch_stop_unknown(
+            fenced = await mark_dispatch_stop_unknown(
                 async_session_maker,
                 dispatch_id=current.id,
                 error_message="invoke outcome remained unconfirmed",
             )
+            if not fenced:
+                return
             message = "Remote execution teardown could not be confirmed; new work is blocked."
             with suppress(Exception):
                 await update_run_meta(
@@ -1380,23 +1382,41 @@ class RunManager:
         error: BaseException,
     ) -> None:
         """Fence a run whose sandbox command termination is unconfirmed."""
-        self._stop_unknown_runs.add(run_id)
         state = getattr(getattr(self, "_app", None), "state", None)
         if getattr(state, "agentcore_worker", None) is not True:
+            self._stop_unknown_runs.add(run_id)
             return
         from cubeplex.agentcore.dispatch import (
             active_dispatch_for_run,
+            latest_dispatch_for_run,
             mark_dispatch_stop_unknown,
         )
         from cubeplex.db.engine import async_session_maker
 
         dispatch = await active_dispatch_for_run(async_session_maker, run_id=run_id)
-        if dispatch is not None:
-            await mark_dispatch_stop_unknown(
-                async_session_maker,
-                dispatch_id=dispatch.id,
-                error_message=f"sandbox command teardown unknown: {type(error).__name__}",
-            )
+        if dispatch is None:
+            latest = await latest_dispatch_for_run(async_session_maker, run_id=run_id)
+            if latest is not None and latest.status == "finished":
+                self._stop_unknown_runs.discard(run_id)
+                return
+            self._stop_unknown_runs.add(run_id)
+            return
+        fenced = await mark_dispatch_stop_unknown(
+            async_session_maker,
+            dispatch_id=dispatch.id,
+            error_message=f"sandbox command teardown unknown: {type(error).__name__}",
+        )
+        if fenced:
+            self._stop_unknown_runs.add(run_id)
+        else:
+            from cubeplex.models.agentcore_dispatch import AgentCoreDispatch
+
+            async with async_session_maker() as session:
+                latest = await session.get(AgentCoreDispatch, dispatch.id)
+            if latest is not None and latest.status == "finished":
+                self._stop_unknown_runs.discard(run_id)
+            else:
+                self._stop_unknown_runs.add(run_id)
 
     @staticmethod
     def _context_from_remote_request(request: dict[str, Any]) -> RunContext:
@@ -2057,22 +2077,28 @@ class RunManager:
                             return "cancelled"
                         if getattr(current, "status", None) == "stop_unknown":
                             return "stop_unknown"
-                    await mark_dispatch_stop_unknown(
+                    fenced = await mark_dispatch_stop_unknown(
                         async_session_maker,
                         dispatch_id=remote.id,
                         error_message="remote teardown was not confirmed",
                     )
-                    return "stop_unknown"
+                    if fenced:
+                        return "stop_unknown"
+                    current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+                    return "cancelled" if current is None else "stop_unknown"
 
                 current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
                 if current is None:
                     return "cancelled"
-                await mark_dispatch_stop_unknown(
+                fenced = await mark_dispatch_stop_unknown(
                     async_session_maker,
                     dispatch_id=current.id,
                     error_message="remote cancel acknowledgement was not terminal",
                 )
-                return "stop_unknown"
+                if fenced:
+                    return "stop_unknown"
+                latest = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+                return "cancelled" if latest is None else "stop_unknown"
             finally:
                 waiters = self._ack_waiters.get(run_id)
                 if waiters and remote_fut in waiters:

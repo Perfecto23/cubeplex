@@ -287,20 +287,35 @@ async def mark_dispatch_finished(
     dispatch_id: UUID,
     error_code: str | None = None,
     error_message: str | None = None,
-) -> None:
+) -> bool:
     """Record worker terminal observation without manufacturing run success."""
     async with session_maker() as session:
+        finished_at = datetime.now(UTC)
+        result = await session.execute(
+            update(AgentCoreDispatch)
+            .where(
+                col(AgentCoreDispatch.id) == dispatch_id,
+                col(AgentCoreDispatch.status).in_(("created", "claimed")),
+            )
+            .values(
+                status="finished",
+                finished_at=finished_at,
+                heartbeat_at=finished_at,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            .returning(AgentCoreDispatch)
+        )
+        if result.scalar_one_or_none() is not None:
+            await session.commit()
+            return True
+        await session.rollback()
         row = await session.get(AgentCoreDispatch, dispatch_id)
         if row is None:
             raise DispatchValidationError("agentcore_dispatch_not_found")
-        if row.status == "stop_unknown":
-            return
-        row.status = "finished"
-        row.finished_at = datetime.now(UTC)
-        row.heartbeat_at = row.finished_at
-        row.error_code = error_code
-        row.error_message = error_message
+        _validate_status(row.status)
         await session.commit()
+        return False
 
 
 async def request_dispatch_stop(
@@ -328,18 +343,35 @@ async def mark_dispatch_stop_unknown(
     *,
     dispatch_id: UUID,
     error_message: str | None = None,
-) -> None:
+) -> bool:
     """Keep a stopped-but-unconfirmed dispatch blocking new work."""
     async with session_maker() as session:
+        heartbeat_at = datetime.now(UTC)
+        result = await session.execute(
+            update(AgentCoreDispatch)
+            .where(
+                col(AgentCoreDispatch.id) == dispatch_id,
+                col(AgentCoreDispatch.status).in_(("created", "claimed")),
+            )
+            .values(
+                status="stop_unknown",
+                stop_requested=True,
+                error_code="stop_unknown",
+                error_message=error_message,
+                heartbeat_at=heartbeat_at,
+            )
+            .returning(AgentCoreDispatch)
+        )
+        if result.scalar_one_or_none() is not None:
+            await session.commit()
+            return True
+        await session.rollback()
         row = await session.get(AgentCoreDispatch, dispatch_id)
         if row is None:
             raise DispatchValidationError("agentcore_dispatch_not_found")
-        row.status = "stop_unknown"
-        row.stop_requested = True
-        row.error_code = "stop_unknown"
-        row.error_message = error_message
-        row.heartbeat_at = datetime.now(UTC)
+        _validate_status(row.status)
         await session.commit()
+        return False
 
 
 async def active_dispatch_for_run(
