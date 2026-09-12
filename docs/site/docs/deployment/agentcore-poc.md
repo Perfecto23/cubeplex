@@ -5,65 +5,56 @@ title: AgentCore execution PoC
 
 # AgentCore execution PoC
 
-This experimental module runs the existing CubePlex agent factory and LLM builder inside an Amazon Bedrock AgentCore Runtime. A bounded local Slack controller invokes it and posts source-grounded results to the original thread.
+The `Perfecto23/cubeplex` fork adds an experimental AgentCore execution path on
+top of upstream `cubeplexai/cubeplex@f5272e19`. It reuses the real CubePlex agent
+factory and LLM builder with CubeLoop 0.14.1.
 
-This is a hosting proof of concept. It does not migrate the full CubePlex Backend, web UI, database, native IM delivery or durable conversation history. The test repository is public, so this experiment does not establish private GitHub authorization.
+A bounded local Python controller reads one authorized Slack test channel,
+invokes a custom ARM64 image hosted by AgentCore Runtime, and posts the answer
+as a bot in the original thread. The agent reads GitHub files through a small
+read-only API tool surface, fixing the source commit for each request.
 
-## Components
+The image is built locally with Docker and pushed to ECR. This PoC does not
+deploy Kubernetes Pods or the full CubePlex web application. The local
+controller and the AgentCore execution handler have separate responsibilities
+and credentials.
 
-- `backend/cubeplex/agentcore_poc/`: strict invocation contract, scope checks, commit-pinned repository reader, real CubePlex agent construction, AgentCore entrypoint and local Slack controller.
-- `deploy/agentcore-poc/`: independently locked dependencies, ARM64 Docker build and narrow testing-account deployment utilities.
-- `deploy/agentcore-poc/tests/`: focused contract and controller tests with external APIs replaced at their boundaries.
+## Run the fork
 
-The runtime has only two repository tools: list files and read a bounded UTF-8 excerpt. It cannot run shell commands, select another repository or write to GitHub. Each run pins the current default-branch commit and checks returned Git blob hashes.
+The maintained operator guide lives in the fork:
 
-## Local checks
+- [Configuration, local checks, deployment and Slack controller](https://github.com/Perfecto23/cubeplex/blob/feat/2026-09-12-agentcore-poc/deploy/agentcore-poc/README.md)
+- [Verification evidence and remaining limits](https://github.com/Perfecto23/cubeplex/blob/feat/2026-09-12-agentcore-poc/deploy/agentcore-poc/VERIFICATION.md)
 
-From the worktree root:
+From a checkout containing this change, local checks do not need AWS or Slack
+credentials:
 
 ```bash
 uv sync --project deploy/agentcore-poc --frozen
-PYTHONPATH=backend deploy/agentcore-poc/.venv/bin/python -m pytest -q deploy/agentcore-poc/tests
-deploy/agentcore-poc/.venv/bin/ruff check backend/cubeplex/agentcore_poc deploy/agentcore-poc
+PYTHONPATH=backend uv run --project deploy/agentcore-poc \
+  python -m pytest -q deploy/agentcore-poc/tests
 ```
 
-The isolated environment exists because this slice does not need the main application's database or sandbox services. The real CubePlex source is imported through `PYTHONPATH`; it is not replaced with a mock agent.
+The deployment helpers bind one testing target and reject other accounts or
+callers. Read the guide and target checks before creating resources. Existing
+deployments use readback and their saved operator state; they must not repeat
+the first-time foundation command.
 
-## Deployment boundary
+## Verified scope
 
-The checked-in target describes a single authorized testing environment. The management script verifies the AWS account and caller before changing resources. It creates only a scoped provider Secret, ECR repository, execution role and AgentCore Runtime. Existing-name collisions stop creation and require readback rather than destructive replacement.
+The real cloud and Slack path returned project and package information from
+`Perfecto23/corplink-rs`, with independently checked commit/blob evidence.
+Wrong-user and wrong-repository requests were denied, an extra command field
+was rejected, and unsigned Runtime calls returned HTTP 403. Duplicate polling
+did not create another execution record or bot reply.
 
-Provider values are read from a private operator file and transferred directly to Secrets Manager. Slack credentials stay in the controller's private local environment file. Neither credential set is placed in Git, image layers or invocation payloads. The runtime receives only the provider Secret ARN.
+The Runtime uses IAM inbound authentication, a scoped Provider Secret, a
+60-second idle timeout and a 900-second maximum compute lifetime. Test
+controllers exited and their known compute sessions were absent at the end of
+acceptance. The registered Runtime and supporting resources remain available
+for explicitly scoped follow-up work.
 
-Before deployment, run focused checks, review the source diff and create a local source commit. The build script requires the expected commit and clean build-source paths:
-
-```bash
-deploy/agentcore-poc/build.sh <expected-full-commit> --push
-deploy/agentcore-poc/.venv/bin/python deploy/agentcore-poc/manage.py runtime \
-  --image-uri <poc-ecr-repository@sha256:digest>
-deploy/agentcore-poc/.venv/bin/python deploy/agentcore-poc/manage.py readback
-```
-
-The first foundation creation is a separate operation. Do not repeat it after a partial or successful attempt. Inspect the protected operations journal and live resources first.
-
-## Slack acceptance
-
-The controller polls only the configured test channel, accepts only the configured user, ignores messages before its start timestamp, and requires the `cubeplex-poc:` prefix. It replies as the configured bot without modifying the Slack app's Events API URL or other relay deployment.
-
-```bash
-PYTHONPATH=backend deploy/agentcore-poc/.venv/bin/python \
-  -m cubeplex.agentcore_poc.controller \
-  --env-file <private-slack-env-file> \
-  --ledger <private-directory-outside-worktree>/ledger.sqlite \
-  --runtime-arn <deployed-runtime-arn> \
-  --start-ts <seconds.six-digit-fraction> \
-  --max-runs 1 --duration 600
-```
-
-Send an authorized test request as a channel root message. Discovery of new replies in existing threads is outside this slice. The controller's ledger prevents duplicate polling events from causing another invocation or reply. Unknown invocation outcomes are retained; unknown send outcomes are read back rather than resent.
-
-Verify the actual request, runtime result and bot reply independently. A successful reply must contain a nonempty answer, source commit and file evidence. Wrong actor/channel/repository and mismatched runtime-session inputs must be rejected. Runtime `READY`, `/ping`, or a mocked model response alone does not establish business acceptance.
-
-## Resource lifecycle
-
-The testing Runtime uses a short idle timeout and maximum lifetime. Stop finite local controllers after testing and verify session shutdown through the platform. ECR images, the provider Secret and role remain until an explicitly scoped cleanup; do not delete unrelated AgentCore resources.
+The repository used in acceptance is public. Full Web/RunManager integration,
+native Slack event delivery, private-repository authorization, durable
+conversations and browser migration remain outside this slice. The tested
+image has unresolved system-package scan findings and is not production-ready.

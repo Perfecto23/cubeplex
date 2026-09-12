@@ -1,0 +1,54 @@
+name: AgentCore PoC
+
+on:
+  pull_request:
+    paths:
+      - 'backend/cubeplex/agentcore_poc/**'
+      - 'backend/cubeplex/agents/graph.py'
+      - 'backend/cubeplex/middleware/_compose.py'
+      - 'backend/cubeplex/llm/**'
+      - 'deploy/agentcore-poc/**'
+      - '.github/workflows/agentcore-poc.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'backend/cubeplex/agentcore_poc/**'
+      - 'backend/cubeplex/agents/graph.py'
+      - 'backend/cubeplex/middleware/_compose.py'
+      - 'backend/cubeplex/llm/**'
+      - 'deploy/agentcore-poc/**'
+      - '.github/workflows/agentcore-poc.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentcore-poc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PYTHONPATH: backend
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_DEFAULT_REGION: us-west-2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.13'
+          enable-cache: true
+          prune-cache: false
+      - name: Install the independently locked PoC dependencies
+        run: uv sync --project deploy/agentcore-poc --frozen
+      - name: Check source and deployment helpers
+        run: |
+          uv run --project deploy/agentcore-poc ruff check backend/cubeplex/agentcore_poc deploy/agentcore-poc
+          uv run --project deploy/agentcore-poc ruff format --check backend/cubeplex/agentcore_poc deploy/agentcore-poc
+          bash -n deploy/agentcore-poc/build.sh
+      - name: Test contracts without cloud, model or Slack credentials
+        run: uv run --project deploy/agentcore-poc python -m pytest -q deploy/agentcore-poc/tests

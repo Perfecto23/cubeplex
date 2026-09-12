@@ -6,9 +6,11 @@ Architecture: A local bounded controller validates and records a Slack request, 
 
 Tech stack: Python, CubeLoop 0.14.1, CubePlex agent factory/LLM builder, Bedrock AgentCore Python SDK, boto3, HTTP GitHub API, Slack Web API, SQLite controller ledger, uv and Docker.
 
+The scoped implementation and real cloud/Slack acceptance are complete. Current commands and evidence are maintained in the [operator guide](../../../deploy/agentcore-poc/README.md) and [verification record](../../../deploy/agentcore-poc/VERIFICATION.md).
+
 ## 1. Execution contract and agent
 
-Owner: runtime implementation subagent.
+Responsibility: execution request validation, model/tool loop and source evidence.
 
 Files: `backend/cubeplex/agentcore_poc/{__init__,contracts,github,agent,runtime}.py` and focused runtime tests under `deploy/agentcore-poc/tests/`.
 
@@ -20,11 +22,11 @@ Verification: invalid scope/URL/path rejection, commit pinning, non-completed mo
 
 ## 2. Slack controller
 
-Owner: Slack implementation subagent.
+Responsibility: Slack ingress, local execution ledger and result delivery.
 
 Files: `backend/cubeplex/agentcore_poc/{controller,slack}.py` and focused controller tests under `deploy/agentcore-poc/tests/`.
 
-Interfaces: import the shared request/response/session contract; local CLI takes the exact runtime target and explicit AWS profile/region, authorized Slack env path, ledger path, time window and finite run/duration limits.
+Interfaces: import the shared request/response/session contract; local CLI takes the exact Runtime ARN, authorized Slack env path, ledger path, time window and finite run/duration limits. The AWS profile, region and account are fixed by the PoC target checks.
 
 Logic: poll only the allowlisted channel, accept the authorized sender/prefix/time window, exclude bot output, claim the event once, invoke with SigV4, and send the result to the original thread. Persist unknown outcomes and require readback rather than blind retries.
 
@@ -32,7 +34,7 @@ Verification: duplicate events, wrong actor/channel/time/prefix, exact thread re
 
 ## 3. Build and deployment
 
-Owner: build/deploy subagent; primary agent verifies the exact resource plan and final readback.
+Responsibility: artifact construction, scoped AWS resources and independent deployment readback.
 
 Files: `deploy/agentcore-poc/` with an independent uv project/lock, Dockerfile and narrow deploy/readback utilities. Machine state and credentials stay outside Git.
 
@@ -42,7 +44,7 @@ Verification: clean dependency import, local container entrypoint, image digest/
 
 ## 4. Integrated acceptance
 
-Owner: primary agent.
+Responsibility: independent source, cloud and Slack business verification.
 
 Read the test repository independently to establish expected source facts. Run direct positive and negative invocations, then send a clearly marked test request as the authorized user to the allowlisted Slack channel. Run the finite controller and verify the bot reply, source SHA and file evidence by independent API reads. Report hosting success separately from native IM/full-product migration and private-repository access.
 

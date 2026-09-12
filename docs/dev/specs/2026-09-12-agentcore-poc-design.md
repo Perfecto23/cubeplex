@@ -4,6 +4,8 @@
 
 Prove that a real Slack request can execute through CubePlex's existing agent factory on Amazon Bedrock AgentCore and return a source-grounded answer to the same Slack thread.
 
+The scoped path has been implemented and exercised. See the [operator guide](../../../deploy/agentcore-poc/README.md) for current commands and the [verification record](../../../deploy/agentcore-poc/VERIFICATION.md) for tested source/artifact versions and remaining limits.
+
 ## Context and chosen scope
 
 CubePlex currently starts CubeLoop runs in its Backend process. This PoC adds an independently runnable execution module to the CubePlex fork. It reuses `cubeplex.agents.graph.create_cubeplex_agent` and the existing LLM builder, while avoiding the full application's database, onboarding and OpenSandbox dependencies for the first hosting experiment.
@@ -22,7 +24,7 @@ The supplied `Perfecto23/corplink-rs` repository is public as verified on 2026-0
 
 The controller produces a strict versioned request with `schema_version`, `run_id`, `team_id`, `channel_id`, `thread_ts`, `user_id`, `prompt`, and `repository`. Unknown fields are rejected. The runtime independently checks configured team, channel, user and repository allowlists. Runtime session identity is derived from the trusted team/channel/thread/user scope and checked against the AgentCore SDK context.
 
-The first scope is one workspace, one channel, one user and `Perfecto23/corplink-rs`. The source tool resolves the repository's current default-branch commit at run start, then reads files at that commit. Tools do not accept arbitrary repositories, URLs, refs or shell commands. Requests are limited to 240 seconds, eight tool calls and a maximum output of 4096 tokens.
+The first scope is one Slack workspace, one channel, one user and `Perfecto23/corplink-rs`. The source tool resolves the repository's current default-branch commit at run start, then reads files at that commit. Tools do not accept arbitrary repositories, URLs, refs or shell commands. Requests are limited to 240 seconds, eight tool calls and a maximum output of 4096 tokens.
 
 Responses carry an explicit status, run/session identity, answer, repository commit and file evidence. Only a completed model turn with usable evidence can be reported as success. Transport errors, incomplete provider responses, rejection, cancellation and timeouts are separate outcomes; raw credential-bearing exceptions are never returned.
 

@@ -48,7 +48,6 @@ def load_provider_secret() -> ProviderSecret:
         client.close()
 
 
-@app.entrypoint
 async def invoke(payload: Any, context: RequestContext) -> dict[str, Any]:
     session_id = context.session_id or ""
     try:
@@ -87,6 +86,9 @@ async def invoke(payload: Any, context: RequestContext) -> dict[str, Any]:
             repository=request.repository,
             error_code="runtime_failed",
         ).model_dump()
+
+
+app.entrypoint(invoke)
 
 
 def main() -> None:

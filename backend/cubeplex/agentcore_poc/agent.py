@@ -92,8 +92,8 @@ def build_model(secret: ProviderSecret) -> Any:
                 id=secret.model,
                 name=secret.model,
                 reasoning=True,
-                context_window=200_000,
-                max_tokens=4096,
+                contextWindow=200_000,
+                maxTokens=4096,
             )
         ],
     )

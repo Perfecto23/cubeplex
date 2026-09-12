@@ -1,3 +1,55 @@
+# CubePlex × AgentCore
+
+这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的实验性 fork，起点为上游 `f5272e1901d0c0c785bdc2381da94951726da601`（版本标识 `0.7.2`）。上游的产品与版权归属保持不变；本 fork 增加了一个 **Amazon Bedrock AgentCore 执行 PoC**，验证能否保留 CubePlex 的 Agent 构造逻辑，把计算放到按需分配的云端运行环境。
+
+## 这个 fork 改了什么
+
+已经跑通的路径是：
+
+```text
+Slack 测试频道中的请求
+  → 本地 Python 控制器读取消息并检查权限
+  → AgentCore 启动自制 ARM64 Runtime 镜像
+  → 真实 CubePlex factory / LLM builder / CubeLoop 调用模型
+  → 只读工具从 GitHub 获取固定 commit 的代码片段
+  → 本地控制器以 Bot 身份回复原 thread
+```
+
+本轮没有部署 Kubernetes Pod。镜像在本地 Docker 构建，推送到 ECR，由 AgentCore Runtime 承载。Slack 控制器是有运行时限的本地进程；聊天历史去重记录保存在本地 SQLite，Provider key 保存在 AWS Secrets Manager。
+
+| 本 fork 增加的能力 | 当前边界 |
+|---|---|
+| AgentCore HTTP entrypoint 与真实 CubePlex Agent 构造 | 独立 PoC 模块；完整 Web / Backend RunManager 仍沿用上游实现 |
+| GitHub 只读工具、commit/blob 校验与行号证据 | 本轮固定 `Perfecto23/corplink-rs`；该仓库公开，不证明私库授权 |
+| Slack polling、Bot 回帖与持久去重 | 限定测试用户、频道、前缀和时间窗；只发现新 root 消息 |
+| 本地构建、ECR digest、最小执行角色和部署 readback | 单个 Testing Runtime；不创建 EC2、Kubernetes、Browser 或数据库 |
+| 严格请求合同、工具预算、模型完成状态检查 | 拒绝其他仓库、任意 URL / shell、错误身份和未完成的模型结果 |
+
+58 项 focused tests 和真实云端、Slack 业务链路已验证。实际部署镜像仍有未解决的系统包扫描发现；这是可复现的 PoC，不是生产迁移完成的声明。源码、镜像及验收边界见[验证记录](deploy/agentcore-poc/VERIFICATION.md)。
+
+## 如何运行
+
+在包含本 PR 的 checkout / worktree 根目录执行：
+
+```bash
+uv sync --project deploy/agentcore-poc --frozen
+PYTHONPATH=backend uv run --project deploy/agentcore-poc \
+  python -m pytest -q deploy/agentcore-poc/tests
+```
+
+随后按照[AgentCore PoC 运行指南](deploy/agentcore-poc/README.md)配置 Provider、核对已绑定的测试环境、部署镜像并启动有限时长的 Slack 控制器。指南分别说明“使用已有 Runtime”和“首次创建环境”，后者会创建收费资源，不应在已有环境上重复执行。
+
+| 阅读目的 | 入口 |
+|---|---|
+| 配置、构建、部署、启动和停止 | [运行指南](deploy/agentcore-poc/README.md) |
+| 真实验证结果与仍未覆盖的能力 | [验证记录](deploy/agentcore-poc/VERIFICATION.md) |
+| 本次设计与实现范围 | [设计](docs/dev/specs/2026-09-12-agentcore-poc-design.md) · [实现计划](docs/dev/plans/2026-09-12-agentcore-poc.md) |
+| 完整 CubePlex 产品的 Docker / Kubernetes 部署 | [上游部署入口](deploy/README.md) |
+
+## 上游 CubePlex
+
+以下保留上游的产品介绍、演示和文档入口。这些描述属于完整 CubePlex 产品；本 fork 的 AgentCore 改造范围以上文和 PoC 运行指南为准。
+
 <p align="center">
   <picture>
     <source
