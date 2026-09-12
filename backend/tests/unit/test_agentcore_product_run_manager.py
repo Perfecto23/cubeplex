@@ -123,6 +123,32 @@ async def test_remote_cancel_ack_with_active_dispatch_is_stop_unknown(
 
 
 @pytest.mark.asyncio
+async def test_remote_cancel_reads_terminal_dispatch_before_runtime_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis)
+    monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
+    remote = SimpleNamespace(id="d1", run_id="r1", status="claimed")
+    stop = AsyncMock()
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_run",
+        AsyncMock(side_effect=[remote, None]),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.request_dispatch_stop",
+        AsyncMock(return_value=[remote]),
+    )
+    monkeypatch.setattr(manager, "_publish_control", AsyncMock(side_effect=TimeoutError()))
+    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(stop=stop))
+
+    result = await manager.dispatch_cancel("r1", ack_timeout=0.1)
+
+    assert result == "cancelled"
+    stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_remote_api_control_does_not_cancel_proxy_or_ack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -145,21 +171,22 @@ async def test_remote_api_control_does_not_cancel_proxy_or_ack(
 
 
 @pytest.mark.asyncio
-async def test_worker_cancel_ack_requires_durable_dispatch_terminal_state(
+async def test_worker_cancel_returns_after_native_task_without_dispatch_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     manager = _manager(redis, agentcore_worker=True)
     manager._tasks["r1"] = asyncio.create_task(asyncio.sleep(10))
-    manager._FORCED_CANCEL_WAIT_SECONDS = 0.1
+    readback = AsyncMock(return_value=SimpleNamespace(status="stop_unknown"))
     monkeypatch.setattr(
         "cubeplex.agentcore.dispatch.active_dispatch_for_run",
-        AsyncMock(return_value=SimpleNamespace(status="stop_unknown")),
+        readback,
     )
 
     result = await manager.cancel_run("r1")
 
-    assert result is False
+    assert result is True
+    readback.assert_not_awaited()
 
 
 @pytest.mark.asyncio

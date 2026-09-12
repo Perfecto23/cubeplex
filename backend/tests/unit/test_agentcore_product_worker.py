@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -229,3 +231,114 @@ async def test_stop_requested_before_execution_is_cancelled_without_worker_error
     assert result.error_code == "cancelled"
     cancel_native.assert_awaited_once_with(dispatch)
     fail_native.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,should_ack", [("finished", True), ("stop_unknown", False)])
+async def test_worker_cancel_ack_is_gated_by_durable_dispatch(
+    status: str,
+    should_ack: bool,
+) -> None:
+    dispatch = _dispatch(status="claimed")
+    worker = AgentCoreWorker(
+        session_maker=MagicMock(),
+        redis=MagicMock(),
+        redis_key_prefix="p",
+        manager_factory=AsyncMock(),
+    )
+    session = MagicMock()
+    session.get = AsyncMock(
+        return_value=SimpleNamespace(
+            status=status,
+            stop_requested=True,
+        )
+    )
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    worker._session_maker = MagicMock(return_value=session)
+    publish_ack = AsyncMock()
+
+    await worker._publish_confirmed_cancel_ack(
+        SimpleNamespace(_publish_ack=publish_ack),
+        dispatch,
+    )
+
+    if should_ack:
+        publish_ack.assert_awaited_once_with(dispatch.run_id)
+    else:
+        publish_ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_sandbox_provision_persists_before_listener_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatch = _dispatch(status="claimed")
+    row = SimpleNamespace(stop_requested=False, status="claimed")
+    session = MagicMock()
+    session.get = AsyncMock(side_effect=lambda *_args: row)
+    session.commit = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session_maker = MagicMock(return_value=session)
+    native_started = asyncio.Event()
+    native_cancelled = asyncio.Event()
+    terminal_persisted = asyncio.Event()
+    listeners_stopped = asyncio.Event()
+
+    async def mark_finished_side_effect(*_args: object, **_kwargs: object) -> None:
+        row.status = "finished"
+        terminal_persisted.set()
+
+    mark_finished = AsyncMock(side_effect=mark_finished_side_effect)
+    monkeypatch.setattr(
+        "cubeplex.agentcore.worker.mark_dispatch_finished",
+        mark_finished,
+    )
+
+    class ProvisioningManager:
+        native_task: asyncio.Task[None] | None = None
+
+        async def start_control_listeners(self) -> None:
+            return
+
+        async def stop_control_listeners(self) -> None:
+            assert terminal_persisted.is_set()
+            listeners_stopped.set()
+
+        async def execute_agentcore_dispatch(self, _dispatch: AgentCoreDispatch) -> None:
+            type(self).native_task = asyncio.current_task()
+            native_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                native_cancelled.set()
+                raise
+
+        async def cancel_run(self, _run_id: str) -> bool:
+            assert self.native_task is not None
+            self.native_task.cancel()
+            return True
+
+        async def _publish_ack(self, _run_id: str) -> None:
+            assert terminal_persisted.is_set()
+            listeners_stopped.set()
+
+    manager = ProvisioningManager()
+    worker = AgentCoreWorker(
+        session_maker=session_maker,
+        redis=MagicMock(),
+        redis_key_prefix="p",
+        manager_factory=AsyncMock(return_value=manager),
+        heartbeat_seconds=60,
+    )
+
+    execution = asyncio.create_task(worker._execute_claimed(dispatch))
+    await native_started.wait()
+    row.stop_requested = True
+    result = await execution
+
+    assert native_cancelled.is_set()
+    assert result.error_code == "cancelled"
+    assert listeners_stopped.is_set()
+    mark_finished.assert_awaited_once()

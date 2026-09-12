@@ -1713,32 +1713,13 @@ class RunManager:
             await task
         state = getattr(getattr(self, "_app", None), "state", None)
         if getattr(state, "agentcore_worker", None) is True:
-            return await self._wait_for_agentcore_cancel(run_id)
+            # The AgentCore worker persists the dispatch terminal state after
+            # this native task exits. Waiting for that row here deadlocks the
+            # worker: the outer dispatch cannot persist while this control
+            # listener is waiting for the same persistence. The worker emits
+            # the ACK after its durable transition instead.
+            return True
         return True
-
-    async def _wait_for_agentcore_cancel(self, run_id: str) -> bool:
-        """ACK a worker cancel only after durable dispatch teardown is known."""
-        from cubeplex.agentcore.dispatch import active_dispatch_for_run
-        from cubeplex.db.engine import async_session_maker
-
-        deadline = asyncio.get_running_loop().time() + self._FORCED_CANCEL_WAIT_SECONDS
-        while True:
-            try:
-                dispatch = await active_dispatch_for_run(async_session_maker, run_id=run_id)
-            except Exception as exc:
-                logger.warning(
-                    "AgentCore cancel readback failed for run {}: {}",
-                    run_id,
-                    type(exc).__name__,
-                )
-                return False
-            if dispatch is None:
-                return True
-            if dispatch.status == "stop_unknown":
-                return False
-            if asyncio.get_running_loop().time() >= deadline:
-                return False
-            await asyncio.sleep(0.05)
 
     async def steer_run(self, run_id: str, content: str) -> bool:
         """Inject a steering message into a live run's agent.
@@ -2037,8 +2018,29 @@ class RunManager:
                     await self._publish_control(run_id, "cancel")
                     await asyncio.wait_for(remote_fut, timeout=ack_timeout)
                 except TimeoutError:
-                    # The API process cannot prove that the worker exited from
-                    # a Redis publish alone. Ask AgentCore for bounded session
+                    # Give the worker a bounded grace window to cancel a
+                    # native task that may still be provisioning a sandbox.
+                    # Read the durable row before killing the Runtime session;
+                    # otherwise StopRuntimeSession can race the worker's
+                    # terminal dispatch write and manufacture stop_unknown.
+                    grace_seconds = min(
+                        max(ack_timeout, 0.0),
+                        self._FORCED_CANCEL_WAIT_SECONDS,
+                    )
+                    grace_deadline = asyncio.get_running_loop().time() + grace_seconds
+                    while asyncio.get_running_loop().time() < grace_deadline:
+                        current = await active_dispatch_for_run(
+                            async_session_maker,
+                            run_id=run_id,
+                        )
+                        if current is None:
+                            return "cancelled"
+                        if getattr(current, "status", None) == "stop_unknown":
+                            return "stop_unknown"
+                        await asyncio.sleep(0.1)
+
+                    # The API process still cannot prove that the worker exited
+                    # from Redis alone. Ask AgentCore for bounded session
                     # teardown, then read the durable dispatch state back.
                     with suppress(Exception):
                         await asyncio.wait_for(
@@ -2053,6 +2055,8 @@ class RunManager:
                         )
                         if current is None:
                             return "cancelled"
+                        if getattr(current, "status", None) == "stop_unknown":
+                            return "stop_unknown"
                     await mark_dispatch_stop_unknown(
                         async_session_maker,
                         dispatch_id=remote.id,
@@ -2108,7 +2112,9 @@ class RunManager:
                 return
             if run_id in self._tasks:
                 if await self.cancel_run(run_id):
-                    await self._publish_ack(run_id)
+                    state = getattr(getattr(self, "_app", None), "state", None)
+                    if getattr(state, "agentcore_worker", None) is not True:
+                        await self._publish_ack(run_id)
         elif type_ == "steer":
             agent = self._agents.get(run_id)
             if agent is not None:

@@ -244,6 +244,10 @@ class AgentCoreWorker:
     async def _execute_claimed(self, dispatch: AgentCoreDispatch) -> WorkerInvocationResult:
         """Run a previously prepared dispatch and persist its terminal state."""
         execution_started = False
+        manager: Any | None = None
+        stop_controls: Any | None = None
+        stop_watcher: asyncio.Task[Any] | None = None
+        heartbeat: asyncio.Task[Any] | None = None
         try:
             manager_value = self._manager_factory(dispatch)
             manager = await manager_value if inspect.isawaitable(manager_value) else manager_value
@@ -270,18 +274,12 @@ class AgentCoreWorker:
                 ),
                 name=f"agentcore-heartbeat:{dispatch.id}",
             )
-            try:
-                await execution
-            finally:
-                for task in (stop_watcher, heartbeat):
-                    task.cancel()
-                for task in (stop_watcher, heartbeat):
-                    with suppress(asyncio.CancelledError):
-                        await task
-                if callable(stop_controls):
-                    await stop_controls()
-
+            await execution
+            # Persist the worker terminal state before stopping the RunManager
+            # control listeners.  A listener may be waiting for cancel_run;
+            # that wait must never be the prerequisite for this transition.
             await mark_dispatch_finished(self._session_maker, dispatch_id=dispatch.id)
+            await self._publish_confirmed_cancel_ack(manager, dispatch)
             return WorkerInvocationResult(dispatch_id=dispatch.id, status="finished")
         except asyncio.CancelledError:
             # A control-plane stop cancels the native RunManager task.  Turn
@@ -297,6 +295,7 @@ class AgentCoreWorker:
                             dispatch_id=dispatch.id,
                             error_code="cancelled",
                         )
+                        await self._publish_confirmed_cancel_ack(manager, dispatch)
                         return WorkerInvocationResult(
                             dispatch_id=dispatch.id,
                             status="finished",
@@ -337,6 +336,40 @@ class AgentCoreWorker:
                 status="finished",
                 error_code="worker_execution_failed",
             )
+        finally:
+            for task in (stop_watcher, heartbeat):
+                if task is not None:
+                    task.cancel()
+            for task in (stop_watcher, heartbeat):
+                if task is not None:
+                    with suppress(asyncio.CancelledError):
+                        await task
+            if callable(stop_controls):
+                # The durable dispatch has already been fenced above. Listener
+                # teardown is cleanup and must not delay or overwrite that
+                # terminal state if Redis is slow during shutdown.
+                with suppress(Exception):
+                    await stop_controls()
+
+    async def _publish_confirmed_cancel_ack(
+        self,
+        manager: Any,
+        dispatch: AgentCoreDispatch,
+    ) -> None:
+        """ACK only after a requested dispatch is durably ``finished``."""
+        try:
+            async with self._session_maker() as session:
+                row = await session.get(AgentCoreDispatch, dispatch.id)
+                if row is None or row.status != "finished" or not row.stop_requested:
+                    return
+            publish_ack = getattr(manager, "_publish_ack", None)
+            if callable(publish_ack):
+                await publish_ack(dispatch.run_id)
+        except Exception:
+            # A missing ACK is safe: the API falls back to Runtime stop and
+            # durable readback. Never turn a successful native stop into a
+            # second execution or a false terminal state here.
+            return
 
     async def _run_tracked(self, dispatch: AgentCoreDispatch, app: Any, task_id: int) -> None:
         """Keep native execution alive after the Runtime request completes."""
