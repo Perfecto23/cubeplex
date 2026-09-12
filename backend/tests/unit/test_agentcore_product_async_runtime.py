@@ -59,15 +59,22 @@ async def test_real_sdk_http_accept_survives_request_and_tracks_busy_until_done(
         AsyncMock(side_effect=[first_prepare, (None, duplicate)]),
     )
     started = threading.Event()
-    finished = threading.Event()
+    release = threading.Event()
+    cleaned = threading.Event()
     executions = 0
+    original_done = worker._background_task_done
+
+    def on_done(task: asyncio.Task[object]) -> None:
+        original_done(task)
+        cleaned.set()
+
+    monkeypatch.setattr(worker, "_background_task_done", on_done)
 
     async def execute(_: AgentCoreDispatch) -> WorkerInvocationResult:
         nonlocal executions
         executions += 1
         started.set()
-        await asyncio.sleep(0.15)
-        finished.set()
+        assert await asyncio.to_thread(release.wait, 5)
         return WorkerInvocationResult(dispatch_id=dispatch.id, status="finished")
 
     monkeypatch.setattr(worker, "_execute_claimed", execute)
@@ -85,24 +92,26 @@ async def test_real_sdk_http_accept_survives_request_and_tracks_busy_until_done(
             },
             json=payload,
         )
-        assert response.status_code == 200
-        assert response.json()["status"] == "accepted"
-        assert started.wait(timeout=1)
-        assert (await client.get("/ping")).json()["status"] == "HealthyBusy"
+        try:
+            assert response.status_code == 200
+            assert response.json()["status"] == "accepted"
+            assert await asyncio.to_thread(started.wait, 5)
+            assert (await client.get("/ping")).json()["status"] == "HealthyBusy"
 
-        duplicate_response = await client.post(
-            "/invocations",
-            headers={
-                "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": dispatch.session_id,
-            },
-            json=payload,
-        )
-        assert duplicate_response.json()["duplicate"] is True
-        assert duplicate_response.json()["status"] == "claimed"
-
-        # Closing the request context has already happened for both calls;
-        # completion is owned by the SDK worker-loop task instead.
-        assert await asyncio.to_thread(finished.wait, 1)
+            duplicate_response = await client.post(
+                "/invocations",
+                headers={
+                    "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": dispatch.session_id,
+                },
+                json=payload,
+            )
+            assert duplicate_response.json()["duplicate"] is True
+            assert duplicate_response.json()["status"] == "claimed"
+        finally:
+            # SDK health can become idle before the worker-loop done callback
+            # removes its strong reference. Synchronize on that real cleanup.
+            release.set()
+            assert await asyncio.to_thread(cleaned.wait, 5)
         assert (await client.get("/ping")).json()["status"] == "Healthy"
 
     assert executions == 1
