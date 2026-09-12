@@ -93,6 +93,7 @@ const sidebars: SidebarsConfig = {
         'deployment/docker-compose',
         'deployment/kubernetes',
         'deployment/backend-config',
+        'deployment/agentcore-product',
       ],
     },
     {

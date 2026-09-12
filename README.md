@@ -1,54 +1,69 @@
 # CubePlex × AgentCore
 
-这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的实验性 fork，起点为上游 `f5272e1901d0c0c785bdc2381da94951726da601`（版本标识 `0.7.2`）。上游的产品与版权归属保持不变；本 fork 增加了一个 **Amazon Bedrock AgentCore 执行 PoC**，验证能否保留 CubePlex 的 Agent 构造逻辑，把计算放到按需分配的云端运行环境。
+这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的 fork，
+上游基线为 `f5272e19`（产品版本 `0.7.2`）。本阶段从此 fork 的 PR #1 合入提交
+`8fb3b5d6a171451848d7939be0209709e8ea05b3` 继续开发。本 fork 把 AgentCore 从一次性
+执行 PoC 接到 CubePlex 原生的 Web、Slack 和 RunManager 路径上。
+
+当前产品接入以 Runtime v3 的 `READY` readback 为最终部署基线。Web 计算、HITL、
+普通续聊、文件回收后读取、长任务、Backend 重启、正常 native Slack，以及
+duplicate replay 的验证已经通过，短路径 Web Stop 也有 teardown 证据。本轮是兼容性
+PoC；准备阶段停止和停止后续聊现场验收已通过，命令执行中停止仍在验收，不能把已
+通过的路径理解成全部停止与恢复边界已经闭环。
 
 ## 这个 fork 改了什么
 
-已经跑通的路径是：
+目标运行边界是：
 
 ```text
-Slack 测试频道中的请求
-  → 本地 Python 控制器读取消息并检查权限
-  → AgentCore 启动自制 ARM64 Runtime 镜像
-  → 真实 CubePlex factory / LLM builder / CubeLoop 调用模型
-  → 只读工具从 GitHub 获取固定 commit 的代码片段
-  → 本地控制器以 Bot 身份回复原 thread
+员工使用 Web / Slack
+  → Kubernetes 上的 CubePlex 控制面
+      账号、workspace、conversation、RunManager、SSE、消息投递
+  → AgentCore Runtime（ARM64 Worker）
+      读取共享 Postgres / Redis / RustFS / OpenSandbox，运行原生 CubeLoop Agent
+  → Redis 事件流、Web SSE 和 Slack durable delivery 回到员工
 ```
 
-本轮没有部署 Kubernetes Pod。镜像在本地 Docker 构建，推送到 ECR，由 AgentCore Runtime 承载。Slack 控制器是有运行时限的本地进程；聊天历史去重记录保存在本地 SQLite，Provider key 保存在 AWS Secrets Manager。
+主要改动分为四层：
 
-| 本 fork 增加的能力 | 当前边界 |
+| 改动 | 责任边界 |
 |---|---|
-| AgentCore HTTP entrypoint 与真实 CubePlex Agent 构造 | 独立 PoC 模块；完整 Web / Backend RunManager 仍沿用上游实现 |
-| GitHub 只读工具、commit/blob 校验与行号证据 | 本轮固定 `Perfecto23/corplink-rs`；该仓库公开，不证明私库授权 |
-| Slack polling、Bot 回帖与持久去重 | 限定测试用户、频道、前缀和时间窗；只发现新 root 消息 |
-| 本地构建、ECR digest、最小执行角色和部署 readback | 单个 Testing Runtime；不创建 EC2、Kubernetes、Browser 或数据库 |
-| 严格请求合同、工具预算、模型完成状态检查 | 拒绝其他仓库、任意 URL / shell、错误身份和未完成的模型结果 |
+| PR #1 的 AgentCore HTTP entrypoint、真实 CubePlex factory 和模型 provider 适配 | 保留在 fork 中作为历史 PoC 基础；旧的 Slack polling 仅供回溯，不是新产品入口 |
+| K8s 产品基线 | 单节点 k3s 控制面、Caddy HTTPS、持久化 PG/Redis/RustFS、OpenSandbox 和 ECR digest 镜像 |
+| RunManager ↔ AgentCore | Postgres durable dispatch、一次 claim、followup/HITL、progress、stop unknown fence、Redis 事件和 delivery outcome |
+| 原生 Slack | xapp/Socket Mode、Slack user identity → CubePlex user/workspace、限定测试 user/channel 的 durable ingress/outbound |
 
-58 项 focused tests 和真实云端、Slack 业务链路已验证。实际部署镜像仍有未解决的系统包扫描发现；这是可复现的 PoC，不是生产迁移完成的声明。源码、镜像及验收边界见[验证记录](deploy/agentcore-poc/VERIFICATION.md)。
+执行计算的 AgentCore 会话可以被回收；conversation、checkpoint、dispatch、Redis
+协调状态和已保存 artifact 不依赖某个 AgentCore VM 会话。Kubernetes 这一阶段仍是
+单节点 Testing 拓扑，节点故障时没有 HA 保证。
 
-## 如何运行
+最终产品镜像来自提交 `11a4a524713fe06d290f5610196099c694f9b132`：Backend
+`sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc`、
+Worker `sha256:d632fe8f985fb88a2552a25068d090dc1a1747ef6f173355c1eb7d5938b62e40`，
+Runtime v3 已用该 Worker 镜像 readback 为 `READY`；Node 24.21.0 Frontend 为
+`sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1`。
+Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，不能宣称安全扫描清零。
+私有 GitHub 授权、200 个仓库检索和替换成 AgentCore Browser 暂不属于这一阶段。
 
-在包含本 PR 的 checkout / worktree 根目录执行：
+当前 Kubernetes OpenSandbox 仍是兼容性 PoC 的过渡工具环境，不是下一阶段的最终
+执行形态。下一阶段先隔离平台凭据，再让 AgentCore MicroVM 同时承担 Agent 和工具执行，
+随后再迁移文件与 Browser 能力；本 fork 当前文档不把该迁移写成已实现能力。
 
-```bash
-uv sync --project deploy/agentcore-poc --frozen
-PYTHONPATH=backend uv run --project deploy/agentcore-poc \
-  python -m pytest -q deploy/agentcore-poc/tests
-```
-
-随后按照[AgentCore PoC 运行指南](deploy/agentcore-poc/README.md)配置 Provider、核对已绑定的测试环境、部署镜像并启动有限时长的 Slack 控制器。指南分别说明“使用已有 Runtime”和“首次创建环境”，后者会创建收费资源，不应在已有环境上重复执行。
+## 从哪里开始
 
 | 阅读目的 | 入口 |
 |---|---|
-| 配置、构建、部署、启动和停止 | [运行指南](deploy/agentcore-poc/README.md) |
-| 真实验证结果与仍未覆盖的能力 | [验证记录](deploy/agentcore-poc/VERIFICATION.md) |
-| 本次设计与实现范围 | [设计](docs/dev/specs/2026-09-12-agentcore-poc-design.md) · [实现计划](docs/dev/plans/2026-09-12-agentcore-poc.md) |
-| 完整 CubePlex 产品的 Docker / Kubernetes 部署 | [上游部署入口](deploy/README.md) |
+| 完整产品的 AWS/k3s/Helm/AgentCore/Slack 操作 | [AgentCore product operator guide](deploy/agentcore-product/README.md) |
+| 产品部署架构、边界、状态和验收标准 | [AgentCore product deployment](docs/site/docs/deployment/agentcore-product.md) |
+| 标准 Docker Compose / Kubernetes 部署 | [部署入口](deploy/README.md) |
+| 旧的窄范围 AgentCore Slack PoC、证据和历史限制 | [PoC 运行指南](deploy/agentcore-poc/README.md) · [PoC 验证记录](deploy/agentcore-poc/VERIFICATION.md) |
+| 产品接入设计和实现范围 | [设计](docs/dev/specs/2026-09-12-agentcore-product-design.md) · [计划](docs/dev/plans/2026-09-12-agentcore-product.md) |
 
 ## 上游 CubePlex
 
-以下保留上游的产品介绍、演示和文档入口。这些描述属于完整 CubePlex 产品；本 fork 的 AgentCore 改造范围以上文和 PoC 运行指南为准。
+以下保留上游的产品介绍、演示和文档入口。这些描述属于完整 CubePlex 产品；本
+fork 的 AgentCore 产品接入边界、Testing 操作和当前状态以上方产品部署指南为准，
+旧 PoC 仅用于历史证据。
 
 <p align="center">
   <picture>
