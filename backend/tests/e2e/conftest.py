@@ -1346,8 +1346,10 @@ class _FakeCommandStatus:
 
 
 class _FakeCommands:
-    async def run(self, command: str, *, opts: object = None) -> _FakeExecution:
-        del command, opts
+    async def run(
+        self, command: str, *, opts: object = None, handlers: object = None
+    ) -> _FakeExecution:
+        del command, opts, handlers
         return _FakeExecution()
 
     async def get_command_status(self, execution_id: str) -> _FakeCommandStatus:
