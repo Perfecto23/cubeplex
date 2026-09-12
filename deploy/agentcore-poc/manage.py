@@ -234,15 +234,7 @@ def create_foundation(current: boto3.Session) -> None:
     save("role-readback.json", role_readback)
     save("policy-readback.json", policy_readback)
     record("create_role", "ready", arn=role["Arn"])
-    print(
-        json.dumps(
-            {
-                "secret_arn": secret["ARN"],
-                "repository_uri": repository["repositoryUri"],
-                "role_arn": role["Arn"],
-            }
-        )
-    )
+    print(json.dumps({"status": "foundation_ready"}))
 
 
 def runtime_request(image_uri: str) -> dict[str, Any]:
