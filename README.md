@@ -7,9 +7,9 @@
 
 当前产品接入以 Runtime v3 的 `READY` readback 为最终部署基线。Web 计算、HITL、
 普通续聊、文件回收后读取、长任务、Backend 重启、正常 native Slack，以及
-duplicate replay 的验证已经通过，短路径 Web Stop 也有 teardown 证据。本轮是兼容性
-PoC；准备阶段停止和停止后续聊现场验收已通过，命令执行中停止仍在验收，不能把已
-通过的路径理解成全部停止与恢复边界已经闭环。
+duplicate replay 的验证已经通过。本轮兼容性 PoC 的三个收尾场景也全部通过：
+准备阶段停止、命令执行中停止、停止后保留上下文续聊。命令已启动的测试在停止后
+未写出延迟标记；现有 Sandbox 预留清理最长约 10 分半等限制仍保留。
 
 ## 这个 fork 改了什么
 
@@ -46,7 +46,7 @@ Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，�
 私有 GitHub 授权、200 个仓库检索和替换成 AgentCore Browser 暂不属于这一阶段。
 
 当前 Kubernetes OpenSandbox 仍是兼容性 PoC 的过渡工具环境，不是下一阶段的最终
-执行形态。下一阶段先隔离平台凭据，再让 AgentCore MicroVM 同时承担 Agent 和工具执行，
+执行形态。下一阶段先解决平台凭据隔离，评估 AgentCore MicroVM 同时承担 Agent 和工具执行，
 随后再迁移文件与 Browser 能力；本 fork 当前文档不把该迁移写成已实现能力。
 
 ## 从哪里开始

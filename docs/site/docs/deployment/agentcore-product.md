@@ -31,12 +31,13 @@ The Testing control plane and Runtime v3 are deployed on a small single-node
 k3s cluster, and the Runtime readback is `READY`. Web compute, HITL, ordinary
 followup, file readback after AgentCore reclaim, long tasks, Backend restart,
 normal native Slack, duplicate replay, prepared stop and stop-then-followup have
-passed real checks. Stop during command execution remains under acceptance;
-this is a compatibility PoC rather than a completed production migration.
+passed real checks. The final running-command stop also passed: execution was
+confirmed before Stop, and no late marker appeared after its original deadline.
+This is a single-node compatibility PoC with the limits below.
 
 The final image source is commit
-`11a4a524713fe06d290f5610196099c694f9b132`. Runtime v3 uses Backend
-`sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc` and
+`11a4a524713fe06d290f5610196099c694f9b132`. Kubernetes uses Backend
+`sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc`; Runtime v3 uses
 the ARM64 Worker
 `sha256:d632fe8f985fb88a2552a25068d090dc1a1747ef6f173355c1eb7d5938b62e40`.
 
@@ -92,19 +93,22 @@ retain the disk and credential stores if recovery is still required.
 | Web prompt, progress and result | Compute/progress passed on v1; final-version ordinary followup passed on v3 |
 | Web HITL and ordinary followup | HITL respond passed on v1 using the same run; ordinary followup passed on v3 using a new run and the existing conversation checkpoint |
 | File readback after AgentCore reclaim | Passed |
-| Web Stop during the short tool path | Passed with teardown verification; command-stop remains pending |
-| Long-running async task | Passed; `HealthyBusy` observed through completion |
-| Backend restart during remote work | Passed; existing task monitor reattached without replay |
+| Web Stop during the short tool path | Passed with teardown verification and no late marker |
+| Long-running async task | Passed on v2: tracked async execution and fresh heartbeats continued beyond the 60-second idle timeout |
+| Backend restart during remote work | Passed on v2: Backend restarted at 85 seconds during a 150-second task, without replay or a second reply |
 | Normal native Slack task/reply | Passed after identity linking |
 | Duplicate Slack/dispatch replay | Passed without duplicate execution or final reply |
 | Stop before execution starts | Passed; native cancel and dispatch terminal state completed in about 0.22s with no `stop_unknown` |
-| Stop during command execution | Pending final field acceptance; the live Backend Sandbox policy can retain the reservation for about 10.5 minutes (`create_timeout=300s`, `ready_timeout=300s`, `cleanup_interval=30s`, `pause_enabled=false`) |
+| Stop during command execution | Passed on v3: confirmed command start, stop at about 50 seconds, cancelled/finished in about 0.30 seconds, no late marker after the original deadline |
 | Stop followed by a new followup | Passed; a new AgentCore run returned the expected Web result without a tool call |
 
 The operator guide records the source-freeze, CFN, SSM tunnel, private values,
 Helm, ECR-refresh, Caddy, Runtime and Slack steps needed to reproduce these
-checks. The current evidence does not justify claiming the full matrix is
-complete.
+checks. The agreed compatibility PoC acceptance is complete. Preparation
+cancellation releases the run immediately, but the existing Sandbox reservation
+can take about 10.5 minutes to clear (`create_timeout=300s`, `ready_timeout=300s`,
+`cleanup_interval=30s`, `pause_enabled=false`). Ordinary followup works during
+that window; another tool request using the same Sandbox scope may wait.
 
 ## Security and deferred scope
 

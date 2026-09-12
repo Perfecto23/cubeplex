@@ -22,7 +22,7 @@ control plane and Runtime v3 are deployed; the Runtime readback is `READY`.
 Web compute, HITL, ordinary followup, file readback after AgentCore reclaim,
 long tasks, Backend restart, normal native Slack, duplicate replay, prepared
 stop and stop-then-followup have passed real checks. This is a compatibility
-PoC: stop during command execution remains under acceptance.
+PoC: the final running-command stop and followup checks have also passed.
 
 The fork starts from merged commit `8fb3b5d6a171451848d7939be0209709e8ea05b3`
 (upstream product version `0.7.2`). The older bounded Slack polling PoC remains
@@ -288,8 +288,7 @@ networking, 60-second idle timeout and 900-second maximum lifetime. Its tracked
 async task state reports `HealthyBusy` while work is active, and API restart
 attaches a monitor to the existing remote task instead of treating it as a new
 dispatch. The long-task, Backend-restart, duplicate replay, prepared-stop and
-stop-then-followup checks have passed; the command-stop scenario below remains
-under acceptance.
+stop-then-followup and running-command stop checks have passed.
 
 1. Populate the Secrets Manager worker config record with the flat
    `CUBEPLEX_*` environment map. It includes database, Redis, RustFS,
@@ -352,18 +351,21 @@ IDs and user-visible result for every check:
 | Web prompt, progress and final result | Web compute/progress passed on v1; final-version ordinary followup passed on v3 | None for the tested path |
 | Web HITL answer and ordinary followup | HITL respond passed on v1 with a new dispatch for the same run; ordinary followup passed on v3 with a new run and the existing conversation checkpoint | None for the tested path |
 | File/artifact read after AgentCore reclaim | Passed; content remained readable after session absence | None for the tested path |
-| Web Stop during the short tool path | Passed with teardown and no late marker | Command-stop scenario remains pending |
+| Web Stop during the short tool path | Passed with teardown and no late marker | None for the tested path |
 | Long-running async task | Passed on v2: tracked async execution and fresh heartbeats continued beyond the 60-second idle timeout | None for the tested path |
 | Backend restart during remote work | Passed on v2: Backend was restarted at 85 seconds during a 150-second task; no replay or second reply | None for the tested path |
 | Normal native Slack task and reply | Passed after real user identity link | None for the tested path |
 | Duplicate Slack/dispatch replay | Passed; no duplicate execution or final reply | None for the tested path |
 | Stop before execution starts | Passed; native cancel and dispatch terminal state completed in about 0.22s with no `stop_unknown` | Keep the readback in the acceptance evidence |
-| Stop during command execution | Pending final field acceptance; the live Backend Sandbox policy can retain the reservation for about 10.5 minutes (`create_timeout=300s`, `ready_timeout=300s`, `cleanup_interval=30s`, `pause_enabled=false`) | After the window, confirm teardown, no late marker and no replay |
+| Stop during command execution | Passed on v3: the start marker was independently observed; stop at about 50 seconds reached cancelled/finished in about 0.30 seconds; no late marker after the original deadline | None for the tested path |
 | Stop followed by a new followup | Passed; a new AgentCore run returned the expected Web result without a tool call | None for the tested path |
 
-The compatibility PoC is complete only when the pending command-stop
-rows and their durable-state evidence pass. The current evidence does not
-justify claiming the whole matrix is complete.
+The agreed compatibility PoC acceptance is complete. Preparation cancellation
+releases the run immediately, but the existing Sandbox reservation can remain
+until its cleanup window: `create_timeout=300s`, `ready_timeout=300s` and
+`cleanup_interval=30s` with `pause_enabled=false`. The observed cleanup took
+about 10.5 minutes. Ordinary followup works during that window; another tool
+request in the same Sandbox scope may wait. This PR preserves that behavior.
 
 ## 10. Stop, retain and recover
 

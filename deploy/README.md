@@ -9,10 +9,10 @@ conversations, RunManager state, message delivery and persistent storage; the
 worker runs the native CubeLoop agent. Web compute, HITL, followup, file
 recovery after session reclaim, short-path Web Stop, long tasks, Backend restart,
 normal native Slack and duplicate replay have passed real checks. Runtime v3 is
-`READY`. This is a compatibility PoC; prepared stop, stop during command
-execution and stop-then-followup are the final field checks; prepared stop and
-stop-then-followup have passed, while command execution stop remains under
-acceptance.
+`READY`. The compatibility PoC closing checks have passed: prepared stop,
+stop during a confirmed running command, and followup after either stop.
+Single-node availability and the existing Sandbox reservation cleanup window
+remain documented limitations.
 
 ## Pick a target
 
@@ -20,7 +20,7 @@ Full install guides live on the docs site:
 
 | Mode | Status | Guide |
 |---|---|---|
-| **AgentCore product integration (this fork)** | Runtime v3 `READY`; Web/Slack, long-task, restart, duplicate replay, prepared-stop and followup checks passed; command-stop pending | [Operator guide](agentcore-product/README.md) |
+| **AgentCore product integration (this fork)** | Runtime v3 `READY`; Web/Slack, long-task, restart, duplicate replay, prepared-stop, command-stop and followup checks passed | [Operator guide](agentcore-product/README.md) |
 | **AgentCore execution PoC (historical)** | scoped cloud/Slack flow verified | [Operator guide](agentcore-poc/README.md) |
 | **Kubernetes (Helm)** | available | [cubeplex.ai/docs/deployment/kubernetes](https://cubeplex.ai/docs/deployment/kubernetes) (English) / [中文](https://cubeplex.ai/docs/zh-Hans/deployment/kubernetes) |
 | **docker-compose** | available | [cubeplex.ai/docs/deployment/docker-compose](https://cubeplex.ai/docs/deployment/docker-compose) |
