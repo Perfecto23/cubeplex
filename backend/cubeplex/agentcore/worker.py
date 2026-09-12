@@ -78,6 +78,10 @@ class AgentCoreWorker:
         self._run_event_ttl_seconds = run_event_ttl_seconds
         self._prepare_lock = asyncio.Lock()
         self._parser_ready = False
+        # The SDK request may complete before the native run. Keep a strong
+        # reference until the tracked task finishes so a disconnect cannot
+        # collect the task or stop its heartbeat/control watchers.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     async def invoke(
         self,
@@ -85,6 +89,91 @@ class AgentCoreWorker:
         *,
         session_id: str,
     ) -> WorkerInvocationResult:
+        """Run one prepared dispatch inline and await its terminal result."""
+        dispatch, early_result = await self._prepare_dispatch(payload, session_id=session_id)
+        if early_result is not None:
+            return early_result
+        assert dispatch is not None
+        return await self._execute_claimed(dispatch)
+
+    async def accept(
+        self,
+        payload: Mapping[str, object],
+        *,
+        session_id: str,
+        app: Any,
+    ) -> WorkerInvocationResult:
+        """Admit a dispatch and let it continue after the HTTP request returns.
+
+        AgentCore invokes async entrypoints on its dedicated worker loop. The
+        task is created on that loop and registered with the SDK so ``/ping``
+        reports ``HealthyBusy`` while native execution is active.
+        """
+        dispatch, early_result = await self._prepare_dispatch(payload, session_id=session_id)
+        if early_result is not None:
+            return early_result
+        assert dispatch is not None
+
+        add_async_task = getattr(app, "add_async_task", None)
+        complete_async_task = getattr(app, "complete_async_task", None)
+        if not callable(add_async_task) or not callable(complete_async_task):
+            await self._fail_native_run(dispatch, "worker_tracking_unavailable")
+            await mark_dispatch_finished(
+                self._session_maker,
+                dispatch_id=dispatch.id,
+                error_code="worker_tracking_unavailable",
+            )
+            return WorkerInvocationResult(
+                dispatch_id=dispatch.id,
+                status="finished",
+                error_code="worker_tracking_unavailable",
+            )
+
+        task_id: int | None = None
+        try:
+            task_id = add_async_task(
+                "cubeplex-agentcore-dispatch",
+                {"dispatch_id": str(dispatch.id)},
+            )
+            task = asyncio.create_task(
+                self._run_tracked(dispatch, app, task_id),
+                name=f"agentcore-dispatch:{dispatch.id}",
+            )
+        except Exception as exc:
+            if task_id is not None:
+                with suppress(Exception):
+                    complete_async_task(task_id)
+            await self._fail_native_run(dispatch, "worker_start_failed")
+            with suppress(Exception):
+                await mark_dispatch_finished(
+                    self._session_maker,
+                    dispatch_id=dispatch.id,
+                    error_code="worker_start_failed",
+                    error_message=type(exc).__name__,
+                )
+            return WorkerInvocationResult(
+                dispatch_id=dispatch.id,
+                status="finished",
+                error_code="worker_start_failed",
+            )
+
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        return WorkerInvocationResult(dispatch_id=dispatch.id, status="accepted")
+
+    def _background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Drop the strong reference and consume unexpected task exceptions."""
+        self._background_tasks.discard(task)
+        with suppress(asyncio.CancelledError):
+            task.exception()
+
+    async def _prepare_dispatch(
+        self,
+        payload: Mapping[str, object],
+        *,
+        session_id: str,
+    ) -> tuple[AgentCoreDispatch | None, WorkerInvocationResult | None]:
+        """Validate, claim, and prepare a dispatch before native execution."""
         invocation = parse_invocation_payload(payload)
         expected_session = agentcore_session_id(invocation.dispatch_id)
         if session_id != expected_session:
@@ -95,31 +184,67 @@ class AgentCoreWorker:
             dispatch_id=invocation.dispatch_id,
         )
         if not owner:
-            return WorkerInvocationResult(
-                dispatch_id=invocation.dispatch_id,
-                status=dispatch.status,
-                duplicate=True,
+            return (
+                None,
+                WorkerInvocationResult(
+                    dispatch_id=invocation.dispatch_id,
+                    status=dispatch.status,
+                    duplicate=True,
+                ),
             )
 
         scope_validated = False
-        execution_started = False
         try:
             await self._validate_native_scope(dispatch)
             scope_validated = True
             await self._ensure_runtime_dependencies()
             if dispatch.stop_requested:
-                await self._fail_native_run(dispatch, "cancelled_before_execution")
+                await self._cancel_native_run(dispatch)
                 await mark_dispatch_finished(
                     self._session_maker,
                     dispatch_id=dispatch.id,
-                    error_code="cancelled_before_execution",
+                    error_code="cancelled",
                 )
-                return WorkerInvocationResult(
+                return (
+                    None,
+                    WorkerInvocationResult(
+                        dispatch_id=dispatch.id,
+                        status="finished",
+                        error_code="cancelled",
+                    ),
+                )
+            return dispatch, None
+        except DispatchValidationError:
+            with suppress(Exception):
+                await mark_dispatch_finished(
+                    self._session_maker,
+                    dispatch_id=dispatch.id,
+                    error_code="dispatch_validation_failed",
+                )
+            raise
+        except Exception as exc:
+            if scope_validated:
+                await self._fail_native_run(dispatch, "worker_start_failed")
+            with suppress(Exception):
+                await mark_dispatch_finished(
+                    self._session_maker,
+                    dispatch_id=dispatch.id,
+                    error_code="worker_execution_failed",
+                    error_message=type(exc).__name__,
+                )
+            return (
+                None,
+                WorkerInvocationResult(
                     dispatch_id=dispatch.id,
                     status="finished",
-                    error_code="cancelled_before_execution",
-                )
+                    error_code="worker_execution_failed",
+                ),
+            )
 
+    async def _execute_claimed(self, dispatch: AgentCoreDispatch) -> WorkerInvocationResult:
+        """Run a previously prepared dispatch and persist its terminal state."""
+        execution_started = False
+        try:
             manager_value = self._manager_factory(dispatch)
             manager = await manager_value if inspect.isawaitable(manager_value) else manager_value
             start_controls = getattr(manager, "start_control_listeners", None)
@@ -198,7 +323,7 @@ class AgentCoreWorker:
                 )
             raise
         except Exception as exc:
-            if scope_validated and not execution_started:
+            if not execution_started:
                 await self._fail_native_run(dispatch, "worker_start_failed")
             with suppress(Exception):
                 await mark_dispatch_finished(
@@ -212,6 +337,14 @@ class AgentCoreWorker:
                 status="finished",
                 error_code="worker_execution_failed",
             )
+
+    async def _run_tracked(self, dispatch: AgentCoreDispatch, app: Any, task_id: int) -> None:
+        """Keep native execution alive after the Runtime request completes."""
+        try:
+            await self._execute_claimed(dispatch)
+        finally:
+            with suppress(Exception):
+                app.complete_async_task(task_id)
 
     async def _fail_native_run(self, dispatch: AgentCoreDispatch, error_code: str) -> None:
         """Publish an explicit terminal error before closing a pre-exec run."""
@@ -245,6 +378,43 @@ class AgentCoreWorker:
                 ttl_seconds=self._run_event_ttl_seconds,
                 maxlen=1000000,
             )
+        await clear_active_run(
+            self._redis,
+            prefix=self._redis_key_prefix,
+            conversation_id=dispatch.conversation_id,
+            run_id=dispatch.run_id,
+        )
+        await expire_run_data(
+            self._redis,
+            prefix=self._redis_key_prefix,
+            run_id=dispatch.run_id,
+            ttl_seconds=self._run_event_ttl_seconds,
+        )
+
+    async def _cancel_native_run(self, dispatch: AgentCoreDispatch) -> None:
+        """Close a run cancelled before native execution starts."""
+        from datetime import UTC, datetime
+
+        from cubeplex.agents.schemas import DoneEvent
+
+        await update_run_meta(
+            self._redis,
+            prefix=self._redis_key_prefix,
+            run_id=dispatch.run_id,
+            status="cancelled",
+        )
+        await append_run_event(
+            self._redis,
+            prefix=self._redis_key_prefix,
+            run_id=dispatch.run_id,
+            conversation_id=dispatch.conversation_id,
+            payload=DoneEvent(
+                timestamp=datetime.now(UTC).isoformat(),
+                data={"cancelled": True},
+            ).model_dump(),
+            ttl_seconds=self._run_event_ttl_seconds,
+            maxlen=1000000,
+        )
         await clear_active_run(
             self._redis,
             prefix=self._redis_key_prefix,

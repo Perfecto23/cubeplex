@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -1063,6 +1063,7 @@ class RunManager:
         self._consolidation_tasks: set[asyncio.Task[None]] = set()
         self._reflection_tasks: set[asyncio.Task[None]] = set()
         self._remote_reconcile_tasks: set[asyncio.Task[None]] = set()
+        self._remote_monitors: dict[str, asyncio.Task[None]] = {}
         self._stop_unknown_runs: set[str] = set()
         self._ack_waiters: dict[str, list[asyncio.Future[bool]]] = {}
         self._control_channel = f"{key_prefix}:control"
@@ -1187,12 +1188,64 @@ class RunManager:
             ),
         )
 
+    def _ensure_remote_monitor(self, run_id: str) -> asyncio.Task[None]:
+        """Keep one bounded monitor attached to a remote run per API process."""
+        existing = self._remote_monitors.get(run_id)
+        if existing is not None and not existing.done():
+            return existing
+
+        task = asyncio.create_task(
+            self._reconcile_remote_dispatch(run_id),
+            name=f"agentcore-reconcile:{run_id}",
+        )
+        self._remote_monitors[run_id] = task
+        self._remote_reconcile_tasks.add(task)
+
+        def _finished(completed: asyncio.Task[None]) -> None:
+            self._remote_reconcile_tasks.discard(completed)
+            if self._remote_monitors.get(run_id) is completed:
+                self._remote_monitors.pop(run_id, None)
+            with suppress(asyncio.CancelledError):
+                error = completed.exception()
+                if error is not None:
+                    logger.error(
+                        "AgentCore monitor failed for run {}: {}",
+                        run_id,
+                        type(error).__name__,
+                    )
+
+        task.add_done_callback(_finished)
+        return task
+
+    async def attach_remote_monitors(self) -> None:
+        """Attach API-side monitoring to remote work surviving a restart."""
+        if not self._agentcore_remote_enabled():
+            return
+        from cubeplex.agentcore.dispatch import active_dispatches
+        from cubeplex.db.engine import async_session_maker
+
+        for dispatch in await active_dispatches(async_session_maker):
+            self._ensure_remote_monitor(dispatch.run_id)
+
     async def _invoke_remote_dispatch(self, dispatch: Any) -> None:
         """Invoke a created dispatch once; never infer completion from HTTP 200."""
         if dispatch.status != "created":
             return
         try:
-            await self._agentcore_client().invoke(dispatch.id)
+            response = await self._agentcore_client().invoke(dispatch.id)
+            status = response.get("status") if isinstance(response, Mapping) else None
+            if status in {"accepted", "created", "claimed"}:
+                self._ensure_remote_monitor(dispatch.run_id)
+            else:
+                from cubeplex.agentcore.dispatch import active_dispatch_for_run
+                from cubeplex.db.engine import async_session_maker
+
+                current = await active_dispatch_for_run(
+                    async_session_maker,
+                    run_id=dispatch.run_id,
+                )
+                if current is not None:
+                    self._ensure_remote_monitor(dispatch.run_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1223,12 +1276,7 @@ class RunManager:
                 getattr(native, "status", None),
                 type(exc).__name__,
             )
-            reconcile = asyncio.create_task(
-                self._reconcile_remote_dispatch(dispatch.run_id),
-                name=f"agentcore-reconcile:{dispatch.run_id}",
-            )
-            self._remote_reconcile_tasks.add(reconcile)
-            reconcile.add_done_callback(self._remote_reconcile_tasks.discard)
+            self._ensure_remote_monitor(dispatch.run_id)
 
     async def _reconcile_remote_dispatch(self, run_id: str) -> None:
         """Reconcile an uncertain invoke without replaying the dispatch."""
@@ -1264,6 +1312,34 @@ class RunManager:
                 dispatch_id=current.id,
                 error_message="invoke outcome remained unconfirmed",
             )
+            message = "Remote execution teardown could not be confirmed; new work is blocked."
+            with suppress(Exception):
+                await update_run_meta(
+                    self._redis,
+                    prefix=self._key_prefix,
+                    run_id=run_id,
+                    status="errored",
+                    error_code="remote_teardown_unknown",
+                    error_message=message,
+                )
+                conversation_id = getattr(current, "conversation_id", None)
+                if conversation_id:
+                    await append_run_event(
+                        self._redis,
+                        prefix=self._key_prefix,
+                        run_id=run_id,
+                        conversation_id=conversation_id,
+                        payload=ErrorEvent(
+                            timestamp=datetime.now(UTC).isoformat(),
+                            data={
+                                "error_code": "remote_teardown_unknown",
+                                "message": message,
+                                "details": message,
+                            },
+                        ).model_dump(),
+                        ttl_seconds=self._run_event_ttl_seconds,
+                        maxlen=self._run_stream_max_events,
+                    )
 
         for _ in range(attempts):
             await asyncio.sleep(interval)
@@ -1588,6 +1664,7 @@ class RunManager:
             with suppress(asyncio.CancelledError):
                 await reconcile
         self._remote_reconcile_tasks.clear()
+        self._remote_monitors.clear()
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
@@ -1621,15 +1698,47 @@ class RunManager:
             from cubeplex.agentcore.dispatch import active_dispatch_for_run
             from cubeplex.db.engine import async_session_maker
 
-            if await active_dispatch_for_run(async_session_maker, run_id=run_id) is not None:
-                return (await self.dispatch_cancel(run_id)) == "cancelled"
+            remote = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+            if remote is None:
+                # The API process is never the owner of a remote execution.
+                # In particular, do not fall through to cancelling its short
+                # proxy task after the durable dispatch has disappeared.
+                return False
+            return (await self.dispatch_cancel(run_id)) == "cancelled"
         task = self._tasks.get(run_id)
         if task is None or task.done():
             return False
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        state = getattr(getattr(self, "_app", None), "state", None)
+        if getattr(state, "agentcore_worker", None) is True:
+            return await self._wait_for_agentcore_cancel(run_id)
         return True
+
+    async def _wait_for_agentcore_cancel(self, run_id: str) -> bool:
+        """ACK a worker cancel only after durable dispatch teardown is known."""
+        from cubeplex.agentcore.dispatch import active_dispatch_for_run
+        from cubeplex.db.engine import async_session_maker
+
+        deadline = asyncio.get_running_loop().time() + self._FORCED_CANCEL_WAIT_SECONDS
+        while True:
+            try:
+                dispatch = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+            except Exception as exc:
+                logger.warning(
+                    "AgentCore cancel readback failed for run {}: {}",
+                    run_id,
+                    type(exc).__name__,
+                )
+                return False
+            if dispatch is None:
+                return True
+            if dispatch.status == "stop_unknown":
+                return False
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
 
     async def steer_run(self, run_id: str, content: str) -> bool:
         """Inject a steering message into a live run's agent.
@@ -1918,14 +2027,15 @@ class RunManager:
             from cubeplex.db.engine import async_session_maker
 
             remote = await active_dispatch_for_run(async_session_maker, run_id=run_id)
-            if remote is not None:
-                await request_dispatch_stop(async_session_maker, run_id=run_id)
-                remote_fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-                self._ack_waiters.setdefault(run_id, []).append(remote_fut)
+            if remote is None:
+                return "not_found"
+            await request_dispatch_stop(async_session_maker, run_id=run_id)
+            remote_fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._ack_waiters.setdefault(run_id, []).append(remote_fut)
+            try:
                 try:
                     await self._publish_control(run_id, "cancel")
                     await asyncio.wait_for(remote_fut, timeout=ack_timeout)
-                    return "cancelled"
                 except TimeoutError:
                     # The API process cannot prove that the worker exited from
                     # a Redis publish alone. Ask AgentCore for bounded session
@@ -1949,15 +2059,26 @@ class RunManager:
                         error_message="remote teardown was not confirmed",
                     )
                     return "stop_unknown"
-                finally:
-                    waiters = self._ack_waiters.get(run_id)
-                    if waiters and remote_fut in waiters:
-                        waiters.remove(remote_fut)
-                        if not waiters:
-                            self._ack_waiters.pop(run_id, None)
+
+                current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+                if current is None:
+                    return "cancelled"
+                await mark_dispatch_stop_unknown(
+                    async_session_maker,
+                    dispatch_id=current.id,
+                    error_message="remote cancel acknowledgement was not terminal",
+                )
+                return "stop_unknown"
+            finally:
+                waiters = self._ack_waiters.get(run_id)
+                if waiters and remote_fut in waiters:
+                    waiters.remove(remote_fut)
+                    if not waiters:
+                        self._ack_waiters.pop(run_id, None)
+        if self._agentcore_remote_enabled():
+            return "not_found"
         if run_id in self._tasks:
-            await self.cancel_run(run_id)
-            return "cancelled"
+            return "cancelled" if await self.cancel_run(run_id) else "published"
 
         fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._ack_waiters.setdefault(run_id, []).append(fut)
@@ -1980,9 +2101,14 @@ class RunManager:
         if not isinstance(run_id, str):
             return
         if type_ == "cancel":
+            if self._agentcore_remote_enabled():
+                # The API owns only a short-lived proxy task. The remote
+                # worker is the execution owner and the initiating API path
+                # already requested the durable stop.
+                return
             if run_id in self._tasks:
-                await self.cancel_run(run_id)
-                await self._publish_ack(run_id)
+                if await self.cancel_run(run_id):
+                    await self._publish_ack(run_id)
         elif type_ == "steer":
             agent = self._agents.get(run_id)
             if agent is not None:
@@ -2112,6 +2238,7 @@ class RunManager:
             with suppress(asyncio.CancelledError):
                 await reconcile
         self._remote_reconcile_tasks.clear()
+        self._remote_monitors.clear()
 
         # Best-effort: stop background consolidation and reflection tasks first,
         # regardless of whether any run tasks remain (drain returns early below

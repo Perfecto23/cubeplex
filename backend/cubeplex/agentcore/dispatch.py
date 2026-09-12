@@ -360,6 +360,19 @@ async def active_dispatch_for_run(
         return result.scalars().first()  # type: ignore[no-any-return]
 
 
+async def active_dispatches(
+    session_maker: async_sessionmaker[Any],
+) -> list[AgentCoreDispatch]:
+    """Return all remote dispatches that still own native execution."""
+    async with session_maker() as session:
+        result = await session.execute(
+            select(AgentCoreDispatch).where(
+                col(AgentCoreDispatch.status).in_(("created", "claimed", "stop_unknown"))
+            )
+        )
+        return list(result.scalars().all())
+
+
 async def latest_dispatch_for_run(
     session_maker: async_sessionmaker[Any],
     *,

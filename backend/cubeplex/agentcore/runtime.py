@@ -157,7 +157,7 @@ async def invoke(payload: Any, context: RequestContext) -> dict[str, object]:
     try:
         from cubeplex.agentcore.dispatch import DispatchValidationError
 
-        result = await _worker.invoke(payload, session_id=session_id)
+        result = await _worker.accept(payload, session_id=session_id, app=app)
         return cast(dict[str, object], result.model_dump())
     except DispatchValidationError as exc:
         return {

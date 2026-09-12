@@ -191,3 +191,41 @@ async def test_parser_initialization_failure_cleans_native_run(
     )
     assert result.error_code == "worker_execution_failed"
     fail_native.assert_awaited_once_with(dispatch, "worker_start_failed")
+
+
+@pytest.mark.asyncio
+async def test_stop_requested_before_execution_is_cancelled_without_worker_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatch = _dispatch()
+    dispatch.stop_requested = True
+    monkeypatch.setattr(
+        "cubeplex.agentcore.worker.claim_dispatch",
+        AsyncMock(return_value=(dispatch, True)),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.worker.mark_dispatch_finished",
+        AsyncMock(),
+    )
+    worker = AgentCoreWorker(
+        session_maker=MagicMock(),
+        redis=MagicMock(),
+        redis_key_prefix="p",
+        manager_factory=AsyncMock(side_effect=AssertionError("must not execute")),
+    )
+    monkeypatch.setattr(worker, "_validate_native_scope", AsyncMock())
+    monkeypatch.setattr(worker, "_ensure_runtime_dependencies", AsyncMock())
+    cancel_native = AsyncMock()
+    fail_native = AsyncMock()
+    monkeypatch.setattr(worker, "_cancel_native_run", cancel_native)
+    monkeypatch.setattr(worker, "_fail_native_run", fail_native)
+
+    result = await worker.invoke(
+        invocation_payload(dispatch.id),
+        session_id=dispatch.session_id,
+    )
+
+    assert result.status == "finished"
+    assert result.error_code == "cancelled"
+    cancel_native.assert_awaited_once_with(dispatch)
+    fail_native.assert_not_awaited()
