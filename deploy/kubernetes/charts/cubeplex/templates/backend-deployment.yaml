@@ -7,6 +7,11 @@ metadata:
     app.kubernetes.io/component: backend
 spec:
   replicas: {{ .Values.backend.replicaCount }}
+  {{- if .Values.backend.hostNetwork }}
+  # A single testing node cannot bind the API port for old and new pods together.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "cubeplex.name" . }}
@@ -21,6 +26,13 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/backend-configmap.yaml") . | sha256sum }}
         checksum/secret: {{ include (print $.Template.BasePath "/backend-secret.yaml") . | sha256sum }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.backend.terminationGracePeriodSeconds | default 3660 }}
+      {{- if .Values.backend.hostNetwork }}
+      # The testing k3s deployment uses the node role through IMDSv2. The node's
+      # response hop limit is 1, so regular sandbox pods cannot obtain that role.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

@@ -1,0 +1,93 @@
+# Economical single-node k3s overlay for the AgentCore product PoC.
+#
+# This file intentionally contains no credentials and no public hostname. The
+# operator must provide image tags, auth/model/sandbox secrets, and the final
+# Caddy hostname in a separate private values file or --set arguments.
+
+image:
+  registry: "986420599013.dkr.ecr.us-west-2.amazonaws.com"
+  repository: "cubeplex-product-20260912"
+  pullPolicy: IfNotPresent
+  backend:
+    name: backend
+    # Required operator input: an immutable tag pushed to the product ECR repo.
+    tag: ""
+  frontend:
+    name: frontend
+    # Required operator input: an immutable tag pushed to the product ECR repo.
+    tag: ""
+
+backend:
+  replicaCount: 1
+  sandbox:
+    # Route sandbox panel traffic through CubePlex's authenticated proxy.
+    use_server_proxy: true
+  secrets:
+    sandbox:
+      # The bundled OpenSandbox server is installed in opensandbox-system.
+      # The API key is intentionally left for the operator's private overlay.
+      domain: "opensandbox-server.opensandbox-system.svc.cluster.local:80"
+      api_key: ""
+      image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.7.2@sha256:da1b5c88e947f1fd28442e56080aef9bedc8b6d61299b3b35c685d41d1a5bb40"
+
+frontend:
+  replicaCount: 1
+
+# Caddy owns host-network 80/443 in the k3s node. Do not create an ingress
+# controller from this chart; the operator supplies Caddy routing separately.
+ingress:
+  enabled: false
+
+# k3s ships the local-path provisioner. Keep this chart from creating a second
+# StorageClass and use persistent PVCs for the stateful services below.
+storageClass:
+  create: false
+  name: local-path
+
+postgres:
+  enabled: true
+  persistence:
+    storageClass: local-path
+    size: 8Gi
+  # The testing node is amd64; the PGroonga/pgvector image is used only there.
+  # No ARM scheduling is enabled for this PoC.
+
+redis:
+  enabled: true
+  persistence:
+    storageClass: local-path
+    size: 2Gi
+
+rustfs:
+  enabled: true
+  persistence:
+    storageClass: local-path
+    size: 20Gi
+  # Docker Hub no longer serves this tag anonymously in the test environment.
+  # Pin the amd64 manifest from the working Quay mirror instead.
+  mcImage: "quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:9ba8cb7340dd57ee994f6e2a8e45bc0dde9d5369615b03c6021105e5b9ce4449"
+
+opensandbox:
+  enabled: true
+  opensandbox-controller:
+    namespaceOverride: opensandbox-system
+    controller:
+      replicaCount: 1
+      image:
+        # v0.2.0 does not accept --containerd-socket-path. The current
+        # official image was checked with --help and the digest is pinned.
+        repository: opensandbox/controller
+        tag: "latest@sha256:1ecfb02b5d24a92bd756a0f67b55900dee24332ba0c184766c2d7aecb3ace69f"
+      snapshot:
+        containerdSocketPath: /run/k3s/containerd/containerd.sock
+  opensandbox-server:
+    namespaceOverride: opensandbox-system
+    server:
+      replicaCount: 1
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi

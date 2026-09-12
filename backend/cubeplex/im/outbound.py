@@ -552,6 +552,7 @@ class OutboundRunTailer:
         responder_open_id: str | None = None,
         block_ms: int = 2000,
         shared_mode: bool = False,
+        checkpoint: Any | None = None,
     ) -> None:
         self._redis = redis
         self._prefix = key_prefix
@@ -563,6 +564,7 @@ class OutboundRunTailer:
         self._responder_open_id = responder_open_id
         self._block_ms = block_ms
         self._shared_mode = shared_mode
+        self._checkpoint = checkpoint
 
     async def maybe_register_awaiting_responder(self, *, ev_payload: dict[str, Any]) -> None:
         """Register the awaiting_responder binding if the event is a pending input.
@@ -619,12 +621,16 @@ class OutboundRunTailer:
 
     async def run(self) -> None:
         """Tail until a terminal event arrives or the loop is cancelled."""
+        last_id = "0"
+        if self._checkpoint is not None:
+            last_id = await self._checkpoint.restore(self._state, self._dispatcher)
+            if self._checkpoint.terminal:
+                return
         try:
             await self._connector.on_processing_start(self._state)
         except Exception:
             logger.opt(exception=True).warning("on_processing_start raised; continuing")
 
-        last_id = "0"
         succeeded = False
         try:
             while True:
@@ -693,6 +699,8 @@ class OutboundRunTailer:
                             "[outbound] register_awaiting_responder raised"
                         )
                     if op.final:
+                        if self._checkpoint is not None and not delivered:
+                            raise RuntimeError("outbound_terminal_not_confirmed")
                         done = True
                         # Mark succeeded only when the terminal op landed
                         # AND the run wasn't an error. Otherwise the
@@ -733,6 +741,13 @@ class OutboundRunTailer:
                             )
                 if pending_stream is not None and not done:
                     await self._flush_pending_stream(pending_stream)
+                if self._checkpoint is not None:
+                    # Cursor and the complete folded state move together only
+                    # after dispatch. Pending post receipts persist separately
+                    # so a crash here can replay rendering without reposting.
+                    await self._checkpoint.save(
+                        last_id, self._state, self._dispatcher, terminal=done
+                    )
                 if done:
                     return
         finally:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from time import monotonic as _monotonic
 from typing import Any
 
 from fastapi import FastAPI
@@ -292,6 +293,8 @@ async def start(app: FastAPI, run_manager: Any) -> None:
     owned_accounts: set[str] = set()
     deliverable_accounts: set[str] = set()
     connection_locks: dict[str, asyncio.Lock] = {}
+    reconnect_attempts: dict[str, int] = {}
+    reconnect_after: dict[str, float] = {}
 
     def _transport_for(account_id: str) -> Any:
         return gateways.get(account_id) or app.state.im_long_connections.get(account_id)
@@ -422,6 +425,7 @@ async def start(app: FastAPI, run_manager: Any) -> None:
             config=_config,
             gateways=gateways,
             app=app,
+            validate_connection_lease=_validate_connection_lease,
         )
 
     from cubeplex.im.inbound_attachments import make_resolver
@@ -454,6 +458,8 @@ async def start(app: FastAPI, run_manager: Any) -> None:
 
         lock = connection_locks.setdefault(account.id, asyncio.Lock())
         async with lock:
+            if _monotonic() < reconnect_after.get(account.id, 0):
+                return
             try:
                 acquired = await try_acquire_lease(
                     app.state.redis,
@@ -470,6 +476,11 @@ async def start(app: FastAPI, run_manager: Any) -> None:
                 if _transport_is_open(account.id):
                     await _connection_opened(account.id)
                     return
+                attempt = reconnect_attempts.get(account.id, 0) + 1
+                reconnect_attempts[account.id] = attempt
+                reconnect_after[account.id] = _monotonic() + min(
+                    SWEEP_INTERVAL * 2 ** min(attempt - 1, 5), 300
+                )
                 if _transport_for(account.id) is not None:
                     await _stop_local_connection(account.id, release=False)
 
@@ -518,6 +529,10 @@ async def start(app: FastAPI, run_manager: Any) -> None:
                 )
 
     async def _stop_local_connection(account_id: str, *, release: bool) -> None:
+        from cubeplex.im.slack._platform import stop_account_tailers
+
+        deliverable_accounts.discard(account_id)
+        await stop_account_tailers(app, account_id)
         gateway = gateways.pop(account_id, None)
         if gateway is not None:
             try:
@@ -602,6 +617,8 @@ async def start(app: FastAPI, run_manager: Any) -> None:
     # Expose the connector so the workspace POST /im/accounts route can
     # spin up the connection inline instead of waiting for the next restart.
     async def _enable_account(account: IMConnectorAccount) -> None:
+        reconnect_attempts.pop(account.id, None)
+        reconnect_after.pop(account.id, None)
         await clear_connection_suspension(
             app.state.redis,
             account_id=account.id,
@@ -610,6 +627,8 @@ async def start(app: FastAPI, run_manager: Any) -> None:
         await _connect_one(account)
 
     async def _disable_account(account_id: str) -> None:
+        reconnect_attempts.pop(account_id, None)
+        reconnect_after.pop(account_id, None)
         await _stop_local_connection(account_id, release=True)
         await clear_connection_suspension(
             app.state.redis,
@@ -655,6 +674,8 @@ async def start(app: FastAPI, run_manager: Any) -> None:
                     await _stop_local_connection(acct.id, release=False)
                     continue
                 if _transport_is_open(acct.id):
+                    reconnect_attempts.pop(acct.id, None)
+                    reconnect_after.pop(acct.id, None)
                     deliverable_accounts.add(acct.id)
                     await publish_connection_heartbeat(
                         app.state.redis,
@@ -662,8 +683,18 @@ async def start(app: FastAPI, run_manager: Any) -> None:
                         instance_id=instance_id,
                         prefix=app.state.redis_key_prefix,
                     )
+                    from cubeplex.im.registry import get_platform
+
+                    reconcile = getattr(get_platform(acct.platform), "reconcile_tailers", None)
+                    if callable(reconcile):
+                        await reconcile(
+                            account=acct,
+                            session_maker=async_session_maker,
+                            on_run_started=_on_run_started,
+                        )
                 else:
                     await _connection_closed(acct.id)
+                    await _connect_one(acct)
                 continue
 
             acquired = await try_acquire_lease(
@@ -696,6 +727,8 @@ async def start(app: FastAPI, run_manager: Any) -> None:
 
 async def stop(app: FastAPI) -> None:
     """Stop IM gateway/long-connection clients, sweep task, then the queue worker."""
+    from cubeplex.im.slack._platform import stop_account_tailers
+
     # Stop sweep
     sweep = getattr(app.state, "im_lease_sweep", None)
     if sweep is not None:
@@ -704,6 +737,8 @@ async def stop(app: FastAPI) -> None:
             await sweep
         except (asyncio.CancelledError, Exception):
             pass
+
+    await stop_account_tailers(app)
 
     # Stop long-connections (Feishu)
     long_conns = getattr(app.state, "im_long_connections", None) or {}

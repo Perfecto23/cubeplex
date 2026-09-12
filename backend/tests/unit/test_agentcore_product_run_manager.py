@@ -1,0 +1,184 @@
+"""RunManager remote-selection and stop contracts."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import fakeredis.aioredis
+import pytest
+
+from cubeplex.streams.run_manager import RunContext, RunManager
+
+
+def _manager(redis: object) -> RunManager:
+    app = SimpleNamespace(state=SimpleNamespace(agentcore_worker=False))
+    return RunManager(
+        app=app,  # type: ignore[arg-type]
+        redis=redis,  # type: ignore[arg-type]
+        key_prefix="agentcore-product-test",
+        run_event_ttl_seconds=60,
+    )
+
+
+def _ctx() -> RunContext:
+    return RunContext(user_id="u1", org_id="o1", workspace_id="w1", conversation_id="c1")
+
+
+@pytest.mark.asyncio
+async def test_remote_execute_persists_dispatch_before_invoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis)
+    monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
+    dispatch = SimpleNamespace(id="dispatch-1", status="created")
+    create = AsyncMock(return_value=dispatch)
+    invoke = AsyncMock()
+    monkeypatch.setattr(manager, "_create_remote_prompt_dispatch", create)
+    monkeypatch.setattr(manager, "_invoke_remote_dispatch", invoke)
+
+    await manager._execute_run(
+        run_id="r1",
+        conversation_id="c1",
+        content="hello",
+        attachments=[],
+        ctx=_ctx(),
+    )
+    create.assert_awaited_once()
+    invoke.assert_awaited_once_with(dispatch)
+
+
+@pytest.mark.asyncio
+async def test_remote_stop_unknown_does_not_cancel_control_plane_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis)
+    monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
+    remote = SimpleNamespace(
+        id="d1",
+        run_id="r1",
+        heartbeat_at=datetime.now(UTC),
+        claimed_at=datetime.now(UTC),
+        created_at=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_run",
+        AsyncMock(return_value=remote),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.request_dispatch_stop",
+        AsyncMock(return_value=[remote]),
+    )
+    monkeypatch.setattr(manager, "_publish_control", AsyncMock(side_effect=TimeoutError()))
+    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(stop=AsyncMock()))
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.mark_dispatch_stop_unknown",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_run",
+        AsyncMock(side_effect=[remote, remote]),
+    )
+
+    result = await manager.dispatch_cancel("r1", ack_timeout=0)
+    assert result == "stop_unknown"
+
+
+@pytest.mark.asyncio
+async def test_new_prompt_is_blocked_while_remote_stop_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis)
+    monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_conversation",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                run_id="r1",
+                org_id="o1",
+                workspace_id="w1",
+                user_id="u1",
+                status="stop_unknown",
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="teardown is unconfirmed"):
+        await manager.start_run(
+            conversation_id="c1",
+            content="must wait",
+            ctx=_ctx(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_run_id_cannot_bypass_existing_remote_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis)
+    monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_conversation",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                run_id="old-run",
+                org_id="o1",
+                workspace_id="w1",
+                user_id="u1",
+                status="claimed",
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="already has an active run"):
+        await manager.start_run(
+            conversation_id="c1",
+            content="must not bypass",
+            run_id="new-run",
+            ctx=_ctx(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_remote_reconcile_max_lifetime_ends_with_bounded_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    manager = _manager(redis)
+    remote = SimpleNamespace(
+        id="d1",
+        run_id="r1",
+        heartbeat_at=datetime.now(UTC),
+        claimed_at=datetime.now(UTC),
+        created_at=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.active_dispatch_for_run",
+        AsyncMock(return_value=remote),
+    )
+    stop = AsyncMock()
+    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(stop=stop))
+    mark_unknown = AsyncMock()
+    monkeypatch.setattr(
+        "cubeplex.agentcore.dispatch.mark_dispatch_stop_unknown",
+        mark_unknown,
+    )
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    monkeypatch.setattr(
+        "cubeplex.config.config.get",
+        lambda key, default=None: {
+            "agentcore.reconcile_interval_seconds": 5.0,
+            "agentcore.dispatch_heartbeat_timeout_seconds": 180,
+            "agentcore.max_lifetime_seconds": 900,
+        }.get(key, default),
+    )
+
+    await manager._reconcile_remote_dispatch("r1")
+
+    stop.assert_awaited_once_with("d1")
+    mark_unknown.assert_awaited_once()

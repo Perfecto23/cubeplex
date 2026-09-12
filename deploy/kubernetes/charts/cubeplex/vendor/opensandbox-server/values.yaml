@@ -104,6 +104,7 @@ configToml: |
   execd_image = "opensandbox/execd:v1.0.21"
 
   [kubernetes]
+  sandbox_create_timeout_seconds = 180
   kubeconfig_path = ""
   namespace = "opensandbox"
   informer_enabled = true

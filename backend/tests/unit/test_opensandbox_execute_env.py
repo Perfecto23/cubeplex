@@ -91,8 +91,19 @@ async def test_execute_forwards_timeout_to_run_opts() -> None:
 async def test_execute_timeout_error_returns_marker() -> None:
     backend, raw = _make_backend()
 
-    async def boom(command: str, *, opts: RunCommandOpts | None = None, **_: object) -> MagicMock:
+    raw.commands.interrupt = AsyncMock()
+    raw.commands.get_command_status = AsyncMock(return_value=MagicMock(running=False))
+
+    async def boom(
+        command: str,
+        *,
+        opts: RunCommandOpts | None = None,
+        handlers: object | None = None,
+        **_: object,
+    ) -> MagicMock:
         del command, opts
+        assert handlers is not None
+        await handlers.on_init(MagicMock(id="cmd-timeout"))  # type: ignore[attr-defined]
         from opensandbox.exceptions import SandboxException
 
         raise SandboxException("command timed out after 120s")
@@ -101,6 +112,8 @@ async def test_execute_timeout_error_returns_marker() -> None:
     result = await backend.execute("sleep 999", timeout=120)
     assert result.output == "[timeout]"
     assert result.exit_code == -1
+    raw.commands.interrupt.assert_awaited_once_with("cmd-timeout")
+    raw.commands.get_command_status.assert_awaited_once_with("cmd-timeout")
 
 
 @pytest.mark.asyncio

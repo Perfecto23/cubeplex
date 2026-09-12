@@ -21,7 +21,11 @@ ENV PATH="/opt/poc/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE="1" \
     AWS_DEFAULT_REGION="us-west-2"
 WORKDIR /app
-RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin agent
+RUN apt-get update \
+    && apt-get upgrade --yes \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin agent
 USER 10001
 EXPOSE 8080
 CMD ["python", "-m", "cubeplex.agentcore_poc.runtime"]

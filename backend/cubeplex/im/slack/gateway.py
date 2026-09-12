@@ -11,6 +11,33 @@ from loguru import logger
 from cubeplex.im.slack.connector import SlackConnector
 
 
+def _configured_allowlist(key: str) -> frozenset[str] | None:
+    from cubeplex.config import config
+
+    values = config.get(key, None)
+    if values is None:
+        return None
+    if not isinstance(values, list) or any(
+        not isinstance(value, str) or not value for value in values
+    ):
+        raise ValueError(f"{key} must be a list of non-empty IDs")
+    return frozenset(values)
+
+
+def _request_origin(body: dict[str, Any]) -> tuple[str | None, str | None]:
+    event = body.get("event")
+    source = event if isinstance(event, dict) else body
+    channel = source.get("channel_id") or source.get("channel")
+    user = source.get("user_id") or source.get("user")
+    if isinstance(channel, dict):
+        channel = channel.get("id")
+    if isinstance(user, dict):
+        user = user.get("id")
+    if not channel and isinstance(body.get("container"), dict):
+        channel = body["container"].get("channel_id")
+    return (channel if isinstance(channel, str) else None, user if isinstance(user, str) else None)
+
+
 class SlackGateway:
     """Manages one slack-bolt AsyncApp per IM account."""
 
@@ -44,6 +71,20 @@ class SlackGateway:
             AsyncSocketModeHandler,
         )
         from slack_bolt.async_app import AsyncApp
+        from slack_bolt.response import BoltResponse
+
+        allowed_channels = _configured_allowlist("im.slack.allowed_channel_ids")
+        allowed_users = _configured_allowlist("im.slack.allowed_user_ids")
+
+        async def filter_scope(body: dict[str, Any], next: Any) -> Any:
+            channel, user = _request_origin(body)
+            if (allowed_channels is not None and channel not in allowed_channels) or (
+                allowed_users is not None and user not in allowed_users
+            ):
+                # Acknowledge and discard before any listener can ingest, link,
+                # resume or reply. The same hook covers events/actions/commands.
+                return BoltResponse(status=200, body="")
+            return await next()
 
         # Re-apply after slack_sdk import/connect: its socket client logs every
         # PING/PONG at DEBUG when the leaf logger level is NOTSET.
@@ -54,7 +95,7 @@ class SlackGateway:
         except Exception:
             logger.opt(exception=True).debug("[Slack] re-apply third-party log levels failed")
 
-        app = AsyncApp(token=self._bot_token)
+        app = AsyncApp(token=self._bot_token, before_authorize=filter_scope)
         self._app = app
         self._client = app.client
         account = self._account
@@ -62,15 +103,18 @@ class SlackGateway:
         ingest = self._ingest
         bot_user_id = self._bot_user_id
 
-        @app.event("app_mention")
-        async def handle_mention(event: dict[str, Any], say: Any) -> None:
-            await self._handle_inbound(event, bot_user_id, account, session_maker, ingest)
+        async def commit_before_ack(event: dict[str, Any], next: Any) -> Any:
+            # Bolt 1.28 auto-acks events before the listener, but AFTER listener
+            # middleware. Keep the existing atomic receipt/queue transaction in
+            # this public hook so Socket Mode only acks a committed admission.
+            if event.get("type") == "app_mention" or event.get("channel_type") == "im":
+                await self._handle_inbound(event, bot_user_id, account, session_maker, ingest)
+            return await next()
 
-        @app.event("message")
-        async def handle_message(event: dict[str, Any], say: Any) -> None:
-            if event.get("channel_type") != "im":
-                return
-            await self._handle_inbound(event, bot_user_id, account, session_maker, ingest)
+        @app.event("app_mention", middleware=[commit_before_ack])
+        @app.event("message", middleware=[commit_before_ack])
+        async def handle_message() -> None:
+            pass
 
         @app.action(re.compile(r"^im:"))
         async def handle_action(ack: Any, action: dict[str, Any], body: dict[str, Any]) -> None:
@@ -167,6 +211,7 @@ class SlackGateway:
                 )
             except Exception:
                 logger.exception("[Slack] /link handler failed for {}", parsed.platform_event_id)
+                raise
             return
 
         if parse_reset_command(parsed.text):
@@ -182,6 +227,7 @@ class SlackGateway:
                 )
             except Exception:
                 logger.exception("[Slack] /new handler failed for {}", parsed.platform_event_id)
+                raise
             return
 
         try:
@@ -199,6 +245,7 @@ class SlackGateway:
             )
         except Exception:
             logger.exception("[Slack] ingest failed for {}", parsed.platform_event_id)
+            raise
 
     async def _handle_text_link(
         self,
@@ -243,13 +290,13 @@ class SlackGateway:
     async def stop(self) -> None:
         if self._handler is not None:
             try:
-                await self._handler.close_async()
+                await asyncio.wait_for(self._handler.close_async(), timeout=5)
             except Exception:
                 pass
         if self._task is not None:
             self._task.cancel()
             try:
-                await self._task
+                await asyncio.wait_for(self._task, timeout=5)
             except (asyncio.CancelledError, Exception):
                 pass
         logger.info("[Slack] Gateway stopped for account {}", self._account.id)

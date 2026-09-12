@@ -1,0 +1,142 @@
+# Create cubeplex-endpoint with the HTTPS hostname before applying.
+# NodePorts are private under the deployment security group.
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: cubeplex-runtime-postgres
+    namespace: cubeplex
+  spec:
+    type: NodePort
+    ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      nodePort: 30432
+    selector:
+      app.kubernetes.io/instance: cubeplex
+      app.kubernetes.io/component: postgres
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: cubeplex-runtime-redis
+    namespace: cubeplex
+  spec:
+    type: NodePort
+    ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      nodePort: 30379
+    selector:
+      app.kubernetes.io/instance: cubeplex
+      app.kubernetes.io/component: redis
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: cubeplex-runtime-objectstore
+    namespace: cubeplex
+  spec:
+    type: NodePort
+    ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+      nodePort: 30900
+    selector:
+      app.kubernetes.io/instance: cubeplex
+      app.kubernetes.io/component: rustfs
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: cubeplex-caddy
+    namespace: cubeplex
+  data:
+    Caddyfile: |
+      {$CUBEPLEX_HOST} {
+        # Account provisioning stays on the operator tunnel for this paid PoC.
+        @registration path /api/v1/auth/register
+        respond @registration "Registration is closed for this testing deployment." 403
+        @backend path /api/* /health/* /sandbox-panel/*
+        handle @backend {
+          reverse_proxy cubeplex-backend:8000 {
+            flush_interval -1
+          }
+        }
+        handle {
+          reverse_proxy cubeplex-frontend:3000
+        }
+      }
+- apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: cubeplex-caddy-data
+    namespace: cubeplex
+  spec:
+    accessModes:
+    - ReadWriteOnce
+    storageClassName: local-path
+    resources:
+      requests:
+        storage: 1Gi
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: cubeplex-caddy
+    namespace: cubeplex
+  spec:
+    replicas: 1
+    strategy:
+      type: Recreate
+    selector:
+      matchLabels:
+        app: cubeplex-caddy
+    template:
+      metadata:
+        labels:
+          app: cubeplex-caddy
+      spec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        automountServiceAccountToken: false
+        containers:
+        - name: caddy
+          image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+          env:
+          - name: CUBEPLEX_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: cubeplex-endpoint
+                key: host
+          ports:
+          - name: http
+            containerPort: 80
+          - name: https
+            containerPort: 443
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+          - name: config
+            mountPath: /etc/caddy/Caddyfile
+            subPath: Caddyfile
+            readOnly: true
+          - name: data
+            mountPath: /data
+          - name: transient
+            mountPath: /config
+        volumes:
+        - name: config
+          configMap:
+            name: cubeplex-caddy
+        - name: data
+          persistentVolumeClaim:
+            claimName: cubeplex-caddy-data
+        - name: transient
+          emptyDir: {}

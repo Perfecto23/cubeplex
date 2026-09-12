@@ -61,6 +61,8 @@ spec:
             - "$(REDIS_PASSWORD)"
             - "--appendonly"
             - "yes"
+            - "--appendfsync"
+            - "always"
             - "--dir"
             - "/data"
           envFrom:

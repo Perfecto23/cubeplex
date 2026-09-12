@@ -12,7 +12,7 @@ import opensandbox
 from loguru import logger
 from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import SandboxException as _ProviderError
-from opensandbox.models.execd import RunCommandOpts
+from opensandbox.models.execd import ExecutionHandlers, RunCommandOpts
 
 from cubeplex.sandbox.base import BrowserEndpoint, ExecuteResult, Sandbox, SandboxError
 from cubeplex.sandbox.panel_token import (
@@ -30,6 +30,17 @@ _TERMINAL_ENV_FILE = "/run/cubeplex/sandbox-env.sh"
 # this is the last gate before a name becomes shell code, so it re-checks
 # independently and skips anything a pre-validation row might already carry.
 _POSIX_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class SandboxCancellationUnknown(SandboxError):
+    """Remote command termination could not be confirmed.
+
+    Callers must fence the owning run and keep its conversation blocked.  A
+    cancelled local HTTP/SSE request is not evidence that the remote process
+    stopped.
+    """
+
+    sandbox_stop_unknown = True
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -105,9 +116,25 @@ class OpenSandbox(Sandbox):
             gid=gid,
         )
 
+        execution_id: str | None = None
+
+        async def _on_init(event: object) -> None:
+            nonlocal execution_id
+            value = getattr(event, "id", None)
+            if isinstance(value, str) and value:
+                execution_id = value
+
         async def _run() -> ExecuteResult:
+            nonlocal execution_id
             with _as_sandbox_error():
-                execution = await self._sandbox.commands.run(command, opts=opts)
+                execution = await self._sandbox.commands.run(
+                    command,
+                    opts=opts,
+                    handlers=ExecutionHandlers(on_init=_on_init),
+                )
+
+                if execution_id is None and execution.id:
+                    execution_id = execution.id
 
                 output_lines: list[str] = []
                 for msg in execution.logs.stdout:
@@ -130,12 +157,72 @@ class OpenSandbox(Sandbox):
             if timeout is not None:
                 return await asyncio.wait_for(_run(), timeout=timeout)
             return await _run()
+        except asyncio.CancelledError:
+            await asyncio.shield(self._interrupt_and_confirm(execution_id))
+            raise
         except TimeoutError:
+            await self._interrupt_and_confirm(execution_id)
             return ExecuteResult(output="[timeout]", exit_code=-1)
         except SandboxError as exc:
             if timeout is not None and _is_timeout_error(exc):
+                await self._interrupt_and_confirm(execution_id)
                 return ExecuteResult(output="[timeout]", exit_code=-1)
             raise
+
+    async def _interrupt_and_confirm(self, execution_id: str | None) -> None:
+        """Interrupt one command and read back a non-running status."""
+        if not execution_id:
+            raise SandboxCancellationUnknown("remote command id was not obtained")
+        interrupt_error: BaseException | None = None
+        try:
+            await asyncio.wait_for(
+                self._sandbox.commands.interrupt(execution_id),
+                timeout=10,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            interrupt_error = exc
+
+        if interrupt_error is not None:
+            # The service timeout may win the race before our interrupt call;
+            # an interrupt error alone is therefore inconclusive.  Read the
+            # command status independently and accept only an explicit
+            # running=False result.
+            try:
+                status = await asyncio.wait_for(
+                    self._sandbox.commands.get_command_status(execution_id),
+                    timeout=5,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as status_error:
+                raise SandboxCancellationUnknown(
+                    "remote command termination status is unknown"
+                ) from status_error
+            if status.running is False:
+                return
+            raise SandboxCancellationUnknown(
+                f"remote command termination failed: {type(interrupt_error).__name__}"
+            ) from interrupt_error
+
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                status = await asyncio.wait_for(
+                    self._sandbox.commands.get_command_status(execution_id),
+                    timeout=5,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise SandboxCancellationUnknown(
+                    "remote command termination status is unknown"
+                ) from exc
+            if status.running is False:
+                return
+            await asyncio.sleep(0.1)
+        raise SandboxCancellationUnknown("remote command remained running")
 
     async def upload(self, files: list[tuple[str, bytes]]) -> None:
         """Write files then chown by numeric uid so agent can edit them.

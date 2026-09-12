@@ -7,7 +7,7 @@ Inbound parsing works on raw slack-bolt event dicts (no SDK dependency).
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -23,6 +23,9 @@ from cubeplex.im.types import (
 )
 
 _SECTION_CHAR_LIMIT = 3000
+
+if TYPE_CHECKING:
+    from cubeplex.im.slack.delivery import SlackDeliveryCheckpoint
 
 
 def _parse_slack_files(files: list[dict[str, Any]]) -> list[InboundAttachmentRef]:
@@ -71,11 +74,13 @@ class SlackConnector:
         client: Any = None,
         channel_id: str | None = None,
         thread_ts: str | None = None,
+        delivery: SlackDeliveryCheckpoint | None = None,
     ) -> None:
         self._bot_user_id = bot_user_id
         self._client = client
         self._channel_id = channel_id
         self._thread_ts = thread_ts
+        self._delivery = delivery
         self._mention_re = re.compile(rf"<@{re.escape(bot_user_id)}>") if bot_user_id else None
 
     # ------------------------------------------------------------------
@@ -229,10 +234,22 @@ class SlackConnector:
         stripped = (text or "").strip()
         return stripped[:_SECTION_CHAR_LIMIT] if stripped else "…"
 
-    async def send_message(self, text: str) -> str | None:
+    async def send_message(self, text: str, *, delivery_key: str | None = None) -> str | None:
         """Post a Block Kit message. Returns the message ``ts``."""
         if self._client is None or not self._channel_id:
             return None
+        if self._delivery is not None and delivery_key is not None:
+            return await self._delivery.post(
+                key=delivery_key,
+                client=self._client,
+                payload={
+                    "channel": self._channel_id,
+                    "blocks": self._make_section_blocks(text),
+                    "text": self._fallback_text(text),
+                    **({"thread_ts": self._thread_ts} if self._thread_ts else {}),
+                },
+                bot_user_id=self._bot_user_id,
+            )
         try:
             blocks = self._make_section_blocks(text)
             kwargs: dict[str, Any] = {
@@ -259,6 +276,8 @@ class SlackConnector:
             return False
         if not (text or "").strip():
             return True
+        if self._delivery is not None:
+            await self._delivery.assert_owned()
         try:
             blocks = self._make_section_blocks(text)
             await self._client.chat_update(
@@ -274,10 +293,24 @@ class SlackConnector:
             logger.opt(exception=True).warning("[Slack] edit_message failed")
             return False
 
-    async def send_message_with_blocks(self, blocks: list[dict[str, Any]], text: str) -> str | None:
+    async def send_message_with_blocks(
+        self, blocks: list[dict[str, Any]], text: str, *, delivery_key: str | None = None
+    ) -> str | None:
         """Post with custom blocks (e.g. buttons). Returns message ``ts``."""
         if self._client is None or not self._channel_id:
             return None
+        if self._delivery is not None and delivery_key is not None:
+            return await self._delivery.post(
+                key=delivery_key,
+                client=self._client,
+                payload={
+                    "channel": self._channel_id,
+                    "blocks": blocks,
+                    "text": self._fallback_text(text),
+                    **({"thread_ts": self._thread_ts} if self._thread_ts else {}),
+                },
+                bot_user_id=self._bot_user_id,
+            )
         try:
             kwargs: dict[str, Any] = {
                 "channel": self._channel_id,

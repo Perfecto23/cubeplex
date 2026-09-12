@@ -1,6 +1,7 @@
 """Data models."""
 
 from cubeplex.models.agent_config import AgentConfig
+from cubeplex.models.agentcore_dispatch import AgentCoreDispatch
 from cubeplex.models.api_key import ApiKey
 from cubeplex.models.artifact import Artifact
 from cubeplex.models.artifact_version import ArtifactVersion
@@ -68,6 +69,7 @@ from cubeplex.models.workspace import Workspace
 
 __all__ = [
     "AgentConfig",
+    "AgentCoreDispatch",
     "ApiKey",
     "Artifact",
     "ArtifactVersion",

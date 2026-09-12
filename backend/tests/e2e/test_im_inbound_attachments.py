@@ -105,9 +105,10 @@ class _RecordingRM:
         attachments: list[str] | None,
         ctx: RunContext,
         cancel_pending_hitl: bool = False,
+        run_id: str | None = None,
     ) -> str:
         self.calls.append({"content": content, "attachments": attachments})
-        return f"run-{len(self.calls)}"
+        return run_id or f"run-{len(self.calls)}"
 
 
 def _file_event(event_id: str) -> InboundEvent:

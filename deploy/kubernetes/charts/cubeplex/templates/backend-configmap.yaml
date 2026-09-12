@@ -2,6 +2,45 @@
 {{- $redisHost := include "cubeplex.redis.host" . -}}
 {{- $rustfsHost := include "cubeplex.rustfs.host" . -}}
 {{- $doclingHost := include "cubeplex.docling.host" . -}}
+{{- $sandbox := dict
+      "enabled" true
+      "use_server_proxy" (dig "sandbox" "use_server_proxy" false .Values.backend)
+      "secure_access" (dig "sandbox" "secure_access" false .Values.backend)
+-}}
+{{- $defaults := dict -}}
+{{- $_ := set $defaults "database" (dict
+      "host" $pgHost
+      "port" 5432
+      "user" .Values.postgres.auth.username
+      "name" .Values.postgres.auth.database
+) -}}
+{{- $_ := set $defaults "objectstore" (dict
+      "provider" "s3"
+      "endpoint" (printf "http://%s:9000" $rustfsHost)
+      "bucket" .Values.rustfs.defaultBucket
+      "region" "us-east-1"
+) -}}
+{{- if .Values.egress.enabled -}}
+{{- $_ := set $sandbox "egress_exchange_host" (dig "sandbox" "egress_exchange_host" (printf "%s.%s.svc.cluster.local" (include "cubeplex.backend.fullname" .) .Release.Namespace) .Values.backend) -}}
+{{- end -}}
+{{- $_ := set $defaults "sandbox" $sandbox -}}
+{{- if .Values.docling.enabled -}}
+{{- $_ := set $defaults "parsers" (dict "docling_serve" (dict "base_url" (printf "http://%s:%v" $doclingHost .Values.docling.service.port))) -}}
+{{- end -}}
+{{- if .Values.egress.enabled -}}
+{{- $_ := set $defaults "egress_exchange" (dict
+      "auth" (dict "mode" "mtls")
+      "listener" (dict
+        "enabled" true
+        "host" "0.0.0.0"
+        "port" 8443
+        "certfile" "/etc/egress-mtls/tls.crt"
+        "keyfile" "/etc/egress-mtls/tls.key"
+        "ca_certs" "/etc/egress-mtls/ca.crt"
+      )
+) -}}
+{{- end -}}
+{{- $config := mergeOverwrite (deepCopy $defaults) (deepCopy (default (dict) .Values.backend.configOverrides)) -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,48 +51,4 @@ data:
   config.production.local.yaml: |
     dynaconf_merge: true
     production:
-      {{- with .Values.backend.configOverrides }}
-      {{- toYaml . | nindent 6 }}
-      {{- end }}
-      database:
-        host: {{ $pgHost | quote }}
-        port: 5432
-        user: {{ .Values.postgres.auth.username | quote }}
-        name: {{ .Values.postgres.auth.database | quote }}
-      objectstore:
-        provider: "s3"
-        endpoint: {{ printf "http://%s:9000" $rustfsHost | quote }}
-        bucket: {{ .Values.rustfs.defaultBucket | quote }}
-        region: "us-east-1"
-      sandbox:
-        # The bundled chart or an external endpoint must provide OpenSandbox.
-        enabled: true
-        use_server_proxy: {{ dig "sandbox" "use_server_proxy" false .Values.backend }}
-        # Panels flow through cubeplex's token-authed panel reverse proxy (not the
-        # OpenSandbox ingress gateway), so signed secured-endpoint mode is off.
-        secure_access: {{ dig "sandbox" "secure_access" false .Values.backend }}
-        {{- if .Values.egress.enabled }}
-        # Activates egress secret-injection in SandboxManager (every
-        # injection call is gated on `if self._exchange_host:`) and is
-        # force-allowed in the sandbox's egress network policy. Defaults to
-        # the same host the sandbox-side mitmproxy addon actually connects to
-        # (see egress-webhook-deployment.yaml's exchangeURL default).
-        egress_exchange_host: {{ dig "sandbox" "egress_exchange_host" (printf "%s.%s.svc.cluster.local" (include "cubeplex.backend.fullname" .) .Release.Namespace) .Values.backend }}
-        {{- end }}
-      {{- if .Values.docling.enabled }}
-      parsers:
-        docling_serve:
-          base_url: {{ printf "http://%s:%v" $doclingHost .Values.docling.service.port | quote }}
-      {{- end }}
-      {{- if .Values.egress.enabled }}
-      egress_exchange:
-        auth:
-          mode: mtls
-        listener:
-          enabled: true
-          host: "0.0.0.0"
-          port: 8443
-          certfile: "/etc/egress-mtls/tls.crt"
-          keyfile:  "/etc/egress-mtls/tls.key"
-          ca_certs: "/etc/egress-mtls/ca.crt"
-      {{- end }}
+      {{- toYaml $config | nindent 6 }}

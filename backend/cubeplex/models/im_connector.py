@@ -218,6 +218,12 @@ class IMRunQueueItem(CubeplexBase, OrgScopedMixin, table=True):
         default=None, sa_column=Column(JSON, nullable=True)
     )
     attachment_ids: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    # Reserve before dispatch so a worker reclaim addresses the same run.
+    run_id: str | None = Field(default=None, max_length=36, nullable=True, index=True)
+    # Adapter checkpoint: event cursor, render state and confirmed/pending posts.
+    outbound_state: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
     status: str = Field(default="pending", max_length=16)
     claimed_at: datetime | None = Field(
         default=None,
