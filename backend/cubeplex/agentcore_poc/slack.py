@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from typing import Any, Protocol
@@ -41,15 +42,21 @@ class SlackClient:
     def call(self, method: str, payload: Mapping[str, object]) -> JsonObject:
         if method not in self._METHODS:
             raise ValueError("slack_method_not_allowed")
-        request = urllib.request.Request(
-            f"https://slack.com/api/{method}",
-            data=json.dumps(dict(payload)).encode(),
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            method="POST",
-        )
+        url = f"https://slack.com/api/{method}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        if method in {"conversations.history", "conversations.replies"}:
+            query = urllib.parse.urlencode(
+                {
+                    key: str(value).lower() if isinstance(value, bool) else value
+                    for key, value in payload.items()
+                }
+            )
+            request = urllib.request.Request(f"{url}?{query}", headers=headers, method="GET")
+        else:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+            request = urllib.request.Request(
+                url, data=json.dumps(dict(payload)).encode(), headers=headers, method="POST"
+            )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = response.read(2_000_001)
@@ -72,7 +79,20 @@ class SlackClient:
         if not isinstance(data, dict):
             raise SlackError("slack_invalid_response")
         if data.get("ok") is not True:
-            # Slack error strings can contain arbitrary upstream data. Do not echo them.
+            # Expose only known codes, never arbitrary upstream response text.
+            code = data.get("error")
+            if isinstance(code, str) and code in {
+                "invalid_arguments",
+                "missing_scope",
+                "channel_not_found",
+                "not_in_channel",
+                "invalid_auth",
+                "not_authed",
+                "thread_not_found",
+                "token_revoked",
+                "account_inactive",
+            }:
+                raise SlackError(f"slack_{code}")
             raise SlackError("slack_api_rejected")
         return data
 

@@ -1,8 +1,11 @@
 """Protect dispatch scope, at-most-once side effects, and original-thread delivery."""
 
+import io
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from cubeplex.agentcore_poc.contracts import InvocationRequest, InvocationResponse
@@ -18,7 +21,7 @@ from cubeplex.agentcore_poc.controller import (
     PollScope,
     format_reply,
 )
-from cubeplex.agentcore_poc.slack import SlackError
+from cubeplex.agentcore_poc.slack import SlackClient, SlackError
 
 ROOT_TS = "1789200000.000001"
 MESSAGE_TS = "1789200001.000001"
@@ -356,3 +359,82 @@ def test_restart_readback_preserves_failed_runtime_status(tmp_path: Path) -> Non
         assert "本次运行未完成" in slack.sends[0]["text"]
     finally:
         restarted.close()
+
+
+@pytest.mark.parametrize("method", ["conversations.history", "conversations.replies"])
+def test_slack_read_transport_uses_get_query_with_lowercase_booleans(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    requests = []
+
+    def urlopen(request: Any, **kwargs: object) -> io.BytesIO:
+        requests.append(request)
+        return io.BytesIO(b'{"ok":true,"messages":[]}')
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    params = {
+        "channel": CHANNEL_ID,
+        "oldest": ROOT_TS,
+        "inclusive": True,
+        "include_all_metadata": False,
+        "limit": 100,
+    }
+    if method == "conversations.replies":
+        params["ts"] = ROOT_TS
+    SlackClient("xoxb-test-transport").call(method, params)
+    request = requests[0]
+    assert request.get_method() == "GET"
+    assert request.data is None
+    query = parse_qs(urlparse(request.full_url).query)
+    assert query["channel"] == [CHANNEL_ID]
+    assert query["oldest"] == [ROOT_TS]
+    assert query["inclusive"] == ["true"]
+    assert query["include_all_metadata"] == ["false"]
+    assert query["limit"] == ["100"]
+    assert "token" not in query
+    if method == "conversations.replies":
+        assert query["ts"] == [ROOT_TS]
+
+
+def test_slack_send_transport_keeps_post_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = []
+
+    def urlopen(request: Any, **kwargs: object) -> io.BytesIO:
+        requests.append(request)
+        return io.BytesIO(b'{"ok":true,"ts":"1789200002.000001"}')
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    params = {
+        "channel": CHANNEL_ID,
+        "thread_ts": ROOT_TS,
+        "text": "Result",
+        "reply_broadcast": False,
+    }
+    SlackClient("xoxb-test-transport").call("chat.postMessage", params)
+    request = requests[0]
+    assert request.get_method() == "POST"
+    assert not urlparse(request.full_url).query
+    assert json.loads(request.data) == params
+    assert request.get_header("Content-type").startswith("application/json")
+
+
+@pytest.mark.parametrize(
+    "remote_error, expected",
+    [
+        ("invalid_arguments", "slack_invalid_arguments"),
+        ("private upstream text must not escape", "slack_api_rejected"),
+    ],
+)
+def test_slack_transport_error_diagnostic_is_allowlisted(
+    monkeypatch: pytest.MonkeyPatch, remote_error: str, expected: str
+) -> None:
+    def urlopen(request: Any, **kwargs: object) -> io.BytesIO:
+        return io.BytesIO(json.dumps({"ok": False, "error": remote_error}).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    with pytest.raises(SlackError) as error:
+        SlackClient("xoxb-test-transport").call(
+            "conversations.history", {"channel": CHANNEL_ID}
+        )
+    assert error.value.code == expected
+    assert str(error.value) == expected
