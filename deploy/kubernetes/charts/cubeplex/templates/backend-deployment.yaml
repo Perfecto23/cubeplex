@@ -11,6 +11,7 @@ spec:
   # A single testing node cannot bind the API port for old and new pods together.
   strategy:
     type: Recreate
+    rollingUpdate: null
   {{- end }}
   selector:
     matchLabels:
