@@ -166,6 +166,14 @@ This is a **Slack platform limit**, not a CubePlex bug: **developer-created slas
 
 Plain-text `link you@example.com` (without a leading `/`) is useful when Slack intercepts bare `/link` as an unknown command because the slash command was never registered.
 
+## Connection and reply recovery
+
+For an isolated test deployment, optionally restrict native Slack input with `im.slack.allowed_channel_ids` and `im.slack.allowed_user_ids` lists, or their environment equivalents `CUBEPLEX_IM__SLACK__ALLOWED_CHANNEL_IDS` and `CUBEPLEX_IM__SLACK__ALLOWED_USER_IDS`. Messages, buttons and slash commands outside either configured list are acknowledged and ignored without sending a rejection notice. Unset lists preserve the default behavior; an explicitly empty list permits no matching input. Restart the gateway after changing these deployment settings. Account binding and allowed-channel `/link` continue to use the normal flow.
+
+An enabled Slack connection reconnects automatically after its gateway stops, with increasing delays capped at five minutes. Incoming messages are acknowledged after their admission transaction commits. If Slack redelivers a message while identity resolution is slow, the same receipt prevents a second queued request.
+
+After an API restart, CubePlex can reattach an unfinished reply to its existing run while the run events are retained. Confirmed reply messages are updated in place. If Slack may have accepted a new message but its response was lost, CubePlex first reads the original channel/thread and matches the saved delivery identity. It does not blindly post another copy. The bot needs the matching history scope (`channels:history`, `groups:history`, or `im:history`) for this readback. When acceptance cannot be confirmed, delivery remains pending; the run and its history remain separate from the reply's delivery status.
+
 ## Rotating credentials
 
 There is no in-place secret edit. To rotate the bot token or app-level token, **delete** the Slack account in CubePlex and bind it again with the new values. If you regenerate the app-level token or reinstall the app in Slack (which can rotate the bot token), update CubePlex by re-binding.

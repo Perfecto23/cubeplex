@@ -14,11 +14,12 @@
 # (`build-and-push.sh` reads this from the operator's environment and
 # passes it through.)
 
-ARG NODE_VERSION=20
+ARG NODE_VERSION=24.21.0
+ARG NODE_IMAGE_DIGEST=sha256:50c8e8ca1d27439048670df5883f32d57cf81cff6233222c893fd0d9884cbd81
 ARG NPM_REGISTRY=""
 
 
-FROM node:${NODE_VERSION}-alpine AS builder
+FROM node:${NODE_VERSION}-alpine@${NODE_IMAGE_DIGEST} AS builder
 
 ARG NPM_REGISTRY
 
@@ -48,7 +49,7 @@ RUN pnpm --filter @cubeplex/core build || true
 RUN pnpm --filter web build
 
 
-FROM node:${NODE_VERSION}-alpine AS runtime
+FROM node:${NODE_VERSION}-alpine@${NODE_IMAGE_DIGEST} AS runtime
 
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
@@ -57,7 +58,8 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-RUN addgroup --system --gid 1001 cubeplex \
+RUN apk upgrade --no-cache \
+    && addgroup --system --gid 1001 cubeplex \
     && adduser --system --uid 1001 --ingroup cubeplex cubeplex
 
 COPY --from=builder --chown=cubeplex:cubeplex /app/packages/web/.next/standalone ./

@@ -1,0 +1,478 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Single-node CubePlex testing control plane and private AgentCore network
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+  ImageId:
+    Type: AWS::EC2::Image::Id
+  Prefix:
+    Type: String
+    Default: cubeplex-product-20260912
+  RuntimeSubnetCidr:
+    Type: String
+    Default: 172.31.128.0/24
+  WorkerImageUri:
+    Type: String
+    Default: ''
+    Description: Immutable ARM64 worker ECR digest; empty provisions infrastructure only
+  RuntimeName:
+    Type: String
+    Default: cubeplex_product_20260912
+Conditions:
+  DeployWorker:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: WorkerImageUri
+      - ''
+Resources:
+  RuntimeSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VpcId
+      AvailabilityZone:
+        Ref: AvailabilityZone
+      CidrBlock:
+        Ref: RuntimeSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${Prefix}-runtime
+  RuntimeRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VpcId
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${Prefix}-runtime
+  RuntimeRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: RuntimeRouteTable
+      SubnetId:
+        Ref: RuntimeSubnet
+  RuntimeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CubePlex AgentCore outbound access
+      VpcId:
+        Ref: VpcId
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${Prefix}-runtime
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CubePlex HTTPS ingress and private runtime dependencies
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp:
+          Ref: RuntimeSubnetCidr
+      - IpProtocol: tcp
+        FromPort: 30432
+        ToPort: 30432
+        SourceSecurityGroupId:
+          Ref: RuntimeSecurityGroup
+      - IpProtocol: tcp
+        FromPort: 30379
+        ToPort: 30379
+        SourceSecurityGroupId:
+          Ref: RuntimeSecurityGroup
+      - IpProtocol: tcp
+        FromPort: 30900
+        ToPort: 30900
+        SourceSecurityGroupId:
+          Ref: RuntimeSecurityGroup
+      - IpProtocol: tcp
+        FromPort: 30880
+        ToPort: 30880
+        SourceSecurityGroupId:
+          Ref: RuntimeSecurityGroup
+      SecurityGroupEgress:
+      - IpProtocol: '-1'
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${Prefix}-node
+  RuntimePostgresEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Ref: RuntimeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30432
+      ToPort: 30432
+      DestinationSecurityGroupId:
+        Ref: NodeSecurityGroup
+  RuntimeRedisEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Ref: RuntimeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30379
+      ToPort: 30379
+      DestinationSecurityGroupId:
+        Ref: NodeSecurityGroup
+  RuntimeObjectstoreEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Ref: RuntimeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30900
+      ToPort: 30900
+      DestinationSecurityGroupId:
+        Ref: NodeSecurityGroup
+  RuntimeSandboxEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Ref: RuntimeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30880
+      ToPort: 30880
+      DestinationSecurityGroupId:
+        Ref: NodeSecurityGroup
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+      - PolicyName: publish-cluster-access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: secretsmanager:PutSecretValue
+            Resource:
+              Ref: KubeconfigSecret
+      - PolicyName: pull-task-images
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchCheckLayerAvailability
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Prefix}/*
+  NodeProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - Ref: NodeRole
+  Node:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageId:
+        Ref: ImageId
+      InstanceType: t3a.xlarge
+      CreditSpecification:
+        CPUCredits: standard
+      SubnetId:
+        Ref: PublicSubnetId
+      SecurityGroupIds:
+      - Ref: NodeSecurityGroup
+      IamInstanceProfile:
+        Ref: NodeProfile
+      SourceDestCheck: false
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeSize: 60
+          VolumeType: gp3
+          Encrypted: true
+          DeleteOnTermination: false
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${Prefix}-k3s
+      - Key: Project
+        Value:
+          Ref: Prefix
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -q
+            apt-get install -y --no-install-recommends curl ca-certificates iptables python3-venv
+            python3 -m venv /opt/cubeplex-tools
+            /opt/cubeplex-tools/bin/pip install boto3==1.43.93
+            cat >/etc/sysctl.d/90-cubeplex-nat.conf <<'EOF'
+            net.ipv4.ip_forward=1
+            EOF
+            sysctl --system
+            cat >/usr/local/sbin/cubeplex-nat <<'EOF'
+            #!/bin/sh
+            set -eu
+            NIC=$(ip route show default | awk '{print $5; exit}')
+            iptables -t nat -C POSTROUTING -s ${RuntimeSubnetCidr} -o "$NIC" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${RuntimeSubnetCidr} -o "$NIC" -j MASQUERADE
+            iptables -C FORWARD -s ${RuntimeSubnetCidr} -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I FORWARD -s ${RuntimeSubnetCidr} -p tcp --dport 443 -j ACCEPT
+            iptables -C FORWARD -d ${RuntimeSubnetCidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD -d ${RuntimeSubnetCidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            EOF
+            chmod 700 /usr/local/sbin/cubeplex-nat
+            cat >/etc/systemd/system/cubeplex-nat.service <<'EOF'
+            [Unit]
+            Description=Outbound HTTPS for CubePlex AgentCore private subnet
+            After=network-online.target k3s.service
+            Wants=network-online.target
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/cubeplex-nat
+            RemainAfterExit=yes
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            curl -fsSL https://get.k3s.io -o /root/install-k3s.sh
+            INSTALL_K3S_VERSION=v1.36.4+k3s1 sh /root/install-k3s.sh server --disable=traefik --disable=servicelb --secrets-encryption --write-kubeconfig-mode=600
+            systemctl enable --now cubeplex-nat.service
+  PublicAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+      - Key: Name
+        Value:
+          Ref: Prefix
+  PublicAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId:
+        Ref: Node
+      AllocationId:
+        Fn::GetAtt: PublicAddress.AllocationId
+  RuntimeDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: RuntimeRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId:
+        Ref: Node
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName:
+        Fn::Sub: ${Prefix}/backend
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName:
+        Fn::Sub: ${Prefix}/frontend
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName:
+        Fn::Sub: ${Prefix}/worker
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  KubeconfigSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    Properties:
+      Name:
+        Fn::Sub: ${Prefix}/kubeconfig
+      Description: Administrator client certificate for the isolated testing cluster
+      SecretString: '{}'
+  WorkerConfigSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    Properties:
+      Name:
+        Fn::Sub: ${Prefix}/worker-config
+      Description: Private CubePlex storage and credential-vault configuration for the worker
+      SecretString: '{}'
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock-agentcore.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount:
+                Ref: AWS::AccountId
+            ArnLike:
+              aws:SourceArn:
+                Fn::Sub: arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${RuntimeName}-*
+      Policies:
+      - PolicyName: worker-dependencies
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              Ref: WorkerConfigSecret
+          - Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchCheckLayerAvailability
+            Resource:
+              Fn::GetAtt: WorkerRepository.Arn
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}-*
+          - Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: '*'
+  ProductRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployWorker
+    DependsOn: RuntimeDefaultRoute
+    Properties:
+      AgentRuntimeName:
+        Ref: RuntimeName
+      Description: CubePlex native RunManager execution for the testing Kubernetes control plane
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri:
+            Ref: WorkerImageUri
+      RoleArn:
+        Fn::GetAtt: WorkerRole.Arn
+      ProtocolConfiguration: HTTP
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          Subnets:
+          - Ref: RuntimeSubnet
+          SecurityGroups:
+          - Ref: RuntimeSecurityGroup
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: 60
+        MaxLifetime: 900
+      EnvironmentVariables:
+        CONFIG_SECRET_ARN:
+          Ref: WorkerConfigSecret
+        AWS_REGION:
+          Ref: AWS::Region
+        AWS_DEFAULT_REGION:
+          Ref: AWS::Region
+        ENV_FOR_DYNACONF: production
+      Tags:
+        Project:
+          Ref: Prefix
+        Environment: testing
+  NodeInvokePolicy:
+    Type: AWS::IAM::Policy
+    Condition: DeployWorker
+    Properties:
+      PolicyName: invoke-cubeplex-worker
+      Roles:
+      - Ref: NodeRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - bedrock-agentcore:InvokeAgentRuntime
+          - bedrock-agentcore:StopRuntimeSession
+          Resource:
+          - Fn::GetAtt: ProductRuntime.AgentRuntimeArn
+          - Fn::Sub: ${ProductRuntime.AgentRuntimeArn}/runtime-endpoint/DEFAULT
+Outputs:
+  InstanceId:
+    Value:
+      Ref: Node
+  PrivateIp:
+    Value:
+      Fn::GetAtt: Node.PrivateIp
+  PublicIp:
+    Value:
+      Ref: PublicAddress
+  NodeRoleArn:
+    Value:
+      Fn::GetAtt: NodeRole.Arn
+  RuntimeSubnetId:
+    Value:
+      Ref: RuntimeSubnet
+  RuntimeSecurityGroupId:
+    Value:
+      Ref: RuntimeSecurityGroup
+  KubeconfigSecretArn:
+    Value:
+      Ref: KubeconfigSecret
+  WorkerConfigSecretArn:
+    Value:
+      Ref: WorkerConfigSecret
+  WorkerRoleArn:
+    Value:
+      Fn::GetAtt: WorkerRole.Arn
+  RuntimeArn:
+    Condition: DeployWorker
+    Value:
+      Fn::GetAtt: ProductRuntime.AgentRuntimeArn
+  RuntimeId:
+    Condition: DeployWorker
+    Value:
+      Fn::GetAtt: ProductRuntime.AgentRuntimeId

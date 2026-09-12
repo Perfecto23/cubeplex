@@ -96,6 +96,7 @@ class _FakeRunManager:
         attachments: list[str] | None,
         ctx: RunContext,
         cancel_pending_hitl: bool = False,
+        run_id: str | None = None,
     ) -> str:
         self.calls.append(
             {
@@ -107,9 +108,10 @@ class _FakeRunManager:
                 "trigger": ctx.trigger,
                 "sender_display_name": ctx.sender_display_name,
                 "cancel_pending_hitl": cancel_pending_hitl,
+                "run_id": run_id,
             }
         )
-        return f"run-fake-{len(self.calls)}"
+        return run_id or f"run-fake-{len(self.calls)}"
 
 
 async def test_worker_processes_one_item_and_completes_receipt(
@@ -156,7 +158,7 @@ async def test_worker_processes_one_item_and_completes_receipt(
     # and the group-chat SenderBadge fire for IM messages.
     assert rm.calls[0]["sender_display_name"] == f"{account.acting_user_id}@example.com"
 
-    assert captured_runs and captured_runs[0][0] == "run-fake-1"
+    assert captured_runs and captured_runs[0][0] == rm.calls[0]["run_id"]
 
     async with maker() as s:
         rcpt = (
@@ -519,6 +521,7 @@ async def test_worker_leaves_row_for_reclaim_on_start_run_failure(
             attachments: list[str] | None,
             ctx: RunContext,
             cancel_pending_hitl: bool = False,
+            run_id: str | None = None,
         ) -> str:
             raise RuntimeError("LLM exploded")
 

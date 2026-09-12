@@ -24,6 +24,7 @@ from typing import Any, Protocol
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from uuid_utils import uuid7
 
 from cubeplex.models.im_connector import IMConnectorAccount, IMIdentityLink, IMRunQueueItem
 from cubeplex.repositories.im_connector import (
@@ -47,6 +48,7 @@ class _RunStarter(Protocol):
         attachments: list[str] | None,
         ctx: RunContext,
         cancel_pending_hitl: bool = False,
+        run_id: str | None = None,
     ) -> str: ...
 
 
@@ -256,6 +258,20 @@ async def process_one_queue_item(
             await session.commit()
             return True
 
+    # Persist the run identity before the external dispatch boundary. Reclaims
+    # call the run manager with this same ID; its existing-run path only attaches
+    # to the accepted run, including a crash before the queue completion commit.
+    async with session_maker() as session:
+        reserved = await session.get(IMRunQueueItem, captured_item.id, with_for_update=True)
+        if reserved is None:
+            return False
+        if reserved.run_id is None:
+            reserved.run_id = str(uuid7())
+            session.add(reserved)
+        assigned_run_id = reserved.run_id
+        await session.commit()
+    captured_item.run_id = assigned_run_id
+
     try:
         run_id = await run_manager.start_run(
             conversation_id=captured["conversation_id"],
@@ -274,7 +290,10 @@ async def process_one_queue_item(
                 sender_display_name=captured["sender_display_name"],
             ),
             cancel_pending_hitl=True,
+            run_id=assigned_run_id,
         )
+        if run_id != assigned_run_id:
+            raise RuntimeError("IM dispatch returned a different run identity")
     except Exception as exc:
         # ``RunManager.start_run`` raises a plain RuntimeError when the
         # conversation already has an active run. That's a normal UX
@@ -320,9 +339,8 @@ async def process_one_queue_item(
     # tokens billed, run row created), so requeuing on a tailer-setup
     # failure would re-fire ``start_run`` and produce duplicate runs
     # + duplicate billing for one inbound message. Keep the queue row
-    # at-most-once for ``start_run`` and treat tailer failures as a
-    # separate post-success failure mode (logged + best-effort error
-    # bubble; no requeue).
+    # delivery independent from execution. Slack's account sweep can reattach
+    # the persisted run_id without requeueing the original request.
     async with session_maker() as session:
         await mark_receipt_completed(session, receipt_id=captured["receipt_id"])
         await mark_queue_item_completed(session, item_id=captured_item.id)
@@ -333,13 +351,11 @@ async def process_one_queue_item(
             await on_run_started(run_id, captured_item)
         except Exception:
             # Tailer setup blew up after ``start_run`` already succeeded.
-            # The user will not see the streaming reply — that's a UX
-            # regression we cannot fix here (re-running would double-bill).
-            # Log loudly so operators can investigate and (optionally)
-            # tell the user via another channel.
+            # Keep execution committed. Delivery recovery uses the saved run
+            # identity and its adapter checkpoint, never a fresh run.
             logger.exception(
                 "[IM worker] on_run_started failed after start_run; "
-                "user will not see a streaming reply for run {} (queue item {})",
+                "delivery remains pending for run {} (queue item {})",
                 run_id,
                 captured_item.id,
             )

@@ -450,6 +450,8 @@ async def lifespan(_app: FastAPI):  # type: ignore
     from cubeplex.streams.recovery import recover_stranded_runs
 
     await recover_stranded_runs(redis_client, prefix=_app.state.redis_key_prefix)
+    if run_manager is not None:
+        await run_manager.attach_remote_monitors()
 
     # Warm the process-wide cubeloop checkpointer pool so the first send
     # doesn't pay the pool-open round trips. Best-effort: on failure the

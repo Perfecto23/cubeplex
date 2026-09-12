@@ -58,13 +58,14 @@ subjects:
     namespace: {{ include "opensandbox-server.namespace" . }}
 ---
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
   name: {{ include "opensandbox-server.fullname" . }}-config
   namespace: {{ include "opensandbox-server.namespace" . }}
   labels:
     {{- include "opensandbox-server.labels" . | nindent 4 }}
-data:
+type: Opaque
+stringData:
   config.toml: |
 {{ .Values.configToml | indent 4 }}
 {{ include "opensandbox-server.ingressConfigToml" . | indent 4 }}
@@ -83,6 +84,8 @@ spec:
       {{- include "opensandbox-server.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      annotations:
+        checksum/config: {{ printf "%s\n%s" .Values.configToml (include "opensandbox-server.ingressConfigToml" .) | sha256sum }}
       labels:
         {{- include "opensandbox-server.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: opensandbox
@@ -135,8 +138,8 @@ spec:
             {{- toYaml .Values.server.resources | nindent 12 }}
       volumes:
         - name: config
-          configMap:
-            name: {{ include "opensandbox-server.fullname" . }}-config
+          secret:
+            secretName: {{ include "opensandbox-server.fullname" . }}-config
         {{- with .Values.server.volumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

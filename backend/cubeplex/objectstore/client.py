@@ -1,11 +1,11 @@
-"""Async S3/OSS object storage client using aioboto3."""
+"""Async S3/OSS object storage client using aiobotocore."""
 
 from __future__ import annotations
 
 import posixpath
 from typing import TYPE_CHECKING
 
-import aioboto3
+from aiobotocore.session import ClientCreatorContext, get_session
 from botocore.config import Config as BotoConfig
 from loguru import logger
 
@@ -29,7 +29,9 @@ class ObjectStoreClient:
         self._region: str = config.get("objectstore.region", "")
         self._access_key: str = config.get("objectstore.access_key", "")
         self._access_secret: str = config.get("objectstore.access_secret", "")
-        self._session: aioboto3.Session = aioboto3.Session()
+        # Use the async client directly: aioboto3's resource layer pins an older
+        # botocore incompatible with the AgentCore Runtime SDK.
+        self._session = get_session()
 
         # OSS does not support aws-chunked transfer encoding, and only accepts
         # virtual-hosted style addressing (bucket as subdomain). With a custom
@@ -57,9 +59,9 @@ class ObjectStoreClient:
     # Internal helper
     # ------------------------------------------------------------------
 
-    def _client_ctx(self) -> aioboto3.Session.client:
+    def _client_ctx(self) -> ClientCreatorContext:
         """Return a fresh async S3 client context manager."""
-        return self._session.client(
+        return self._session.create_client(
             "s3",
             endpoint_url=self._endpoint or None,
             region_name=self._region or None,

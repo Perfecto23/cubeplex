@@ -3,15 +3,14 @@ cubeplex has been deployed.
   Namespace: {{ .Release.Namespace }}
   Release:   {{ .Release.Name }}
 
-Ingress: ingress-nginx is reachable on this cluster via NodePort 30019
-(http) and 30999 (https). On 192.168.1.101 the host already binds :80
-(unrelated nginx), so don't expect `cubeplex.local` on the default port —
-use :30019 explicitly.
-
-Add to /etc/hosts on your workstation:
-  192.168.1.101 {{ .Values.ingress.host }}
-
-Then visit: http://{{ .Values.ingress.host }}:30019/
+{{- if .Values.ingress.enabled }}
+Configure DNS for {{ .Values.ingress.host }} to reach your ingress controller.
+Then visit: {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/
+{{- else }}
+Ingress is disabled. Route your configured HTTPS reverse proxy to the backend
+and frontend Services. The AgentCore testing deployment uses the Caddy manifest
+in deploy/agentcore-product/access.yaml.
+{{- end }}
 
 Inspect:
   kubectl -n {{ .Release.Namespace }} get pods,svc,ingress

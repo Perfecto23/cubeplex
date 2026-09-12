@@ -1,0 +1,151 @@
+# Requires an existing cubeplex/ecr-pull Secret with valid dockerconfigjson.
+# This manifest never creates or replaces that credential with an empty value.
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: ecr-pull-refresh
+    namespace: cubeplex
+  automountServiceAccountToken: true
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: ecr-pull-refresh
+    namespace: cubeplex
+  rules:
+  - apiGroups:
+    - ''
+    resources:
+    - secrets
+    resourceNames:
+    - ecr-pull
+    verbs:
+    - get
+    - patch
+    - update
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: ecr-pull-refresh
+    namespace: cubeplex
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: Role
+    name: ecr-pull-refresh
+  subjects:
+  - kind: ServiceAccount
+    name: ecr-pull-refresh
+    namespace: cubeplex
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ecr-pull-refresh
+    namespace: cubeplex
+  data:
+    refresh_ecr.py: |
+      import base64, json, os, ssl, sys
+      from pathlib import Path
+      from urllib.request import Request, urlopen
+      import boto3
+
+      def main() -> int:
+          try:
+              token = Path("/var/run/secrets/kubernetes.io/serviceaccount/token").read_text().strip()
+              ca_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+              if not token or not ca_path.is_file():
+                  raise RuntimeError("service_account_credentials_unavailable")
+              response = boto3.client("ecr", region_name=os.getenv("AWS_REGION", "us-west-2"))
+              auths = {}
+              for item in response.get_authorization_token().get("authorizationData", []):
+                  endpoint = str(item.get("proxyEndpoint", "")).removeprefix("https://").rstrip("/")
+                  auth = str(item.get("authorizationToken", ""))
+                  if endpoint and auth:
+                      auths[endpoint] = {"auth": auth}
+              if not auths:
+                  raise RuntimeError("ecr_authorization_unavailable")
+              encoded = base64.b64encode(json.dumps({"auths": auths}, separators=(",", ":")).encode()).decode()
+              namespace = os.getenv("ECR_PULL_NAMESPACE", "cubeplex")
+              secret = os.getenv("ECR_PULL_SECRET", "ecr-pull")
+              host, port = os.environ["KUBERNETES_SERVICE_HOST"], os.getenv("KUBERNETES_SERVICE_PORT", "443")
+              url = f"https://{host}:{port}/api/v1/namespaces/{namespace}/secrets/{secret}"
+              body = json.dumps({"type": "kubernetes.io/dockerconfigjson", "data": {".dockerconfigjson": encoded}}, separators=(",", ":")).encode()
+              request = Request(url, data=body, method="PATCH", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/merge-patch+json"})
+              with urlopen(request, context=ssl.create_default_context(cafile=str(ca_path)), timeout=20) as result:
+                  if result.status != 200:
+                      raise RuntimeError("kubernetes_patch_unexpected_status")
+          except Exception:  # noqa: BLE001 - never expose token, request body, or API body
+              print("ecr_refresh_failed", file=sys.stderr)
+              return 1
+          print("ecr_refresh_succeeded")
+          return 0
+
+      if __name__ == "__main__":
+          raise SystemExit(main())
+- apiVersion: batch/v1
+  kind: CronJob
+  metadata:
+    name: ecr-pull-refresh
+    namespace: cubeplex
+  spec:
+    schedule: 0 */6 * * *
+    concurrencyPolicy: Forbid
+    startingDeadlineSeconds: 300
+    successfulJobsHistoryLimit: 1
+    failedJobsHistoryLimit: 2
+    jobTemplate:
+      spec:
+        backoffLimit: 1
+        activeDeadlineSeconds: 120
+        ttlSecondsAfterFinished: 3600
+        template:
+          spec:
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            restartPolicy: OnFailure
+            serviceAccountName: ecr-pull-refresh
+            imagePullSecrets:
+            - name: ecr-pull
+            automountServiceAccountToken: true
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+            - name: refresh
+              image: __BACKEND_IMAGE__
+              imagePullPolicy: IfNotPresent
+              command:
+              - python
+              - /opt/ecr-refresh/refresh_ecr.py
+              env:
+              - name: AWS_REGION
+                value: us-west-2
+              - name: AWS_DEFAULT_REGION
+                value: us-west-2
+              - name: KUBERNETES_SERVICE_HOST
+                value: kubernetes.default.svc
+              - name: KUBERNETES_SERVICE_PORT
+                value: '443'
+              - name: ECR_PULL_NAMESPACE
+                value: cubeplex
+              - name: ECR_PULL_SECRET
+                value: ecr-pull
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                  - ALL
+              volumeMounts:
+              - name: refresh-script
+                mountPath: /opt/ecr-refresh
+                readOnly: true
+            volumes:
+            - name: refresh-script
+              configMap:
+                name: ecr-pull-refresh
+                defaultMode: 365

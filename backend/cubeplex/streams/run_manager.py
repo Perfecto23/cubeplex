@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from cubeloop.providers.base import ReasoningControl
 from cubeloop.providers.fallback import FallbackBoundModel
@@ -1062,6 +1062,9 @@ class RunManager:
         self._hitl_channels: dict[str, Any] = {}
         self._consolidation_tasks: set[asyncio.Task[None]] = set()
         self._reflection_tasks: set[asyncio.Task[None]] = set()
+        self._remote_reconcile_tasks: set[asyncio.Task[None]] = set()
+        self._remote_monitors: dict[str, asyncio.Task[None]] = {}
+        self._stop_unknown_runs: set[str] = set()
         self._ack_waiters: dict[str, list[asyncio.Future[bool]]] = {}
         self._control_channel = f"{key_prefix}:control"
         self._ack_channel = f"{key_prefix}:control:ack"
@@ -1084,6 +1087,406 @@ class RunManager:
         if not self._tasks:
             self._tasks_empty.set()
 
+    def _agentcore_remote_enabled(self) -> bool:
+        """Whether this process is the control plane for remote execution."""
+        state = getattr(getattr(self, "_app", None), "state", None)
+        if getattr(state, "agentcore_worker", None) is True:
+            return False
+        try:
+            from cubeplex.config import config
+
+            return str(config.get("execution.backend", "local")) == "agentcore"
+        except Exception:
+            return False
+
+    def _agentcore_client(self) -> Any:
+        state = getattr(getattr(self, "_app", None), "state", None)
+        existing = getattr(state, "agentcore_client", None)
+        if existing is not None and not isinstance(existing, type(self._app)):
+            return existing
+        from cubeplex.agentcore.client import AgentCoreClient
+        from cubeplex.config import config
+
+        client = AgentCoreClient(
+            runtime_arn=str(config.get("agentcore.runtime_arn", "")),
+            region_name=str(config.get("agentcore.region", config.get("aws.region", "")) or "")
+            or None,
+        )
+        if state is not None:
+            state.agentcore_client = client
+        return client
+
+    async def _create_remote_prompt_dispatch(
+        self,
+        *,
+        run_id: str,
+        content: str,
+        attachments: list[str],
+        ctx: RunContext,
+        model_key: str | None,
+        reasoning: ReasoningControl,
+    ) -> Any:
+        from cubeplex.agentcore.dispatch import (
+            DispatchScope,
+            build_prompt_request,
+            create_dispatch,
+        )
+        from cubeplex.db.engine import async_session_maker
+
+        return await create_dispatch(
+            async_session_maker,
+            scope=DispatchScope(
+                org_id=ctx.org_id,
+                workspace_id=ctx.workspace_id,
+                conversation_id=ctx.conversation_id,
+                user_id=ctx.user_id,
+                run_id=run_id,
+            ),
+            operation="prompt",
+            request=build_prompt_request(
+                content=content,
+                attachments=attachments,
+                ctx=ctx,
+                model_key=model_key,
+                reasoning=reasoning,
+            ),
+        )
+
+    async def _create_remote_respond_dispatch(
+        self,
+        *,
+        run_id: str,
+        conversation_id: str,
+        question_id: str,
+        answer: Any,
+        claim_token: str,
+        ctx: RunContext,
+    ) -> Any:
+        from cubeplex.agentcore.dispatch import (
+            DispatchScope,
+            build_respond_request,
+            create_dispatch,
+        )
+        from cubeplex.db.engine import async_session_maker
+
+        return await create_dispatch(
+            async_session_maker,
+            scope=DispatchScope(
+                org_id=ctx.org_id,
+                workspace_id=ctx.workspace_id,
+                conversation_id=conversation_id,
+                user_id=ctx.user_id,
+                run_id=run_id,
+            ),
+            operation="respond",
+            claim_token=claim_token,
+            request=build_respond_request(
+                question_id=question_id,
+                answer=answer,
+                claim_token=claim_token,
+                ctx=ctx,
+            ),
+        )
+
+    def _ensure_remote_monitor(self, run_id: str) -> asyncio.Task[None]:
+        """Keep one bounded monitor attached to a remote run per API process."""
+        existing = self._remote_monitors.get(run_id)
+        if existing is not None and not existing.done():
+            return existing
+
+        task = asyncio.create_task(
+            self._reconcile_remote_dispatch(run_id),
+            name=f"agentcore-reconcile:{run_id}",
+        )
+        self._remote_monitors[run_id] = task
+        self._remote_reconcile_tasks.add(task)
+
+        def _finished(completed: asyncio.Task[None]) -> None:
+            self._remote_reconcile_tasks.discard(completed)
+            if self._remote_monitors.get(run_id) is completed:
+                self._remote_monitors.pop(run_id, None)
+            with suppress(asyncio.CancelledError):
+                error = completed.exception()
+                if error is not None:
+                    logger.error(
+                        "AgentCore monitor failed for run {}: {}",
+                        run_id,
+                        type(error).__name__,
+                    )
+
+        task.add_done_callback(_finished)
+        return task
+
+    async def attach_remote_monitors(self) -> None:
+        """Attach API-side monitoring to remote work surviving a restart."""
+        if not self._agentcore_remote_enabled():
+            return
+        from cubeplex.agentcore.dispatch import active_dispatches
+        from cubeplex.db.engine import async_session_maker
+
+        for dispatch in await active_dispatches(async_session_maker):
+            self._ensure_remote_monitor(dispatch.run_id)
+
+    async def _invoke_remote_dispatch(self, dispatch: Any) -> None:
+        """Invoke a created dispatch once; never infer completion from HTTP 200."""
+        if dispatch.status != "created":
+            return
+        try:
+            response = await self._agentcore_client().invoke(dispatch.id)
+            status = response.get("status") if isinstance(response, Mapping) else None
+            if status in {"accepted", "created", "claimed"}:
+                self._ensure_remote_monitor(dispatch.run_id)
+            else:
+                from cubeplex.agentcore.dispatch import active_dispatch_for_run
+                from cubeplex.db.engine import async_session_maker
+
+                current = await active_dispatch_for_run(
+                    async_session_maker,
+                    run_id=dispatch.run_id,
+                )
+                if current is not None:
+                    self._ensure_remote_monitor(dispatch.run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            from cubeplex.agentcore.dispatch import active_dispatch_for_run
+            from cubeplex.db.engine import async_session_maker
+
+            current = None
+            with suppress(Exception):
+                current = await active_dispatch_for_run(
+                    async_session_maker,
+                    run_id=dispatch.run_id,
+                )
+            native = None
+            with suppress(Exception):
+                native = await get_run_meta(
+                    self._redis,
+                    prefix=self._key_prefix,
+                    run_id=dispatch.run_id,
+                )
+            # A timeout or connection reset is an uncertain delivery result.
+            # Leave the created/claimed dispatch and native active run fenced
+            # for recovery reconciliation; never turn an HTTP/network error
+            # into completed, and never invoke a new dispatch here.
+            logger.warning(
+                "AgentCore invocation outcome unknown for run {} (dispatch_status={}, native_status={}, error={})",
+                dispatch.run_id,
+                getattr(current, "status", None),
+                getattr(native, "status", None),
+                type(exc).__name__,
+            )
+            self._ensure_remote_monitor(dispatch.run_id)
+
+    async def _reconcile_remote_dispatch(self, run_id: str) -> None:
+        """Reconcile an uncertain invoke without replaying the dispatch."""
+        from cubeplex.agentcore.dispatch import (
+            active_dispatch_for_run,
+            mark_dispatch_stop_unknown,
+        )
+        from cubeplex.config import config
+        from cubeplex.db.engine import async_session_maker
+
+        interval = float(config.get("agentcore.reconcile_interval_seconds", 5.0))
+        timeout_seconds = int(config.get("agentcore.dispatch_heartbeat_timeout_seconds", 180))
+        max_lifetime = int(config.get("agentcore.max_lifetime_seconds", 900))
+        attempts = max(12, int(max_lifetime / max(interval, 1.0)) + 1)
+
+        async def stop_and_fence(dispatch: Any) -> None:
+            try:
+                await asyncio.wait_for(
+                    self._agentcore_client().stop(dispatch.id),
+                    timeout=min(max(interval, 1.0), 10.0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "AgentCore reconciliation stop failed for run {}: {}",
+                    run_id,
+                    type(exc).__name__,
+                )
+            current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+            if current is None:
+                return
+            fenced = await mark_dispatch_stop_unknown(
+                async_session_maker,
+                dispatch_id=current.id,
+                error_message="invoke outcome remained unconfirmed",
+            )
+            if not fenced:
+                return
+            message = "Remote execution teardown could not be confirmed; new work is blocked."
+            with suppress(Exception):
+                await update_run_meta(
+                    self._redis,
+                    prefix=self._key_prefix,
+                    run_id=run_id,
+                    status="errored",
+                    error_code="remote_teardown_unknown",
+                    error_message=message,
+                )
+                conversation_id = getattr(current, "conversation_id", None)
+                if conversation_id:
+                    await append_run_event(
+                        self._redis,
+                        prefix=self._key_prefix,
+                        run_id=run_id,
+                        conversation_id=conversation_id,
+                        payload=ErrorEvent(
+                            timestamp=datetime.now(UTC).isoformat(),
+                            data={
+                                "error_code": "remote_teardown_unknown",
+                                "message": message,
+                                "details": message,
+                            },
+                        ).model_dump(),
+                        ttl_seconds=self._run_event_ttl_seconds,
+                        maxlen=self._run_stream_max_events,
+                    )
+
+        for _ in range(attempts):
+            await asyncio.sleep(interval)
+            dispatch = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+            if dispatch is None:
+                return
+            heartbeat = dispatch.heartbeat_at or dispatch.claimed_at or dispatch.created_at
+            age = (datetime.now(UTC) - heartbeat).total_seconds()
+            if age <= timeout_seconds:
+                continue
+            await stop_and_fence(dispatch)
+            return
+
+        # The worker kept heartbeating for the full bounded lifetime without
+        # reaching a terminal dispatch state.  Do one final bounded teardown
+        # and readback rather than silently abandoning a live native run.
+        final_dispatch = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+        if final_dispatch is not None:
+            await stop_and_fence(final_dispatch)
+
+    @staticmethod
+    def _has_sandbox_stop_unknown(exc: BaseException) -> bool:
+        """Find the driver marker through cubeloop's exception wrappers."""
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if getattr(current, "sandbox_stop_unknown", False) is True:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    async def _mark_sandbox_stop_unknown(
+        self,
+        *,
+        run_id: str,
+        conversation_id: str,
+        error: BaseException,
+    ) -> None:
+        """Fence a run whose sandbox command termination is unconfirmed."""
+        state = getattr(getattr(self, "_app", None), "state", None)
+        if getattr(state, "agentcore_worker", None) is not True:
+            self._stop_unknown_runs.add(run_id)
+            return
+        from cubeplex.agentcore.dispatch import (
+            active_dispatch_for_run,
+            latest_dispatch_for_run,
+            mark_dispatch_stop_unknown,
+        )
+        from cubeplex.db.engine import async_session_maker
+
+        dispatch = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+        if dispatch is None:
+            latest = await latest_dispatch_for_run(async_session_maker, run_id=run_id)
+            if latest is not None and latest.status == "finished":
+                self._stop_unknown_runs.discard(run_id)
+                return
+            self._stop_unknown_runs.add(run_id)
+            return
+        fenced = await mark_dispatch_stop_unknown(
+            async_session_maker,
+            dispatch_id=dispatch.id,
+            error_message=f"sandbox command teardown unknown: {type(error).__name__}",
+        )
+        if fenced:
+            self._stop_unknown_runs.add(run_id)
+        else:
+            from cubeplex.models.agentcore_dispatch import AgentCoreDispatch
+
+            async with async_session_maker() as session:
+                latest = await session.get(AgentCoreDispatch, dispatch.id)
+            if latest is not None and latest.status == "finished":
+                self._stop_unknown_runs.discard(run_id)
+            else:
+                self._stop_unknown_runs.add(run_id)
+
+    @staticmethod
+    def _context_from_remote_request(request: dict[str, Any]) -> RunContext:
+        from cubeplex.agentcore.dispatch import request_context_from_payload
+
+        raw = request_context_from_payload(request)
+        return RunContext(
+            user_id=cast(str, raw["user_id"]),
+            org_id=cast(str, raw["org_id"]),
+            workspace_id=cast(str, raw["workspace_id"]),
+            conversation_id=cast(str, raw["conversation_id"]),
+            trigger=cast(str, raw["trigger"]),
+            topic_id=cast(str | None, raw.get("topic_id")),
+            is_group_chat=bool(raw.get("is_group_chat", False)),
+            sender_display_name=cast(str | None, raw.get("sender_display_name")),
+            sandbox_mode=cast(str | None, raw.get("sandbox_mode")),
+            topic_creator_user_id=cast(str | None, raw.get("topic_creator_user_id")),
+            conversation_creator_user_id=cast(str | None, raw.get("conversation_creator_user_id")),
+        )
+
+    async def execute_agentcore_dispatch(self, dispatch: Any) -> None:
+        """Execute one claimed dispatch using this worker's local RunManager."""
+        state = getattr(self._app, "state", None)
+        if getattr(state, "agentcore_worker", None) is not True:
+            raise RuntimeError("agentcore_worker_mode_required")
+        existing = self._tasks.get(dispatch.run_id)
+        if existing is not None and not existing.done():
+            await existing
+            return
+        request = dict(dispatch.request)
+        ctx = self._context_from_remote_request(request)
+        if dispatch.operation == "prompt":
+            task = asyncio.create_task(
+                self._execute_run(
+                    run_id=dispatch.run_id,
+                    conversation_id=dispatch.conversation_id,
+                    content=str(request.get("content") or ""),
+                    attachments=[str(item) for item in request.get("attachments", [])],
+                    ctx=ctx,
+                    model_key=(
+                        str(request["model_key"]) if request.get("model_key") is not None else None
+                    ),
+                    reasoning=ReasoningControl(**dict(request.get("reasoning") or {})),
+                ),
+                name=f"run:{dispatch.run_id}",
+            )
+        elif dispatch.operation == "respond":
+            task = asyncio.create_task(
+                self._execute_respond_run(
+                    run_id=dispatch.run_id,
+                    conversation_id=dispatch.conversation_id,
+                    question_id=str(request.get("question_id") or ""),
+                    answer=request.get("answer"),
+                    claim_token=str(request.get("claim_token") or ""),
+                    ctx=ctx,
+                ),
+                name=f"respond:{dispatch.run_id}",
+            )
+        else:
+            raise RuntimeError("agentcore_dispatch_operation_invalid")
+        self._tasks_empty.clear()
+        self._tasks[dispatch.run_id] = task
+        task.add_done_callback(lambda _: self._on_task_done(dispatch.run_id))
+        await task
+        if dispatch.run_id in getattr(self, "_stop_unknown_runs", set()):
+            self._stop_unknown_runs.discard(dispatch.run_id)
+            from cubeplex.agentcore.dispatch import AgentCoreStopUnknown
+
+            raise AgentCoreStopUnknown("sandbox command teardown is unconfirmed")
+
     async def start_run(
         self,
         *,
@@ -1104,10 +1507,61 @@ class RunManager:
         completion hook can find the row by ``run_id`` even if ``_execute_run``
         finishes faster than the poller's post-dispatch UPDATE.
         """
+        requested_run_id = run_id
         if run_id is None:
             run_id = str(uuid7())
         started_at = utc_isoformat(datetime.now(UTC))
 
+        if self._agentcore_remote_enabled():
+            from cubeplex.agentcore.dispatch import active_dispatch_for_conversation
+            from cubeplex.db.engine import async_session_maker
+
+            blocked = await active_dispatch_for_conversation(
+                async_session_maker,
+                conversation_id=conversation_id,
+            )
+            if blocked is not None:
+                if blocked.status == "stop_unknown":
+                    raise RuntimeError("remote run teardown is unconfirmed")
+                if (
+                    requested_run_id != blocked.run_id
+                    or blocked.org_id != ctx.org_id
+                    or blocked.workspace_id != ctx.workspace_id
+                    or blocked.user_id != ctx.user_id
+                ):
+                    raise RuntimeError(f"Conversation {conversation_id} already has an active run")
+                return run_id
+
+        # Queue consumers may have assigned a durable run_id before the
+        # process crashed.  Read back the native owner before touching Redis:
+        # the same (conversation, run_id, scope) is an idempotent attach, while
+        # a scope collision must fail closed and never overwrite the stream.
+        if requested_run_id is not None:
+            existing = await get_active_run(
+                self._redis,
+                prefix=self._key_prefix,
+                conversation_id=conversation_id,
+            )
+            if existing is not None and existing.run_id == run_id:
+                if existing.conversation_id != ctx.conversation_id:
+                    raise RuntimeError("run scope conflict")
+                return run_id
+            if self._agentcore_remote_enabled():
+                from cubeplex.agentcore.dispatch import latest_dispatch_for_run
+                from cubeplex.db.engine import async_session_maker
+
+                remote = await latest_dispatch_for_run(async_session_maker, run_id=run_id)
+                if remote is not None:
+                    if (
+                        remote.conversation_id != conversation_id
+                        or remote.org_id != ctx.org_id
+                        or remote.workspace_id != ctx.workspace_id
+                        or remote.user_id != ctx.user_id
+                    ):
+                        raise RuntimeError("run scope conflict")
+                    if remote.status == "stop_unknown":
+                        raise RuntimeError("remote run teardown is unconfirmed")
+                    return run_id
         # DB is the authoritative source for "is this conversation paused
         # on a pending HITL". Check BEFORE create_run so a TTL-expired
         # Redis lock can't let a new turn slip past — the Redis active-run
@@ -1187,6 +1641,10 @@ class RunManager:
                     prefix=self._key_prefix,
                     conversation_id=conversation_id,
                 )
+                if existing is not None and existing.run_id == run_id:
+                    if existing.conversation_id != ctx.conversation_id:
+                        raise RuntimeError("run scope conflict")
+                    return run_id
                 if existing and existing.status in ("running", "paused_hitl"):
                     raise RuntimeError(f"Conversation {conversation_id} already has an active run")
                 raise RuntimeError(f"Conversation {conversation_id} could not claim an active run")
@@ -1220,6 +1678,13 @@ class RunManager:
 
     async def cancel_all(self) -> None:
         """Cancel every in-flight run task. Forced shutdown path."""
+        for reconcile in list(self._remote_reconcile_tasks):
+            reconcile.cancel()
+        for reconcile in list(self._remote_reconcile_tasks):
+            with suppress(asyncio.CancelledError):
+                await reconcile
+        self._remote_reconcile_tasks.clear()
+        self._remote_monitors.clear()
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
@@ -1249,12 +1714,31 @@ class RunManager:
         client that clicks Stop and immediately re-sends would race against
         cleanup and get a 409 from ``start_run``.
         """
+        if self._agentcore_remote_enabled():
+            from cubeplex.agentcore.dispatch import active_dispatch_for_run
+            from cubeplex.db.engine import async_session_maker
+
+            remote = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+            if remote is None:
+                # The API process is never the owner of a remote execution.
+                # In particular, do not fall through to cancelling its short
+                # proxy task after the durable dispatch has disappeared.
+                return False
+            return (await self.dispatch_cancel(run_id)) == "cancelled"
         task = self._tasks.get(run_id)
         if task is None or task.done():
             return False
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        state = getattr(getattr(self, "_app", None), "state", None)
+        if getattr(state, "agentcore_worker", None) is True:
+            # The AgentCore worker persists the dispatch terminal state after
+            # this native task exits. Waiting for that row here deadlocks the
+            # worker: the outer dispatch cannot persist while this control
+            # listener is waiting for the same persistence. The worker emits
+            # the ACK after its durable transition instead.
+            return True
         return True
 
     async def steer_run(self, run_id: str, content: str) -> bool:
@@ -1535,9 +2019,96 @@ class RunManager:
         return "published"
 
     async def dispatch_cancel(self, run_id: str, ack_timeout: float = 3.0) -> str:
+        if self._agentcore_remote_enabled():
+            from cubeplex.agentcore.dispatch import (
+                active_dispatch_for_run,
+                mark_dispatch_stop_unknown,
+                request_dispatch_stop,
+            )
+            from cubeplex.db.engine import async_session_maker
+
+            remote = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+            if remote is None:
+                return "not_found"
+            await request_dispatch_stop(async_session_maker, run_id=run_id)
+            remote_fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._ack_waiters.setdefault(run_id, []).append(remote_fut)
+            try:
+                try:
+                    await self._publish_control(run_id, "cancel")
+                    await asyncio.wait_for(remote_fut, timeout=ack_timeout)
+                except TimeoutError:
+                    # Give the worker a bounded grace window to cancel a
+                    # native task that may still be provisioning a sandbox.
+                    # Read the durable row before killing the Runtime session;
+                    # otherwise StopRuntimeSession can race the worker's
+                    # terminal dispatch write and manufacture stop_unknown.
+                    grace_seconds = min(
+                        max(ack_timeout, 0.0),
+                        self._FORCED_CANCEL_WAIT_SECONDS,
+                    )
+                    grace_deadline = asyncio.get_running_loop().time() + grace_seconds
+                    while asyncio.get_running_loop().time() < grace_deadline:
+                        current = await active_dispatch_for_run(
+                            async_session_maker,
+                            run_id=run_id,
+                        )
+                        if current is None:
+                            return "cancelled"
+                        if getattr(current, "status", None) == "stop_unknown":
+                            return "stop_unknown"
+                        await asyncio.sleep(0.1)
+
+                    # The API process still cannot prove that the worker exited
+                    # from Redis alone. Ask AgentCore for bounded session
+                    # teardown, then read the durable dispatch state back.
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            self._agentcore_client().stop(remote.id),
+                            timeout=min(max(ack_timeout, 1.0), 10.0),
+                        )
+                    for _ in range(max(1, int(ack_timeout * 2))):
+                        await asyncio.sleep(0.5)
+                        current = await active_dispatch_for_run(
+                            async_session_maker,
+                            run_id=run_id,
+                        )
+                        if current is None:
+                            return "cancelled"
+                        if getattr(current, "status", None) == "stop_unknown":
+                            return "stop_unknown"
+                    fenced = await mark_dispatch_stop_unknown(
+                        async_session_maker,
+                        dispatch_id=remote.id,
+                        error_message="remote teardown was not confirmed",
+                    )
+                    if fenced:
+                        return "stop_unknown"
+                    current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+                    return "cancelled" if current is None else "stop_unknown"
+
+                current = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+                if current is None:
+                    return "cancelled"
+                fenced = await mark_dispatch_stop_unknown(
+                    async_session_maker,
+                    dispatch_id=current.id,
+                    error_message="remote cancel acknowledgement was not terminal",
+                )
+                if fenced:
+                    return "stop_unknown"
+                latest = await active_dispatch_for_run(async_session_maker, run_id=run_id)
+                return "cancelled" if latest is None else "stop_unknown"
+            finally:
+                waiters = self._ack_waiters.get(run_id)
+                if waiters and remote_fut in waiters:
+                    waiters.remove(remote_fut)
+                    if not waiters:
+                        self._ack_waiters.pop(run_id, None)
+        if self._agentcore_remote_enabled():
+            return "not_found"
         if run_id in self._tasks:
-            await self.cancel_run(run_id)
-            return "cancelled"
+            return "cancelled" if await self.cancel_run(run_id) else "published"
 
         fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._ack_waiters.setdefault(run_id, []).append(fut)
@@ -1560,9 +2131,16 @@ class RunManager:
         if not isinstance(run_id, str):
             return
         if type_ == "cancel":
+            if self._agentcore_remote_enabled():
+                # The API owns only a short-lived proxy task. The remote
+                # worker is the execution owner and the initiating API path
+                # already requested the durable stop.
+                return
             if run_id in self._tasks:
-                await self.cancel_run(run_id)
-                await self._publish_ack(run_id)
+                if await self.cancel_run(run_id):
+                    state = getattr(getattr(self, "_app", None), "state", None)
+                    if getattr(state, "agentcore_worker", None) is not True:
+                        await self._publish_ack(run_id)
         elif type_ == "steer":
             agent = self._agents.get(run_id)
             if agent is not None:
@@ -1686,6 +2264,14 @@ class RunManager:
         Logs a status line on entry when there's anything to wait for, plus
         a progress line every 30 seconds while waiting.
         """
+        for reconcile in list(self._remote_reconcile_tasks):
+            reconcile.cancel()
+        for reconcile in list(self._remote_reconcile_tasks):
+            with suppress(asyncio.CancelledError):
+                await reconcile
+        self._remote_reconcile_tasks.clear()
+        self._remote_monitors.clear()
+
         # Best-effort: stop background consolidation and reflection tasks first,
         # regardless of whether any run tasks remain (drain returns early below
         # when _tasks is empty).
@@ -3721,6 +4307,17 @@ class RunManager:
         reasoning: ReasoningControl | None = None,
         llm_snapshot: Any | None = None,
     ) -> None:
+        if self._agentcore_remote_enabled():
+            dispatch = await self._create_remote_prompt_dispatch(
+                run_id=run_id,
+                content=content,
+                attachments=attachments,
+                ctx=ctx,
+                model_key=model_key,
+                reasoning=reasoning or ReasoningControl(),
+            )
+            await self._invoke_remote_dispatch(dispatch)
+            return
         from cubeplex.api.routes.v1.conversations import (
             _enqueue_search_index,
             _update_conversation_timestamp,
@@ -4142,6 +4739,13 @@ class RunManager:
             await self._record_user_cancel(run_id=run_id, conversation_id=conversation_id)
             raise
         except Exception as exc:
+            if self._has_sandbox_stop_unknown(exc):
+                await self._mark_sandbox_stop_unknown(
+                    run_id=run_id,
+                    conversation_id=conversation_id,
+                    error=exc,
+                )
+                return
             logger.opt(exception=True).error("Run {} failed: {}", run_id, exc)
             # Model/provider/context_window are fallbacks for non-cubeloop
             # exceptions. Cubeloop typed errors already carry tokens_in etc.
@@ -4245,12 +4849,13 @@ class RunManager:
 
             steering_agent = extra_ref_holder.get("steering_agent")
             current_agent = self._agents.get(run_id)
+            stop_unknown = run_id in self._stop_unknown_runs
             registration_replaced = _registration_was_replaced(
                 current_agent=current_agent,
                 originating_agent=steering_agent,
             )
             if not registration_replaced:
-                if final_status != "paused_hitl":
+                if not stop_unknown and final_status != "paused_hitl":
                     await self._steering_delivery.finalize_run(run_id)
                 if steering_agent is not None:
                     await self._steering_delivery.unregister(run_id, agent=steering_agent)
@@ -4272,7 +4877,7 @@ class RunManager:
             # in start_run (the guard only fires when create_run failed),
             # orphaning the paused turn. The respond / cancel paths clear
             # the lock when they terminate.
-            if final_status != "paused_hitl" and not registration_replaced:
+            if not stop_unknown and final_status != "paused_hitl" and not registration_replaced:
                 await clear_active_run(
                     self._redis,
                     prefix=self._key_prefix,
@@ -4286,7 +4891,7 @@ class RunManager:
                     ttl_seconds=self._run_event_ttl_seconds,
                 )
 
-            if sandbox:
+            if sandbox and not stop_unknown:
                 from cubeplex.sandbox.lazy import LazySandbox
 
                 if isinstance(sandbox, LazySandbox) and sandbox.initialized:
@@ -4320,26 +4925,20 @@ class RunManager:
     ) -> None:
         """Spawn-wrapper around :meth:`_run_cubeloop_respond_path`.
 
-        Mirrors :meth:`_execute_run` for the resume path. Reuses the
-        original ``run_id`` (events stream into the same Redis key the SSE
-        consumer is still tailing), so this:
-
-        * does NOT call :func:`update_run_meta` on terminal — the respond
-          path's CAS-guarded :func:`finalize_run_meta_if_claim_matches`
-          already wrote the terminal status. A naive ``update_run_meta``
-          here would defeat the CAS;
-        * still emits ``DoneEvent`` so the SSE consumer can close cleanly;
-        * still clears the active-run pointer + expires run data in
-          ``finally`` — exactly like the prompt path. ``claim_resume``
-          handles the case where the active pointer is gone but the meta
-          row still exists (paused_hitl status).
-
-        The leading setup (citation counter, subagent/citation drainer,
-        sandbox + skill catalog resolution, AgentConfig system-prompt
-        merge, available-skills suffix, widget stub suffix) is
-        identical to ``_execute_run``'s — keeping it byte-stable preserves
-        the prompt cache prefix across pause/resume.
+        The remote branch keeps the same native run ID and claim token; the
+        worker executes this method with ``agentcore_worker=True``.
         """
+        if self._agentcore_remote_enabled():
+            dispatch = await self._create_remote_respond_dispatch(
+                run_id=run_id,
+                conversation_id=conversation_id,
+                question_id=question_id,
+                answer=answer,
+                claim_token=claim_token,
+                ctx=ctx,
+            )
+            await self._invoke_remote_dispatch(dispatch)
+            return
         from cubeplex.api.routes.v1.conversations import (
             _enqueue_search_index,
             _update_conversation_timestamp,
@@ -4702,6 +5301,13 @@ class RunManager:
             raise
         except Exception as exc:
             logger.opt(exception=True).error("Respond run {} failed: {}", run_id, exc)
+            if self._has_sandbox_stop_unknown(exc):
+                await self._mark_sandbox_stop_unknown(
+                    run_id=run_id,
+                    conversation_id=conversation_id,
+                    error=exc,
+                )
+                return
             # Don't clear DB pending — leaving it allows the user to retry
             # the answer. Don't finalize meta status here either: if the body
             # finally block already ran, it CAS-wrote whatever status
@@ -4794,7 +5400,8 @@ class RunManager:
             except ValueError:
                 citation_event_queue.set(None)
 
-            if sandbox:
+            stop_unknown = run_id in self._stop_unknown_runs
+            if sandbox and not stop_unknown:
                 from cubeplex.sandbox.lazy import LazySandbox
 
                 if isinstance(sandbox, LazySandbox) and sandbox.initialized:
@@ -4823,7 +5430,7 @@ class RunManager:
                 originating_agent=steering_agent,
             )
             if not registration_replaced:
-                if durable_final_status != "paused_hitl":
+                if not stop_unknown and durable_final_status != "paused_hitl":
                     await self._steering_delivery.finalize_run(run_id)
                 if steering_agent is not None:
                     await self._steering_delivery.unregister(run_id, agent=steering_agent)
@@ -4836,7 +5443,7 @@ class RunManager:
             # where pointer is gone but meta is paused_hitl (it re-stamps
             # the pointer atomically). On "completed" the pointer must be
             # gone so the next start_run can allocate a fresh run.
-            if not registration_replaced:
+            if not stop_unknown and not registration_replaced:
                 await clear_active_run(
                     self._redis,
                     prefix=self._key_prefix,
