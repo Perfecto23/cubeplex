@@ -1,0 +1,13 @@
+**
+!backend/
+!backend/cubeplex/
+!backend/cubeplex/**
+!deploy/
+!deploy/agentcore-poc/
+!deploy/agentcore-poc/pyproject.toml
+!deploy/agentcore-poc/uv.lock
+**/__pycache__/
+**/*.pyc
+**/.env*
+**/*.pem
+**/*.key
