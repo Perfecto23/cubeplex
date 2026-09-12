@@ -14,8 +14,8 @@
 # (`build-and-push.sh` reads this from the operator's environment and
 # passes it through.)
 
-ARG NODE_VERSION=24.6
-ARG NODE_IMAGE_DIGEST=sha256:51dbfc749ec3018c7d4bf8b9ee65299ff9a908e38918ce163b0acfcd5dd931d9
+ARG NODE_VERSION=24.21.0
+ARG NODE_IMAGE_DIGEST=sha256:50c8e8ca1d27439048670df5883f32d57cf81cff6233222c893fd0d9884cbd81
 ARG NPM_REGISTRY=""
 
 
