@@ -1,0 +1,13 @@
+{
+  "profile": "moego-testing",
+  "account": "986420599013",
+  "region": "us-west-2",
+  "resource_prefix": "cubeplex-poc-20260912",
+  "runtime_name": "cubeplex_poc_20260912",
+  "repository": "Perfecto23/corplink-rs",
+  "allowed_team_id": "T011CF3CMJN",
+  "allowed_channel_id": "C0BKH447YGN",
+  "allowed_user_ids": "U09USS444UE",
+  "idle_seconds": 60,
+  "max_lifetime_seconds": 900
+}

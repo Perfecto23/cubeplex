@@ -2,12 +2,18 @@
 
 Artifacts for deploying CubePlex to your own infrastructure.
 
+This fork adds a separately runnable [AgentCore execution PoC](agentcore-poc/README.md).
+It builds a custom Runtime image and uses a bounded local Slack controller; it
+does not install the full CubePlex web application or Kubernetes stack. See its
+[verification record](agentcore-poc/VERIFICATION.md) for the tested scope.
+
 ## Pick a target
 
 Full install guides live on the docs site:
 
 | Mode | Status | Guide |
 |---|---|---|
+| **AgentCore execution PoC (this fork)** | scoped cloud/Slack flow verified | [Operator guide](agentcore-poc/README.md) |
 | **Kubernetes (Helm)** | available | [cubeplex.ai/docs/deployment/kubernetes](https://cubeplex.ai/docs/deployment/kubernetes) (English) / [中文](https://cubeplex.ai/docs/zh-Hans/deployment/kubernetes) |
 | **docker-compose** | available | [cubeplex.ai/docs/deployment/docker-compose](https://cubeplex.ai/docs/deployment/docker-compose) |
 
@@ -25,6 +31,7 @@ process. Existing sandbox E2E workflows are not part of image publication.
 ```
 deploy/
 ├── README.md                  # this file
+├── agentcore-poc/             # fork-specific Runtime image and operator guide
 ├── images/                    # shared Dockerfiles
 │   ├── backend/Dockerfile
 │   ├── frontend/Dockerfile
