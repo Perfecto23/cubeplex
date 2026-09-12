@@ -434,13 +434,12 @@ Resources:
         Version: '2012-10-17'
         Statement:
         - Effect: Allow
-          Action: bedrock-agentcore:InvokeAgentRuntime
+          Action:
+          - bedrock-agentcore:InvokeAgentRuntime
+          - bedrock-agentcore:StopRuntimeSession
           Resource:
-            Fn::Sub: ${ProductRuntime.AgentRuntimeArn}/runtime-endpoint/DEFAULT
-        - Effect: Allow
-          Action: bedrock-agentcore:StopRuntimeSession
-          Resource:
-            Fn::GetAtt: ProductRuntime.AgentRuntimeArn
+          - Fn::GetAtt: ProductRuntime.AgentRuntimeArn
+          - Fn::Sub: ${ProductRuntime.AgentRuntimeArn}/runtime-endpoint/DEFAULT
 Outputs:
   InstanceId:
     Value:
