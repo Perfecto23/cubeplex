@@ -59,7 +59,9 @@ Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，�
 | 旧的窄范围 AgentCore Slack PoC、证据和历史限制 | [PoC 运行指南](deploy/agentcore-poc/README.md) · [PoC 验证记录](deploy/agentcore-poc/VERIFICATION.md) |
 | 产品接入设计和实现范围 | [设计](docs/dev/specs/2026-09-12-agentcore-product-design.md) · [计划](docs/dev/plans/2026-09-12-agentcore-product.md) |
 
-独立执行层实验另见 [AgentCore MicroVM Git execution slice](deploy/agentcore-git-slice/README.md)。它验证 MicroVM 内的 CubeLoop、Git、Shell 与 Lambda broker 的受控 push/PR 和跨 VM resume，不代表 Web/Slack 已迁移到该架构；新 Runtime 和真实权限隔离 probe 已通过，模型与 GitHub 业务验收仍待完成。
+独立执行层实验另见 [AgentCore MicroVM Git execution slice](deploy/agentcore-git-slice/README.md)。它验证 MicroVM 内的 CubeLoop、Git、Shell 与 Lambda broker 的受控 push/PR 和跨 VM resume，不代表 Web/Slack 已迁移到该架构；Native Web/Slack bridge 仍是下一阶段。
+
+独立 Git slice 已由云端 Agent 完成修复、测试、commit、受限 push 和 [测试 PR #1](https://github.com/Perfecto23/cubeplex-microvm-git-poc-20260913/pull/1)。成功快照已在新 MicroVM 中完成零模型的数据恢复检查，重复完成请求也保持同一 SHA/PR。该 Git 任务的模型调用已达 `20/20`，自然语言续聊仍待验证；[镜像、恢复限制和实测数据](deploy/agentcore-git-slice/README.md#当前验收结果2026-09-13)单独记录。
 
 ## 上游 CubePlex
 
