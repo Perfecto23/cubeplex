@@ -25,7 +25,11 @@ Recovery modes:
   PR, handoff files and terminal result pass their existing postconditions.
 - Ordinary `stage=resume` still requires the saved snapshot and restores its typed native messages.
   A zero-model snapshot restore performed by an operator proves bundle/message/artifact integrity;
-  it is not evidence that a new Agent or a Web/Slack entrypoint completed a follow-up.
+  it is not evidence that a Web/Slack entrypoint completed a follow-up. The 2026-09-13
+  acceptance additionally ran a real `stage=resume`: a fresh workspace restored the saved
+  27-message prefix, added 10 messages with 4 model calls, and preserved the same HEAD, PR and
+  saved files. The original failed session's lost native history was not reconstructed; the
+  saved continuation snapshot was the recovery source.
 
 Worker environment: BROKER_FUNCTION_ARN, AWS_REGION. No platform config Secret.
 Runtime input: {"version":1,"task_id":"git-slice-20260913","stage":"work"|"resume","capability":"...","mode":"probe"|"run"}.
@@ -42,7 +46,7 @@ state, verifies files/tests/HEAD, reconfirms the same push/PR and reports comple
 redoing the fix.
 
 Broker env: TASK_BUCKET, TASK_ID, MODEL_SECRET_ARN, GITHUB_SECRET_ARN. Operator manifest key tasks/{TASK_ID}/manifest.json. Model secret JSON={api_key,base_url,model}; GitHub secret JSON={token}; canary is a separate harmless Secret.
-Manifest fields: schema_version=1,task_id,repo,remote_url,base_sha,branch,model,allowed_paths=[intervals.py],artifact_paths=[README.md,continuation.md],active_stage,capability_sha256,deadline,max_model_calls=20,max_model_request_bytes=65536,max_model_output_tokens=2048,max_bundle_bytes=2097152,max_snapshot_bytes=4194304,max_changed_bytes=65536,canary_secret_arn,canary_sha256,worker_role_arn,forbidden_value_sha256. UTC deadline is an ISO timestamp. capability_sha256 rotates between stages; manifest is operator-only. Set max_model_calls=0 for the first denial probe, then at most 20 for the complete work/resume cycle. forbidden_value_sha256 contains only operator-computed hashes of protected credentials, never the values.
+Manifest fields: schema_version=1,task_id,repo,remote_url,base_sha,branch,model,allowed_paths=[intervals.py],artifact_paths=[README.md,continuation.md],active_stage,capability_sha256,deadline,max_model_calls=100,max_model_request_bytes=65536,max_model_output_tokens=2048,max_bundle_bytes=2097152,max_snapshot_bytes=4194304,max_changed_bytes=65536,canary_secret_arn,canary_sha256,worker_role_arn,forbidden_value_sha256. UTC deadline is an ISO timestamp. capability_sha256 rotates between stages; manifest is operator-only. Set max_model_calls=0 for the first denial probe, then raise the limit only through an explicit operator/user authorization; the recorded acceptance raised it from 20 to 100 while preserving the existing model_calls counter. forbidden_value_sha256 contains only operator-computed hashes of protected credentials, never the values.
 
 The operator must initially create tasks/{TASK_ID}/state/state.json as {"model_calls":0,"completed_stages":{}} with an If-None-Match condition. Do not reinitialize existing task state or reset its budget counter. The broker has no ListBucket permission; a missing state object can therefore return AccessDenied rather than NoSuchKey.
 Broker role can read manifest but cannot update it; can read/write task state, request records and immutable snapshots under separate keys. Worker role has no S3 permissions.
