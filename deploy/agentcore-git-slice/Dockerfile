@@ -68,5 +68,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check \
     -r /tmp/requirements-frozen.txt --target "${LAMBDA_TASK_ROOT}"
 
 COPY deploy/agentcore-git-slice/cubeplex_git_slice "${LAMBDA_TASK_ROOT}/cubeplex_git_slice"
+# The private source archive keeps owner-only modes; Lambda assigns its own UID.
+RUN chmod -R a+rX "${LAMBDA_TASK_ROOT}/cubeplex_git_slice"
 
 CMD ["cubeplex_git_slice.broker.lambda_handler"]
