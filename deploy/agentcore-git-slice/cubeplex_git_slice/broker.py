@@ -96,7 +96,7 @@ def validate_manifest(manifest: dict[str, Any], task_id: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("capability_sha256", ""))):
         raise BrokerError("manifest_invalid")
     for key, maximum in {
-        "max_model_calls": 20,
+        "max_model_calls": 100,
         "max_model_request_bytes": 65536,
         "max_model_output_tokens": 2048,
         "max_bundle_bytes": 2097152,
