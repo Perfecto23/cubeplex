@@ -46,3 +46,45 @@ def test_runtime_rejects_other_versions(version: object) -> None:
                 "capability": "cap",
             }
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_active_invocation_reports_busy_and_always_releases_health_task(
+    monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    import asyncio
+    from cubeplex_native import runtime
+    from cubeplex_native.client import NativeControlPlaneClient
+
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class Client:
+        async def aclose(self) -> None:
+            if fails:
+                raise RuntimeError("close failed")
+
+    class Worker:
+        def __init__(self, client: object) -> None:
+            pass
+
+        async def run(self) -> dict[str, str]:
+            started.set()
+            await release.wait()
+            return {"status": "completed"}
+
+    monkeypatch.setattr(NativeControlPlaneClient, "from_environment", lambda **_: Client())
+    monkeypatch.setattr(runtime, "NativeWorker", Worker)
+    dispatch_id = "11111111-1111-4111-8111-111111111111"
+    task = asyncio.create_task(
+        runtime.invoke(
+            {"version": 2, "dispatch_id": dispatch_id, "capability": "task-only"},
+            SimpleNamespace(session_id=expected_session_id(dispatch_id)),
+        )
+    )
+    await started.wait()
+    assert runtime.app.get_current_ping_status().value == "HealthyBusy"
+    release.set()
+    await task
+    assert runtime.app.get_current_ping_status().value == "Healthy"
+    assert runtime.app.get_async_task_info()["active_count"] == 0

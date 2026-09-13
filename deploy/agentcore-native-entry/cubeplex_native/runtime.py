@@ -49,10 +49,14 @@ async def invoke(payload: Any, context: Any = None) -> dict[str, Any]:
             dispatch_id=dispatch_id,
             capability=capability,
         )
+        task_id = app.add_async_task("native-dispatch")
         try:
             result = await NativeWorker(client).run()
         finally:
-            await client.aclose()
+            try:
+                await client.aclose()
+            finally:
+                app.complete_async_task(task_id)
         return {
             **result,
             "session_id": session_id,
