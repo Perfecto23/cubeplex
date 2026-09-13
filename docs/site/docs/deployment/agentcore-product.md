@@ -13,11 +13,11 @@ Web / Slack
     ↓
 Kubernetes CubePlex control plane
     accounts · workspaces · conversations · RunManager · delivery
-    ↓ durable Postgres dispatch + Redis events
-AgentCore ARM64 worker
-    native CubePlex factory · tools · checkpoints · progress
-    ↓
-Web SSE / Slack durable tailer
+    ↓ dispatch identity + task capability
+AgentCore Native ARM64 MicroVM
+    CubeLoop · Git/Shell · local files
+    ↓ scoped model / checkpoint / event / file callbacks
+CubePlex Backend → Web SSE / Slack durable tailer
 ```
 
 Kubernetes owns the durable product state. AgentCore owns one claimed dispatch
@@ -27,13 +27,22 @@ depend on the old VM session still existing.
 
 ## Native MicroVM adapter
 
-A separate native adapter is being integrated. It runs CubeLoop and the Git/Shell/file tools together in a PUBLIC AgentCore MicroVM. The Backend keeps provider credentials, scoped history, PostgreSQL callback receipts, event delivery and file storage. It does not give the tool VM direct database, Redis, object-store or provider credentials.
+The native adapter runs CubeLoop and the Git/Shell/file tools together in a PUBLIC AgentCore MicroVM. The Backend keeps provider credentials, scoped history, PostgreSQL callback receipts, event delivery and file storage. It does not give the tool VM direct database, Redis, object-store or provider credentials.
 
-Its live Web/Slack acceptance is still pending; the compatibility results below do not prove this new route. The native snapshot currently preserves ordinary workspace files, excluding `.git` and hidden or credential files. The one-repository push/PR broker from the independent Git slice is not connected to the native product entrypoints. See the [native operator guide](https://github.com/Perfecto23/cubeplex/blob/feat/2026-09-13-agentcore-native-entry/deploy/agentcore-native-entry/README.md) for the actual tool and recovery limits.
+Testing Runtime v2 is `READY` and real Web/Slack task and follow-up checks have passed, including file cards, HITL pause/answer in a new Worker, Backend restart, stop/reclaim and duplicate callback fencing. The current baseline is Runtime `cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source `09f272ec4088f72fe709cc89b01d7abd68fe45d3` / digest `sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`, and Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest `sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`; the migration and image remain on the same source baseline.
 
-## Current status
+The Native credential boundary is verified: the Worker role matched, the platform package was unavailable,
+protected credential fingerprints had zero matches in env/proc, Secrets Manager and S3 reads were denied, the fake capability
+was rejected, the CP login returned 200, and the exact Runtime session stopped with HTTP 200. Earlier failed probe attempts are retained as history only. The native
+snapshot currently preserves ordinary workspace files, excluding `.git` and hidden or credential files.
+The one-repository push/PR broker from the independent Git slice is not connected to native product
+entrypoints. Browser and terminal file-sidebar behavior remains on OpenSandbox. See the [native operator
+guide](https://github.com/Perfecto23/cubeplex/blob/feat/2026-09-13-agentcore-native-entry/deploy/agentcore-native-entry/README.md)
+for actual tool and recovery limits.
 
-The Testing control plane and Runtime v3 are deployed on a small single-node
+## Retained compatibility baseline
+
+The retained compatibility Runtime v3 shares the Testing control plane on a single-node
 k3s cluster, and the Runtime readback is `READY`. Web compute, HITL, ordinary
 followup, file readback after AgentCore reclaim, long tasks, Backend restart,
 normal native Slack, duplicate replay, prepared stop and stop-then-followup have
@@ -41,8 +50,15 @@ passed real checks. The final running-command stop also passed: execution was
 confirmed before Stop, and no late marker appeared after its original deadline.
 This is a single-node compatibility PoC with the limits below.
 
-The final image source is commit
-`11a4a524713fe06d290f5610196099c694f9b132`. Kubernetes uses Backend
+The Native Runtime v2 is a separate execution baseline for the same control plane. Its Web/Slack task,
+follow-up, HITL, stop/reclaim and duplicate callback checks are complete; the compatibility Runtime v3,
+Frontend and OpenSandbox remain retained for rollback and legacy capabilities. A previous compatibility
+rollback was also verified with the new Backend migration container; it did not downgrade the database.
+The final Web and Slack acceptance completed after local forwarding and test Docker services were stopped,
+using the deployed service path.
+
+The compatibility baseline image source is commit
+`11a4a524713fe06d290f5610196099c694f9b132`. Its previous Backend image was
 `sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc`; Runtime v3 uses
 the ARM64 Worker
 `sha256:d632fe8f985fb88a2552a25068d090dc1a1747ef6f173355c1eb7d5938b62e40`.
@@ -57,22 +73,22 @@ historical bounded Slack/AgentCore PoC is documented separately in
 | Component | Responsibility | Durable authority |
 |---|---|---|
 | CubePlex Backend on k3s | auth, workspace scope, RunManager, dispatch admission, SSE, native Slack ingress and delivery | Postgres + Redis |
-| AgentCore Runtime | Runtime v3 claims one dispatch, runs native CubeLoop, invokes tools, persists checkpoints and events, and tracks async work as `HealthyBusy` | shared Postgres/Redis/RustFS/OpenSandbox |
+| Compatibility AgentCore Runtime | Runtime v3 claims one dispatch, runs native CubeLoop, invokes tools, persists checkpoints and events, and tracks async work as `HealthyBusy` | shared Postgres/Redis/RustFS/OpenSandbox |
+| Native AgentCore Runtime v2 | CubeLoop, bounded Git/Shell/file tools, HITL and control-plane callbacks inside one task MicroVM | PostgreSQL callbacks/checkpoints + Redis events + RustFS workspace files |
 | Postgres | conversations, memberships, dispatches, checkpoints and product records | source of truth for product history |
 | Redis | run coordination, event streams, delivery cursors and locks | live coordination and replay window |
 | RustFS/S3 | attachments and artifacts | durable object bytes |
 | OpenSandbox | existing CubePlex shell/file/browser tool environment | sandbox workspace/PVC state |
 
-The AgentCore invocation payload is only a protocol version and a dispatch ID.
-The worker loads identity and scope from the server-created dispatch and
+The compatibility invocation payload contains a version and dispatch ID. Native invocations additionally carry a short-lived task capability; privileged state is accessed through scoped Backend callbacks.
+Both paths resolve identity and scope from the server-created dispatch and
 rejects caller-supplied scope. Prompt and HITL answers use separate durable
 dispatches. Duplicate invokes return the existing dispatch state rather than
 calling the model twice.
 
 The node's invoke policy is deliberately narrow: `InvokeAgentRuntime` and
 `StopRuntimeSession` are granted for the exact Runtime ARN and the exact
-AgentCore default endpoint ARN. The Runtime itself uses the immutable ARM64
-Worker image inside the private VPC subnet.
+AgentCore default endpoint ARN. The compatibility Runtime uses its immutable ARM64 image in the private VPC subnet. The Native Runtime uses its separate immutable ARM64 image with PUBLIC networking.
 
 Stop and delivery have separate outcomes. A confirmed stop tears down the
 native run; an unconfirmed stop remains fenced as `stop_unknown`. A Slack
@@ -131,12 +147,13 @@ an allowlist limited to the test user and channel. Credentials stay in Secrets
 Manager or Kubernetes Secrets and never enter Git, image build arguments or
 logs.
 
-This compatibility PoC keeps OpenSandbox as a transitional Kubernetes tool
-environment. The next phase first isolates platform credentials, then moves
-Agent and tool execution together into an AgentCore MicroVM; file and Browser
-capabilities can migrate after that boundary is secure. The fork now contains
-an independent Git execution slice under `deploy/agentcore-git-slice`, with
-separate source and live acceptance evidence. It does not migrate this
+This compatibility route keeps OpenSandbox as a Kubernetes tool environment for
+rollback and legacy Browser/terminal file-sidebar behavior. Native Runtime v2
+now runs the Agent and bounded Git/Shell/file tools together in an AgentCore
+MicroVM. The next phase covers private GitHub authorization, retrieval across
+200 private repositories and replacing the OpenSandbox Browser. The fork also
+contains an independent Git execution slice under `deploy/agentcore-git-slice`,
+with separate source and live acceptance evidence; it does not migrate this
 Web/Slack product path.
 
 The current phase defers per-employee private GitHub authorization, retrieval

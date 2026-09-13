@@ -1,73 +1,48 @@
 # CubePlex × AgentCore
 
-这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的 fork，
-上游基线为 `f5272e19`（产品版本 `0.7.2`）。本阶段从此 fork 的 PR #1 合入提交
-`8fb3b5d6a171451848d7939be0209709e8ea05b3` 继续开发。本 fork 把 AgentCore 从一次性
-执行 PoC 接到 CubePlex 原生的 Web、Slack 和 RunManager 路径上。
-
-当前产品接入以 Runtime v3 的 `READY` readback 为最终部署基线。Web 计算、HITL、
-普通续聊、文件回收后读取、长任务、Backend 重启、正常 native Slack，以及
-duplicate replay 的验证已经通过。本轮兼容性 PoC 的三个收尾场景也全部通过：
-准备阶段停止、命令执行中停止、停止后保留上下文续聊。命令已启动的测试在停止后
-未写出延迟标记；现有 Sandbox 预留清理最长约 10 分半等限制仍保留。
-
-## 这个 fork 改了什么
-
-目标运行边界是：
+这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的 fork，上游基线为 `f5272e19`（产品版本 `0.7.2`）。本 fork 将 CubePlex 的产品控制面与 Agent 执行环境拆开：员工继续使用原来的网页或 Slack，CubeLoop Agent 和 Git/Shell/文件工具在 AgentCore MicroVM 中按需运行。
 
 ```text
 员工使用 Web / Slack
-  → Kubernetes 上的 CubePlex 控制面
-      账号、workspace、conversation、RunManager、SSE、消息投递
-  → AgentCore Runtime（ARM64 Worker）
-      读取共享 Postgres / Redis / RustFS / OpenSandbox，运行原生 CubeLoop Agent
-  → Redis 事件流、Web SSE 和 Slack durable delivery 回到员工
+  → Kubernetes 上的 CubePlex
+      账号、工作区、会话、任务状态、消息收发与持久化数据
+  → AgentCore Native Runtime
+      CubeLoop Agent + Git/Shell/文件工具
+  → 任务回调返回 Backend
+      保存检查点、进度、人工确认和文件，再展示给员工
 ```
 
-主要改动分为四层：
+当前 Testing 使用 `cubeplex_native_entry_20260913-sWxaCf7pyC` Runtime v2，状态 `READY`。真实网页与 Slack 任务、跨会话追问、下载文件、人工确认、Backend 重启、停止与回收、重复消息和晚到回调均已验收。关闭本机运维连接后，网页与 Slack 的新任务仍由云端处理；没有进行物理电脑关机实验。
 
-| 改动 | 责任边界 |
-|---|---|
-| PR #1 的 AgentCore HTTP entrypoint、真实 CubePlex factory 和模型 provider 适配 | 保留在 fork 中作为历史 PoC 基础；旧的 Slack polling 仅供回溯，不是新产品入口 |
-| K8s 产品基线 | 单节点 k3s 控制面、Caddy HTTPS、持久化 PG/Redis/RustFS、OpenSandbox 和 ECR digest 镜像 |
-| RunManager ↔ AgentCore | Postgres durable dispatch、一次 claim、followup/HITL、progress、stop unknown fence、Redis 事件和 delivery outcome |
-| 原生 Slack | xapp/Socket Mode、Slack user identity → CubePlex user/workspace、限定测试 user/channel 的 durable ingress/outbound |
+## 实现与部署
 
-执行计算的 AgentCore 会话可以被回收；conversation、checkpoint、dispatch、Redis
-协调状态和已保存 artifact 不依赖某个 AgentCore VM 会话。Kubernetes 这一阶段仍是
-单节点 Testing 拓扑，节点故障时没有 HA 保证。
+- **Kubernetes 控制面**：复用现有单节点 k3s、Backend、Frontend、Postgres、Redis、RustFS 和原生 Slack Socket Mode，入口不依赖本机轮询程序。
+- **Native 执行层**：自制 ARM64 镜像运行 CubeLoop 与本地工具。模型、数据库和存储主凭据留在 Backend；MicroVM 只有对应任务的短期回调权限和最小 AWS 角色。
+- **状态与恢复**：检查点与请求回执在同一 PostgreSQL 事务提交；事件、终态和停止有去重与隔离。等待人工回答时可以回收 VM，回答后用新会话继续同一个 run。
+- **回退**：旧 compatibility Runtime v3 和 OpenSandbox 保留。已验证切回旧执行路径仍保留会话上下文，再恢复 Native 模式；没有回滚数据库。
 
-最终产品镜像来自提交 `11a4a524713fe06d290f5610196099c694f9b132`：Backend
-`sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc`、
-Worker `sha256:d632fe8f985fb88a2552a25068d090dc1a1747ef6f173355c1eb7d5938b62e40`，
-Runtime v3 已用该 Worker 镜像 readback 为 `READY`；Node 24.21.0 Frontend 为
-`sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1`。
-Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，不能宣称安全扫描清零。
-私有 GitHub 授权、200 个仓库检索和替换成 AgentCore Browser 暂不属于这一阶段。
+Native Worker 来自 `09f272ec4088f72fe709cc89b01d7abd68fe45d3`，Backend 来自 `5e616137415f7b93d3e86b9514739ba129d9a7c4`，镜像 digest 与部署方法见 [Native 运行指南](deploy/agentcore-native-entry/README.md)。Backend 主容器和 migration 初始化容器须使用同一新版镜像。Frontend 沿用已部署版本。已修复有供应商补丁的镜像问题；仍保留已知未修复的 zlib High，Native 镜像另有 nghttp2 Medium，不能宣称扫描清零。
 
-当前 Kubernetes OpenSandbox 仍是兼容性 PoC 的过渡工具环境，不是下一阶段的最终
-执行形态。下一阶段先解决平台凭据隔离，评估 AgentCore MicroVM 同时承担 Agent 和工具执行，
-随后再迁移文件与 Browser 能力；本 fork 当前文档不把该迁移写成已实现能力。
+## 当前能力边界
 
-## Native MicroVM 接入
+原生路径支持公开仓库的 clone、读取和命令执行，以及普通文件的保存、展示和恢复。真实 Git 测试首轮因 Agent 未切换目录而发现 0 个测试，未计为通过；同会话纠正后实际运行了 4 个测试（1 通过、3 失败，测试仓库 main 故意保留缺陷），结果已如实保存。
 
-[Native 执行适配](deploy/agentcore-native-entry/README.md)已实现并通过本地整链测试：CubeLoop 与 Git/Shell/文件工具在独立 Worker 内执行，经任务凭据调用 Backend；原生聊天检查点、事件、下载成果和人工确认仍使用 CubePlex 现有存储及接口。真实 HTTP 联调覆盖了命令执行、文件展示、暂停、回答及新 Worker 恢复续跑。当前尚未完成 Testing 部署及新链路网页/Slack 用户验收。
+普通文件快照不保存 `.git`、隐藏文件、凭据、安装环境或后台进程。Browser、Terminal 和文件侧栏仍使用旧 OpenSandbox 环境；本轮 Native 的实际用户入口是对话和下载卡片。受限 push/PR broker 只在独立 Git slice 中验证，尚未接到产品入口。员工私库授权、200 仓库检索、AgentCore Browser 和其余工具迁移继续分批实施。
 
-Native 普通文件快照不含 `.git`、隐藏文件、凭据或安装环境；独立 Git slice 的受限 push/PR broker 尚未接到产品入口。旧兼容 Runtime 与 OpenSandbox 保留。完整部署与本轮能力边界以 [Native 运行指南](deploy/agentcore-native-entry/README.md) 为准。
+这是单节点 Testing PoC，节点故障没有 HA 保证。现有节点继续运行，固定基线约 $3.89/天，另加少量镜像、存储、模型及 AgentCore 按量费用；本阶段没有新增 EC2、EKS、NAT Gateway 或数据库。
 
-## 从哪里开始
+## 文档入口
 
 | 阅读目的 | 入口 |
 |---|---|
-| 完整产品的 AWS/k3s/Helm/AgentCore/Slack 操作 | [AgentCore product operator guide](deploy/agentcore-product/README.md) |
-| 产品部署架构、边界、状态和验收标准 | [AgentCore product deployment](docs/site/docs/deployment/agentcore-product.md) |
-| 标准 Docker Compose / Kubernetes 部署 | [部署入口](deploy/README.md) |
-| 旧的窄范围 AgentCore Slack PoC、证据和历史限制 | [PoC 运行指南](deploy/agentcore-poc/README.md) · [PoC 验证记录](deploy/agentcore-poc/VERIFICATION.md) |
-| 产品接入设计和实现范围 | [设计](docs/dev/specs/2026-09-12-agentcore-product-design.md) · [计划](docs/dev/plans/2026-09-12-agentcore-product.md) |
+| 当前 Native 路径、镜像、配置、验收和边界 | [Native 运行指南](deploy/agentcore-native-entry/README.md) |
+| 现有 AWS/k3s/Helm/Slack 基础设施与兼容回退 | [兼容部署指南](deploy/agentcore-product/README.md) |
+| 产品部署架构与两条执行路径 | [产品部署说明](docs/site/docs/deployment/agentcore-product.md) |
+| 独立 Git/Shell、受限 push/PR 与 Git 状态跨 VM 恢复 | [Git execution slice](deploy/agentcore-git-slice/README.md) |
+| 标准上游 Docker Compose / Kubernetes 部署 | [部署入口](deploy/README.md) |
+| 历史窄范围 Slack PoC | [PoC 指南](deploy/agentcore-poc/README.md) · [验证记录](deploy/agentcore-poc/VERIFICATION.md) |
 
-独立执行层实验另见 [AgentCore MicroVM Git execution slice](deploy/agentcore-git-slice/README.md)。它验证 MicroVM 内的 CubeLoop、Git、Shell 与 Lambda broker 的受控 push/PR 和跨 VM resume，不代表 Web/Slack 已迁移到该架构；Native Web/Slack bridge 仍是下一阶段。
-
-独立 Git slice 已由云端 Agent 完成修复、测试、commit、受限 push 和 [测试 PR #1](https://github.com/Perfecto23/cubeplex-microvm-git-poc-20260913/pull/1)。首次失败 session 的 native history 和 handoff 没有恢复；后续 published continuation 保存的 27 条 native history 成为了可恢复基线。用户明确授权后，模型预算从 `20` 提高到 `100`，保留已用计数，没有重置状态。真实 `resume` 新 VM 恢复了相同的 27 条消息前缀，新增 10 条消息、4 次模型调用，累计 37 条消息和 24 次调用；HEAD、PR 和已保存文件保持一致。重复 `resume` 返回 `already_completed`，没有新增模型调用，Runtime session 已停止或确认不存在；[镜像、恢复限制和实测数据](deploy/agentcore-git-slice/README.md#当前验收结果2026-09-13)单独记录。
+独立 Git slice 已完成真实云端修复、测试、commit、受限 push、[测试 PR](https://github.com/Perfecto23/cubeplex-microvm-git-poc-20260913/pull/1) 及新 VM 续聊。模型计数保留为累计 24 次，上限经授权从 20 调整到 100。其 Git bundle 与原生历史恢复证据独立记录，不能替代产品入口的验收，也不能被当作 Native 已接入 authenticated push/PR 的证据。
 
 ## 上游 CubePlex
 
