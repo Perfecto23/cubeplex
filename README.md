@@ -59,7 +59,7 @@ Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，�
 | 旧的窄范围 AgentCore Slack PoC、证据和历史限制 | [PoC 运行指南](deploy/agentcore-poc/README.md) · [PoC 验证记录](deploy/agentcore-poc/VERIFICATION.md) |
 | 产品接入设计和实现范围 | [设计](docs/dev/specs/2026-09-12-agentcore-product-design.md) · [计划](docs/dev/plans/2026-09-12-agentcore-product.md) |
 
-独立执行层实验另见 [AgentCore MicroVM Git execution slice](deploy/agentcore-git-slice/README.md)。它验证 MicroVM 内的 CubeLoop、Git、Shell 与 Lambda broker 的受控 push/PR 和跨 VM resume，不代表 Web/Slack 已迁移到该架构；当前 live Runtime、模型和 GitHub 验收仍待完成。
+独立执行层实验另见 [AgentCore MicroVM Git execution slice](deploy/agentcore-git-slice/README.md)。它验证 MicroVM 内的 CubeLoop、Git、Shell 与 Lambda broker 的受控 push/PR 和跨 VM resume，不代表 Web/Slack 已迁移到该架构；新 Runtime 和真实权限隔离 probe 已通过，模型与 GitHub 业务验收仍待完成。
 
 ## 上游 CubePlex
 

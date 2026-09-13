@@ -11,7 +11,7 @@ status result: {"commit":...,"pr":{number,url},"model_calls":...,"snapshot_sha25
 
 Worker environment: BROKER_FUNCTION_ARN, AWS_REGION. No platform config Secret.
 Runtime input: {"version":1,"task_id":"git-slice-20260913","stage":"work"|"resume","capability":"...","mode":"probe"|"run"}.
-Runtime output must never echo capability/credentials. boot_id derives from hostname and Linux kernel boot ID; session ID and whether the workspace already existed provide additional recovery evidence.
+Runtime output must never echo capability/credentials. boot_id derives from hostname and Linux kernel boot ID and is diagnostic only: two real sessions produced the same value. Use the AWS session ID, prior termination, workspace state and restored snapshot as recovery evidence; do not require boot_id uniqueness.
 
 Git helper: executable git-remote-broker calls module cubeplex_git_slice.git_remote. After public clone, set remote.origin.pushurl to broker::<task_id>. Worker task client configuration file is provided via CUBEPLEX_GIT_TASK_CONFIG (contains only broker ARN, task/stage capability, region and fixed repo/base/branch). The helper exports its new commit in a bundle and invokes op=push; the broker relays this identical commit. It must speak the standard Git remote-helper push/status protocol.
 
