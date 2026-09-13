@@ -21,6 +21,16 @@ default:
   deployment:
     mode: single_tenant
 
+  execution:
+    backend: local
+  agentcore:
+    execution_mode: compatibility
+    runtime_arn: ""
+    native_runtime_arn: ""
+    region: ""
+    capability_ttl_seconds: 1800
+    native_max_model_calls: 100
+
   # API Configuration
   api:
     host: "0.0.0.0"

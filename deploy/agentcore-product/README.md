@@ -18,11 +18,25 @@ Amazon Bedrock AgentCore Runtime
 
 The guide targets the economical Testing deployment in AWS account
 `986420599013`, region `us-west-2`, stack `cubeplex-product-20260912`. The
-control plane and Runtime v3 are deployed; the Runtime readback is `READY`.
+control plane and retained compatibility Runtime v3 are deployed; the Native
+Runtime v2 is the current execution baseline and is `READY`.
 Web compute, HITL, ordinary followup, file readback after AgentCore reclaim,
 long tasks, Backend restart, normal native Slack, duplicate replay, prepared
 stop and stop-then-followup have passed real checks. This is a compatibility
 PoC: the final running-command stop and followup checks have also passed.
+
+The newer Native Runtime v2 is documented separately in the [Native entrypoint
+guide](../agentcore-native-entry/README.md). It uses the same Kubernetes control
+plane but runs CubeLoop and the bounded Git/Shell/file tools together in an
+AgentCore MicroVM. Its current Testing baseline is Runtime
+`cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source
+`09f272ec4088f72fe709cc89b01d7abd68fe45d3` / digest
+`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`, and
+Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest
+`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`.
+The migration and image are a matched baseline. Native Web/Slack task and
+follow-up, HITL, stop/reclaim, restart and duplicate-callback checks have passed;
+the older Runtime v3 and OpenSandbox remain the compatibility rollback path.
 
 The fork starts from merged commit `8fb3b5d6a171451848d7939be0209709e8ea05b3`
 (upstream product version `0.7.2`). The older bounded Slack polling PoC remains
@@ -97,7 +111,7 @@ port 8080. The worker image must be pushed to:
 986420599013.dkr.ecr.us-west-2.amazonaws.com/cubeplex-product-20260912/worker@<digest>
 ```
 
-The final image readbacks for Runtime v3 are:
+The retained compatibility image readbacks for Runtime v3 are:
 
 ```text
 source=11a4a524713fe06d290f5610196099c694f9b132
@@ -283,7 +297,7 @@ token, request body or Secret value.
 
 For a fresh deployment, create the Runtime only after the final ARM64 worker
 image has been pushed and its immutable digest has been read back from ECR. The
-current Testing Runtime v3 is `READY` with the Worker image above, private VPC
+retained Testing compatibility Runtime v3 is `READY` with the Worker image above, private VPC
 networking, 60-second idle timeout and 900-second maximum lifetime. Its tracked
 async task state reports `HealthyBusy` while work is active, and API restart
 attaches a monitor to the existing remote task instead of treating it as a new
@@ -395,12 +409,13 @@ separate secret rotation policy.
 
 ## Next phase and deferred capabilities
 
-This compatibility PoC keeps OpenSandbox as a transitional Kubernetes tool
-environment. The next phase first isolates platform credentials, then moves
-Agent and tool execution together into an AgentCore MicroVM; file and Browser
-capabilities can migrate after that boundary is secure. The independent
-[Git execution slice](../agentcore-git-slice/README.md) supplies a separate
-test entrypoint. Its acceptance does not migrate the existing Web/Slack path.
+This compatibility route keeps OpenSandbox as a Kubernetes tool environment for
+rollback and legacy Browser/terminal file-sidebar behavior. Native Runtime v2
+now runs the Agent and bounded Git/Shell/file tools together in an AgentCore
+MicroVM. The next phase covers private GitHub authorization, retrieval across
+200 private repositories and replacing the OpenSandbox Browser. The independent
+[Git execution slice](../agentcore-git-slice/README.md) supplies a separate test
+entrypoint; its acceptance does not migrate the existing Web/Slack path.
 
 Per-employee private GitHub authorization, indexing and retrieval across 200
 private repositories, and replacing the existing OpenSandbox browser with an

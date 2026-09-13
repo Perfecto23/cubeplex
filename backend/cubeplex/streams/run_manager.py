@@ -1099,13 +1099,33 @@ class RunManager:
         except Exception:
             return False
 
-    def _agentcore_client(self) -> Any:
+    def _agentcore_client(self, dispatch: Any | None = None) -> Any:
         state = getattr(getattr(self, "_app", None), "state", None)
+        from cubeplex.agentcore.client import AgentCoreClient
+        from cubeplex.config import config
+
+        if dispatch is not None and dispatch.request.get("execution_mode") == "native":
+            from cubeplex.agentcore.native_auth import issue_capability
+
+            arn = str(dispatch.request.get("runtime_arn") or "")
+            native = getattr(state, "native_agentcore_client", None)
+            if native is not None and native.runtime_arn == arn:
+                return native
+            native = AgentCoreClient(
+                runtime_arn=arn,
+                region_name=str(config.get("agentcore.region", "") or "") or None,
+                payload_factory=lambda dispatch_id: {
+                    "version": 2,
+                    "dispatch_id": str(dispatch_id),
+                    "capability": issue_capability(dispatch_id),
+                },
+            )
+            if state is not None:
+                state.native_agentcore_client = native
+            return native
         existing = getattr(state, "agentcore_client", None)
         if existing is not None and not isinstance(existing, type(self._app)):
             return existing
-        from cubeplex.agentcore.client import AgentCoreClient
-        from cubeplex.config import config
 
         client = AgentCoreClient(
             runtime_arn=str(config.get("agentcore.runtime_arn", "")),
@@ -1133,6 +1153,20 @@ class RunManager:
         )
         from cubeplex.db.engine import async_session_maker
 
+        request = build_prompt_request(
+            content=content,
+            attachments=attachments,
+            ctx=ctx,
+            model_key=model_key,
+            reasoning=reasoning,
+        )
+        from cubeplex.config import config
+
+        if config.get("agentcore.execution_mode", "compatibility") == "native":
+            from cubeplex.agentcore.native_prepare import prepare_native_request
+
+            request = await prepare_native_request(request, ctx=ctx, app=self._app)
+
         return await create_dispatch(
             async_session_maker,
             scope=DispatchScope(
@@ -1143,13 +1177,7 @@ class RunManager:
                 run_id=run_id,
             ),
             operation="prompt",
-            request=build_prompt_request(
-                content=content,
-                attachments=attachments,
-                ctx=ctx,
-                model_key=model_key,
-                reasoning=reasoning,
-            ),
+            request=request,
         )
 
     async def _create_remote_respond_dispatch(
@@ -1166,8 +1194,20 @@ class RunManager:
             DispatchScope,
             build_respond_request,
             create_dispatch,
+            latest_dispatch_for_run,
         )
         from cubeplex.db.engine import async_session_maker
+
+        request = build_respond_request(
+            question_id=question_id,
+            answer=answer,
+            claim_token=claim_token,
+            ctx=ctx,
+        )
+        previous = await latest_dispatch_for_run(async_session_maker, run_id=run_id)
+        if previous is not None and previous.request.get("execution_mode") == "native":
+            for key in ("execution_mode", "runtime_arn", "model_ref", "model", "system_prompt"):
+                request[key] = previous.request[key]
 
         return await create_dispatch(
             async_session_maker,
@@ -1180,12 +1220,7 @@ class RunManager:
             ),
             operation="respond",
             claim_token=claim_token,
-            request=build_respond_request(
-                question_id=question_id,
-                answer=answer,
-                claim_token=claim_token,
-                ctx=ctx,
-            ),
+            request=request,
         )
 
     def _ensure_remote_monitor(self, run_id: str) -> asyncio.Task[None]:
@@ -1232,7 +1267,7 @@ class RunManager:
         if dispatch.status != "created":
             return
         try:
-            response = await self._agentcore_client().invoke(dispatch.id)
+            response = await self._agentcore_client(dispatch).invoke(dispatch.id)
             status = response.get("status") if isinstance(response, Mapping) else None
             if status in {"accepted", "created", "claimed"}:
                 self._ensure_remote_monitor(dispatch.run_id)
@@ -1293,9 +1328,21 @@ class RunManager:
         attempts = max(12, int(max_lifetime / max(interval, 1.0)) + 1)
 
         async def stop_and_fence(dispatch: Any) -> None:
+            if dispatch.request.get("execution_mode") == "native":
+                from cubeplex.agentcore.native_lifecycle import cancel_native_dispatch
+
+                await cancel_native_dispatch(
+                    dispatch,
+                    client=self._agentcore_client(dispatch),
+                    redis=self._redis,
+                    prefix=self._key_prefix,
+                    ttl_seconds=self._run_event_ttl_seconds,
+                    maxlen=self._run_stream_max_events,
+                )
+                return
             try:
                 await asyncio.wait_for(
-                    self._agentcore_client().stop(dispatch.id),
+                    self._agentcore_client(dispatch).stop(dispatch.id),
                     timeout=min(max(interval, 1.0), 10.0),
                 )
             except Exception as exc:
@@ -2030,6 +2077,17 @@ class RunManager:
             remote = await active_dispatch_for_run(async_session_maker, run_id=run_id)
             if remote is None:
                 return "not_found"
+            if remote.request.get("execution_mode") == "native":
+                from cubeplex.agentcore.native_lifecycle import cancel_native_dispatch
+
+                return await cancel_native_dispatch(
+                    remote,
+                    client=self._agentcore_client(remote),
+                    redis=self._redis,
+                    prefix=self._key_prefix,
+                    ttl_seconds=self._run_event_ttl_seconds,
+                    maxlen=self._run_stream_max_events,
+                )
             await request_dispatch_stop(async_session_maker, run_id=run_id)
             remote_fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             self._ack_waiters.setdefault(run_id, []).append(remote_fut)
@@ -2064,7 +2122,7 @@ class RunManager:
                     # teardown, then read the durable dispatch state back.
                     with suppress(Exception):
                         await asyncio.wait_for(
-                            self._agentcore_client().stop(remote.id),
+                            self._agentcore_client(remote).stop(remote.id),
                             timeout=min(max(ack_timeout, 1.0), 10.0),
                         )
                     for _ in range(max(1, int(ack_timeout * 2))):
@@ -4308,14 +4366,47 @@ class RunManager:
         llm_snapshot: Any | None = None,
     ) -> None:
         if self._agentcore_remote_enabled():
-            dispatch = await self._create_remote_prompt_dispatch(
-                run_id=run_id,
-                content=content,
-                attachments=attachments,
-                ctx=ctx,
-                model_key=model_key,
-                reasoning=reasoning or ReasoningControl(),
-            )
+            try:
+                dispatch = await self._create_remote_prompt_dispatch(
+                    run_id=run_id,
+                    content=content,
+                    attachments=attachments,
+                    ctx=ctx,
+                    model_key=model_key,
+                    reasoning=reasoning or ReasoningControl(),
+                )
+            except Exception as exc:
+                logger.warning("Remote run preparation failed: {}", type(exc).__name__)
+                await self._append_event(
+                    run_id,
+                    conversation_id,
+                    ErrorEvent(
+                        timestamp=datetime.now(UTC).isoformat(),
+                        data={
+                            "error_code": "remote_preparation_failed",
+                            "message": "The remote execution configuration is unavailable.",
+                        },
+                    ),
+                )
+                await self._append_event(
+                    run_id,
+                    conversation_id,
+                    DoneEvent(timestamp=datetime.now(UTC).isoformat(), data={}),
+                )
+                await update_run_meta(
+                    self._redis,
+                    prefix=self._key_prefix,
+                    run_id=run_id,
+                    status="errored",
+                    error_code="remote_preparation_failed",
+                )
+                await clear_active_run(
+                    self._redis,
+                    prefix=self._key_prefix,
+                    conversation_id=conversation_id,
+                    run_id=run_id,
+                )
+                return
             await self._invoke_remote_dispatch(dispatch)
             return
         from cubeplex.api.routes.v1.conversations import (
