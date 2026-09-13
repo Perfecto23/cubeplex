@@ -53,20 +53,21 @@ def make_store() -> TaskStore:
 
 def test_concurrent_budget_claims_cannot_overspend_or_reset_between_stages() -> None:
     store = make_store()
+    maximum = 100
 
     def claim(index: int) -> str:
         try:
-            store.claim_model(f"request-{index}", 20)
+            store.claim_model(f"request-{index}", maximum)
             return "claimed"
         except BrokerError as exc:
             return exc.code
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(claim, range(40)))
-    assert results.count("claimed") == 20
-    assert store.state()["model_calls"] == 20
+        results = list(pool.map(claim, range(140)))
+    assert results.count("claimed") == maximum
+    assert store.state()["model_calls"] == maximum
     with pytest.raises(BrokerError, match="model_budget_exceeded"):
-        store.claim_model("resume-request", 20)
+        store.claim_model("resume-request", maximum)
 
 
 def test_request_hash_and_terminal_result_are_immutable() -> None:

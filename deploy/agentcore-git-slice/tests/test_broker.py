@@ -35,7 +35,7 @@ def manifest() -> dict[str, Any]:
         "active_stage": "work",
         "capability_sha256": hashlib.sha256(CAPABILITY.encode()).hexdigest(),
         "deadline": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-        "max_model_calls": 20,
+        "max_model_calls": 100,
         "max_model_request_bytes": 65536,
         "max_model_output_tokens": 2048,
         "max_bundle_bytes": 2097152,
@@ -201,6 +201,17 @@ def test_public_manifest_has_exact_probe_constraints_without_authorization_secre
     assert not calls and not broker.secrets.calls
 
 
+def test_manifest_model_budget_hard_limit_is_100() -> None:
+    broker, _ = make_broker()
+    current = manifest()
+    current["max_model_calls"] = 100
+    broker.store.s3.objects["tasks/task/manifest.json"] = canonical(current)
+    assert broker.handle(event())["ok"]
+    current["max_model_calls"] = 101
+    broker.store.s3.objects["tasks/task/manifest.json"] = canonical(current)
+    assert broker.handle(event())["error"]["code"] == "manifest_invalid"
+
+
 @pytest.mark.parametrize(
     "updates",
     [
@@ -235,7 +246,7 @@ def test_budget_zero_and_exact_request_replay() -> None:
         broker.handle(event("model", model_request()))["error"]["code"] == "model_budget_exceeded"
     )
     assert not calls and not broker.secrets.calls
-    current["max_model_calls"] = 20
+    current["max_model_calls"] = 100
     broker.store.s3.objects["tasks/task/manifest.json"] = canonical(current)
     request = event("model", model_request())
     response = broker.handle(request)
