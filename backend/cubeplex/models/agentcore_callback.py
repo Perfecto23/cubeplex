@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Column, DateTime
+from sqlalchemy import JSON, Column, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
@@ -18,7 +18,10 @@ class AgentCoreCallback(SQLModel, table=True):
     operation: str = Field(max_length=64)
     payload_sha256: str = Field(max_length=64)
     status: str = Field(default="pending", max_length=16)
-    response: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    response: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSON().with_variant(JSONB(), "postgresql"), nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
