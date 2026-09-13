@@ -61,7 +61,7 @@ Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，�
 
 独立执行层实验另见 [AgentCore MicroVM Git execution slice](deploy/agentcore-git-slice/README.md)。它验证 MicroVM 内的 CubeLoop、Git、Shell 与 Lambda broker 的受控 push/PR 和跨 VM resume，不代表 Web/Slack 已迁移到该架构；Native Web/Slack bridge 仍是下一阶段。
 
-独立 Git slice 已由云端 Agent 完成修复、测试、commit、受限 push 和 [测试 PR #1](https://github.com/Perfecto23/cubeplex-microvm-git-poc-20260913/pull/1)。成功快照已在新 MicroVM 中完成零模型的数据恢复检查，重复完成请求也保持同一 SHA/PR。该 Git 任务的模型调用已达 `20/20`，自然语言续聊仍待验证；[镜像、恢复限制和实测数据](deploy/agentcore-git-slice/README.md#当前验收结果2026-09-13)单独记录。
+独立 Git slice 已由云端 Agent 完成修复、测试、commit、受限 push 和 [测试 PR #1](https://github.com/Perfecto23/cubeplex-microvm-git-poc-20260913/pull/1)。首次失败 session 的 native history 和 handoff 没有恢复；后续 published continuation 保存的 27 条 native history 成为了可恢复基线。用户明确授权后，模型预算从 `20` 提高到 `100`，保留已用计数，没有重置状态。真实 `resume` 新 VM 恢复了相同的 27 条消息前缀，新增 10 条消息、4 次模型调用，累计 37 条消息和 24 次调用；HEAD、PR 和已保存文件保持一致。重复 `resume` 返回 `already_completed`，没有新增模型调用，Runtime session 已停止或确认不存在；[镜像、恢复限制和实测数据](deploy/agentcore-git-slice/README.md#当前验收结果2026-09-13)单独记录。
 
 ## 上游 CubePlex
 

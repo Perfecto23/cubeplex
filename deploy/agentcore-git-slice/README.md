@@ -1,6 +1,6 @@
 # AgentCore MicroVM Git execution slice
 
-这是一个独立的执行层 PoC，用来验证“Agent 在新的 AgentCore MicroVM 中完成一次受控 Git 工作，再在另一台新 VM 中继续”的边界。当前 source 基线为 `482fe5df40e694c66ae52fbf2540593ba4c9803c`，Worker/Broker 已构建并推送到 Testing ECR。它没有把 CubePlex Web、Slack 或现有产品 RunManager 迁移到这里；旧产品和现有 Runtime 仍是回滚基线。
+这是一个独立的执行层 PoC，用来验证“Agent 在新的 AgentCore MicroVM 中完成一次受控 Git 工作，再在另一台新 VM 中继续”的边界。Worker 运行 source `482fe5df40e694c66ae52fbf2540593ba4c9803c`；Broker 当前预算扩展来自提交 `125a202efb571d6bc24e1dc2d40ae94e6f766bad`。两者都已构建并推送到 Testing ECR。它没有把 CubePlex Web、Slack 或现有产品 RunManager 迁移到这里；旧产品和现有 Runtime 仍是回滚基线。
 
 ## 它解决什么问题
 
@@ -63,9 +63,9 @@ deploy/agentcore-git-slice/build.sh <committed-sha> --push
 2. 按 [CONTRACT.md](./CONTRACT.md) 创建完整 manifest，填入固定 base SHA、Worker Role ARN、canary 哈希和凭据指纹。生成新的随机 capability，只把 SHA-256 写入 manifest。首轮 `max_model_calls=0`，设置近期 UTC deadline。
 3. 用带 `If-None-Match: *` 的 S3 PutObject 首次写入 `tasks/git-slice-20260913/manifest.json` 和 `tasks/git-slice-20260913/state/state.json`；后者初始内容为 `{"model_calls":0,"completed_stages":{}}`。已有状态不能重置。
 4. 创建 Runtime 输入私有 JSON，字段为 `version=1`、`task_id`、`stage=work`、`capability`、`mode=probe`。使用新的、至少 33 字符的 session ID 调用 `InvokeAgentRuntime`，完整保存结果。
-5. 确认实际 Worker role、canary IAM 拒绝、凭据面检查，以及错误 repo/ref/op/capability 和零预算拒绝均符合预期。随后才把 manifest 的调用上限提升至最多 20，并以 `mode=run` 执行。
+5. 确认实际 Worker role、canary IAM 拒绝、凭据面检查，以及错误 repo/ref/op/capability 和零预算拒绝均符合预期。随后才把 manifest 的调用上限提升至已授权的上限，并以 `mode=run` 执行。本次用户明确授权后把上限从 `20` 提高到 `100`，保留已用的 `20` 次，不重置任务状态。
 
-恢复时先确认原 session 停止，再把 operator manifest 切到 `active_stage=resume` 并旋转 capability；保留预算计数和所有已完成状态。新 session 使用 `stage=resume, mode=run`。AWS CLI 可通过 `--payload fileb://<private-input.json>` 传入内容，响应写入私有结果文件；不要在终端打印 capability。运行结束不自动合并测试 PR。
+恢复时先确认原 session 停止，再把 operator manifest 切到 `active_stage=resume` 并旋转 capability；保留预算计数和所有已完成状态。新 session 使用 `stage=resume, mode=run`。AWS CLI 可通过 `--payload fileb://<private-input.json>` 传入内容，响应写入私有结果文件；不要在终端打印 capability。运行结束不自动合并测试 PR。首次失败 session 丢失的 native history 不由 resume 伪造；resume 只恢复已经成功保存的 snapshot。
 
 ## 如何运行和验收
 
@@ -80,22 +80,27 @@ Runtime 输入只有版本、task、stage、capability 和 `probe|run` 模式；
 `run/work` 的 fresh 路径只在 Agent 完成测试、commit、broker push、PR、README handoff 和 continuation
 snapshot 后成功；已发布但没有成功 checkpoint 的 work 则走上面的 `published_commit_only` 路径。operator
 随后确认旧 Runtime session 已停止、旋转 stage capability，再以 `run/resume` 启动新 VM。resume 用
-snapshot 恢复相同 base/head/branch 和 CubeLoop native history，重复完成的 stage 只返回已有结果，不再次
-调用模型、push 或创建 PR。snapshot restore 已用真实 S3 数据、官方 Shell 和零模型调用验证；这项验证
-不等同于 Agent 自然语言 follow-up，后者仍受全局模型预算约束。
+snapshot 恢复相同 base/head/branch 和 CubeLoop native history；本次新 VM 从空 workspace 恢复了 27 条
+消息的完整前缀，新增 10 条消息、4 次模型调用，累计 37 条消息和 24 次调用，并保持同一 HEAD、PR
+和已保存文件。重复完成的 stage 返回 `already_completed`，不再次修改、push 或创建 PR。原始失败
+session 的 history 不在恢复范围内；成功 continuation 保存的 snapshot 才是 resume 的输入。
 
 ## 当前验收结果（2026-09-13）
 
 | 层次 | 已核对的结果 |
 | --- | --- |
-| 应用代码 | 86 项 slice 测试通过；ruff/mypy 通过 |
+| 应用代码 | 上一应用基线 86 项 slice 测试通过；本次预算调整 36 项相关测试通过，ruff/mypy 通过 |
 | Worker 镜像 | Source `482fe5df40e694c66ae52fbf2540593ba4c9803c`；digest `sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d`；ECR scan 完成，保留 1 High/1 Medium |
-| Broker 镜像 | Source `482fe5df40e694c66ae52fbf2540593ba4c9803c`；digest `sha256:18166341b191bcf976156f17193e8983c077a2ec1d924dca0e25f6e0280dc522`；ECR scan 完成且无 findings |
+| Broker 镜像 | Source `125a202efb571d6bc24e1dc2d40ae94e6f766bad`；digest `sha256:e28d843a062c6b36e8dece6d764502c345a1388b75aa9aa52870e565b791d735`；ECR scan 完成且无 findings |
+| Runtime | `cubeplex_git_slice_20260913-7TBZpqBGCs` v2，真实 readback 为 `READY`；使用上述 Worker digest |
 | 首次云端 work | `fc1637492a841c84dba9206595bf2289d6706b3e` 已 push；首次 PR 结果 unknown，native history/checkpoint 未成功保存，旧 session 已回收；人工 readback 已保存异常收敛记录 |
-| published continuation | 同一 SHA、PR #1 OPEN 未合入；新增 9 次模型调用，累计 `20/20`；snapshot 含 27 条新 native history、README 487B patch 和 continuation note |
+| published continuation | 同一 SHA、PR #1 OPEN 未合入；初始预算阶段新增 9 次模型调用，累计 `20` 次；snapshot 含 27 条新 native history、README 487B patch 和 continuation note |
 | 新 VM restore | 真实 S3 snapshot 经过官方 Shell stdin 恢复；27 条消息、HEAD、README patch、continuation note 逐字段一致，model calls=0，shell exit=0，StopRuntimeSession=200 |
-| 重复完成调用 | 新 session 返回 `already_completed`，保持同一 SHA、PR、snapshot 和计数 |
-| 后续边界 | 自然语言 follow-up 尚未验证，且当前全局预算已达 `20/20`；Native Web/Slack bridge 不属于本 slice |
+| 预算扩展 | 用户明确授权将 `max_model_calls` 从 `20` 提高到 `100`；已用计数保留为 `20`，任务状态未重置 |
+| 实际 resume | 新 VM 恢复 27 条消息的 exact prefix；新增 10 条消息、4 次模型调用，累计 37 条消息、24 次调用；same HEAD/PR/saved files，最新 snapshot `5d7f0ab86ac34ff19be80cc5bc60c6904dd83e0a450699d5ef43796d513bc7d3` |
+| 重复完成调用 | 新 session 返回 `already_completed`，保持同一 SHA、PR、snapshot 和 `24` 次计数，StopRuntimeSession=200 |
+| session 回收 | resume session 的终止读回为 `ResourceNotFoundException`，表示 session 不存在或已回收 |
+| 后续边界 | Native Web/Slack bridge 不属于本 slice；Native entry PR4 为 Draft，正在实现，尚未部署或验收 |
 
 继续会话的冷 clone 为约 511ms/1423 HTTP 接收字节，同环境 reuse 为约 329ms/951 HTTP 接收字节（含响应头），本地 Git objects 为 3303 字节。新 VM 中纯 restore 函数约 31ms；通过官方 Shell stdin 传入的序列化快照为 30236 字节，后者不是总网络流量。这个小 fixture 的结果不能外推到 200 个仓库。旧 EC2、旧 K8s 产品、持久盘、EIP、Secrets、ECR 和现有 VPC Runtime 仍被产品/回滚依赖，
 不能因为这个独立 PoC 而停止或删除。
@@ -110,6 +115,6 @@ Worker 已采用官方 Debian backports 的 curl `8.21.0-2~bpo13+1`，修复 [89
 
 保留项为 zlib `CVE-2026-85091`（[Debian 当前未修复](https://security-tracker.debian.org/tracker/CVE-2026-85091)）及 nghttp2 `CVE-2026-58055`（Medium）。它们没有被伪装为已修复。本镜像只用于这次受控 Testing 实验。
 
-新增三个 Secrets 的存储基线约 $1.20/月，另有 ECR/S3 存储及 Lambda/AgentCore 按量费用；[Secrets Manager 价格](https://aws.amazon.com/secrets-manager/pricing/)按存储时间和调用量计费。未新增 EC2、EKS、NAT Gateway 或数据库。本轮全局模型预算 `20/20` 已用完，自然语言 follow-up 未验证，不能自动增加预算。
+新增三个 Secrets 的存储基线约 $1.20/月，另有 ECR/S3 存储及 Lambda/AgentCore 按量费用；[Secrets Manager 价格](https://aws.amazon.com/secrets-manager/pricing/)按存储时间和调用量计费。未新增 EC2、EKS、NAT Gateway 或数据库。本次预算扩展只来自用户明确授权，当前任务累计调用 `24/100`；不能把预算扩展解释为自动重置或通用上限。
 
 旧产品 EC2 当前仍须运行，固定基线约 $3.89/天。后续停机候选窗口可设为 2026-09-14 20:00–20:30（Asia/Singapore），但这只是建议，尚未安排或执行；前提是独立 Git/出网验收通过、无活跃工作、已有数据备份，并明确接受网页、Slack、存储及旧 VPC Runtime 出网中断。恢复时启动同一 EC2，经 SSM 核对 k3s、PVC、NAT 路由和 ECR 拉取。保留的 60 GiB gp3、EIP 和两个旧产品 Secrets 仍约 $9.25/月，另加镜像及本 slice 的保留资源费用。
