@@ -47,6 +47,20 @@ deploy/agentcore-git-slice/build.sh <committed-sha> --push
 
 `--push` 固定到 Testing account/region。构建前确认 source SHA，推送后读回镜像 digest 和 ECR scan；镜像构建、Runtime 部署和业务验收分别记录。
 
+## 部署准备
+
+本实验固定使用 `moego-testing / us-west-2`。先通过 STS 确认账号为 `986420599013`，用 `infra.yaml` 创建 CloudFormation change set 并检查改动，再执行。镜像参数留空时只创建存储、ECR、Secrets 和两个受限角色；传入 `WorkerImageUri`、`BrokerImageUri` 的 ECR digest 后才创建 Lambda 和 PUBLIC Runtime。不会创建 K8s、数据库或 VPC NAT。
+
+从 stack Outputs 获取 Bucket、Role、Secret 和 Runtime ARN。配置文件放在仓库外的私有目录（目录 `0700`、文件 `0600`），使用标准 API 按这个顺序初始化：
+
+1. 向 model Secret 写入 `{api_key, base_url, model}`；向 GitHub Secret 写入 `{token}`。GitHub 凭据须只允许这个测试仓库的 Contents/PR 写权限，并设置短期过期时间。canary Secret 只存随机的无害测试值。Secret 使用 `put-secret-value --secret-string file://<private-file>`，不把值放在命令参数中。
+2. 按 [CONTRACT.md](./CONTRACT.md) 创建完整 manifest，填入固定 base SHA、Worker Role ARN、canary 哈希和凭据指纹。生成新的随机 capability，只把 SHA-256 写入 manifest。首轮 `max_model_calls=0`，设置近期 UTC deadline。
+3. 用带 `If-None-Match: *` 的 S3 PutObject 首次写入 `tasks/git-slice-20260913/manifest.json` 和 `tasks/git-slice-20260913/state/state.json`；后者初始内容为 `{"model_calls":0,"completed_stages":{}}`。已有状态不能重置。
+4. 创建 Runtime 输入私有 JSON，字段为 `version=1`、`task_id`、`stage=work`、`capability`、`mode=probe`。使用新的、至少 33 字符的 session ID 调用 `InvokeAgentRuntime`，完整保存结果。
+5. 确认实际 Worker role、canary IAM 拒绝、凭据面检查，以及错误 repo/ref/op/capability 和零预算拒绝均符合预期。随后才把 manifest 的调用上限提升至最多 20，并以 `mode=run` 执行。
+
+恢复时先确认原 session 停止，再把 operator manifest 切到 `active_stage=resume` 并旋转 capability；保留预算计数和所有已完成状态。新 session 使用 `stage=resume, mode=run`。AWS CLI 可通过 `--payload fileb://<private-input.json>` 传入内容，响应写入私有结果文件；不要在终端打印 capability。运行结束不自动合并测试 PR。
+
 ## 如何运行和验收
 
 Worker entrypoint 是：

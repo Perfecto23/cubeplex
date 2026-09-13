@@ -15,9 +15,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONPATH=/app
 
 RUN set -eux; \
+    printf '%s\n' 'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian trixie-backports main' \
+        > /etc/apt/sources.list.d/trixie-backports.list; \
     apt-get update; \
     apt-get upgrade -y; \
     apt-get install -y --no-install-recommends bash ca-certificates git tini; \
+    apt-get install -y --no-install-recommends -t trixie-backports \
+        libcurl3t64-gnutls=8.21.0-2~bpo13+1; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd --system --gid 10001 agentcore; \
     useradd --system --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin agentcore
@@ -52,7 +56,10 @@ FROM ${LAMBDA_BASE} AS broker
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-RUN dnf install -y ca-certificates git \
+RUN dnf --releasever=2023.12.20260831 install -y \
+        ca-certificates git \
+        openssl-fips-provider-latest-3.5.7-2.amzn2023.0.2 \
+        openssl-snapsafe-libs-3.5.7-2.amzn2023.0.2 \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
