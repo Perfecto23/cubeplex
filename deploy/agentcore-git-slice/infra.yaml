@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bounded AgentCore MicroVM Git execution slice. Empty image parameters create
+  only the task-owned foundation; compute is created only after immutable
+  Worker and broker image URIs are supplied.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: cubeplex-git-slice-20260913
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,39}$'
+  TaskId:
+    Type: String
+    Default: git-slice-20260913
+    AllowedPattern: '^[A-Za-z0-9_-]{1,80}$'
+  RuntimeName:
+    Type: String
+    Default: cubeplex_git_slice_20260913
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9_]{0,47}$'
+  WorkerImageUri:
+    Type: String
+    Default: ''
+    Description: Immutable ARM64 Worker image URI. Leave empty for foundation-only.
+  BrokerImageUri:
+    Type: String
+    Default: ''
+    Description: Immutable ARM64 Lambda broker image URI. Leave empty for foundation-only.
+
+Conditions:
+  HasWorkerImage:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: WorkerImageUri
+          - ''
+  HasBrokerImage:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: BrokerImageUri
+          - ''
+  DeployCompute:
+    Fn::And:
+      - Condition: HasWorkerImage
+      - Condition: HasBrokerImage
+
+Resources:
+  TaskBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName:
+        Fn::Sub: ${Prefix}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName:
+        Fn::Sub: ${Prefix}/worker
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+  BrokerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName:
+        Fn::Sub: ${Prefix}/broker
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaECRImageRetrieval
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-broker
+
+  ModelSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name:
+        Fn::Sub: ${Prefix}/model
+      Description: Placeholder only; operator replaces this with the bounded model credential.
+      SecretString: '{"api_key":"PLACEHOLDER_NOT_A_REAL_CREDENTIAL","base_url":"https://example.invalid/v1","model":"placeholder"}'
+
+  GitHubSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name:
+        Fn::Sub: ${Prefix}/github
+      Description: Placeholder only; operator replaces this with the repo-scoped short-lived writer.
+      SecretString: '{"token":"PLACEHOLDER_NOT_A_REAL_CREDENTIAL"}'
+
+  CanarySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name:
+        Fn::Sub: ${Prefix}/canary
+      Description: Harmless canary used only for the credential-boundary denial probe.
+      SecretString: '{"probe":"PLACEHOLDER_CANARY"}'
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${Prefix}-worker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${RuntimeName}*
+      Policies:
+        - PolicyName: invoke-bounded-broker-and-read-worker-image
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-broker
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  Fn::GetAtt: WorkerRepository.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogStreams
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}*:*
+              - Effect: Deny
+                Action:
+                  - secretsmanager:*
+                  - ssm:Get*
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                  - sts:AssumeRole*
+                  - iam:*
+                Resource: '*'
+
+  BrokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${Prefix}-broker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+      Policies:
+        - PolicyName: read-secrets-and-task-state
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - Ref: ModelSecret
+                  - Ref: GitHubSecret
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/manifest.json
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/state/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/requests/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/snapshots/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/state/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/requests/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${TaskBucket}/tasks/${TaskId}/snapshots/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Prefix}-broker:*
+
+  BrokerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployCompute
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${Prefix}-broker
+      RetentionInDays: 7
+
+  BrokerFunction:
+    Type: AWS::Lambda::Function
+    Condition: DeployCompute
+    DependsOn: BrokerLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${Prefix}-broker
+      Role:
+        Fn::GetAtt: BrokerRole.Arn
+      PackageType: Image
+      Code:
+        ImageUri:
+          Ref: BrokerImageUri
+      Architectures:
+        - arm64
+      MemorySize: 1024
+      Timeout: 120
+      EphemeralStorage:
+        Size: 512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          TASK_BUCKET:
+            Ref: TaskBucket
+          TASK_ID:
+            Ref: TaskId
+          MODEL_SECRET_ARN:
+            Ref: ModelSecret
+          GITHUB_SECRET_ARN:
+            Ref: GitHubSecret
+
+  GitSliceRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployCompute
+    Properties:
+      AgentRuntimeName:
+        Ref: RuntimeName
+      Description: Public ARM64 MicroVM for the bounded CubeLoop Git execution slice
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri:
+            Ref: WorkerImageUri
+      RoleArn:
+        Fn::GetAtt: WorkerRole.Arn
+      ProtocolConfiguration: HTTP
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: 60
+        MaxLifetime: 900
+      EnvironmentVariables:
+        BROKER_FUNCTION_ARN:
+          Fn::GetAtt: BrokerFunction.Arn
+        AWS_REGION:
+          Ref: AWS::Region
+      Tags:
+        Project:
+          Ref: Prefix
+        TaskId:
+          Ref: TaskId
+        Environment: testing
+
+Outputs:
+  TaskBucketName:
+    Description: Private versioned bucket; operator creates manifest.json and initial state.
+    Value:
+      Ref: TaskBucket
+  ManifestObjectKey:
+    Value:
+      Fn::Sub: tasks/${TaskId}/manifest.json
+  WorkerRepositoryUri:
+    Value:
+      Fn::GetAtt: WorkerRepository.RepositoryUri
+  BrokerRepositoryUri:
+    Value:
+      Fn::GetAtt: BrokerRepository.RepositoryUri
+  WorkerRoleArn:
+    Value:
+      Fn::GetAtt: WorkerRole.Arn
+  BrokerRoleArn:
+    Value:
+      Fn::GetAtt: BrokerRole.Arn
+  ModelSecretArn:
+    Value:
+      Ref: ModelSecret
+  GitHubSecretArn:
+    Value:
+      Ref: GitHubSecret
+  CanarySecretArn:
+    Value:
+      Ref: CanarySecret
+  BrokerFunctionArn:
+    Condition: DeployCompute
+    Value:
+      Fn::GetAtt: BrokerFunction.Arn
+  RuntimeArn:
+    Condition: DeployCompute
+    Value:
+      Fn::GetAtt: GitSliceRuntime.AgentRuntimeArn

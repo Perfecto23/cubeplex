@@ -83,8 +83,11 @@ single-node non-HA test topology.
 
 The fixed baseline is about **$118.24/month** at 730 hours, or **$3.89/day**,
 before the two new Secrets Manager secrets (about **$0.80/month**), ECR,
-AgentCore, model and traffic usage. Stop the node when the test is paused;
-retain the disk and credential stores if recovery is still required.
+AgentCore, model and traffic usage. Keep the node running during the independent
+Git slice: it hosts the product and storage and provides NAT for the existing
+VPC Runtime. A later cost pause needs a confirmed outage window and recovery
+checks; retained disk, public IPv4 and two product Secrets still cost about
+$9.25/month before ECR and other usage.
 
 ## Acceptance boundary
 
@@ -125,8 +128,10 @@ logs.
 This compatibility PoC keeps OpenSandbox as a transitional Kubernetes tool
 environment. The next phase first isolates platform credentials, then moves
 Agent and tool execution together into an AgentCore MicroVM; file and Browser
-capabilities can migrate after that boundary is secure. This fork does not
-implement that migration yet.
+capabilities can migrate after that boundary is secure. The fork now contains
+an independent Git execution slice under `deploy/agentcore-git-slice`, with
+separate source and live acceptance evidence. It does not migrate this
+Web/Slack product path.
 
 The current phase defers per-employee private GitHub authorization, retrieval
 across 200 private repositories, and replacing OpenSandbox Browser with

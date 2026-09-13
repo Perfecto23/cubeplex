@@ -369,11 +369,18 @@ request in the same Sandbox scope may wait. This PR preserves that behavior.
 
 ## 10. Stop, retain and recover
 
-For a cost pause, stop the new EC2 node and leave the retained EBS, EIP,
-Secrets Manager records, ECR repositories and stack state intact. Do not stop
-or delete shared unrelated resources. Resume by starting the node, reopening
-the SSM tunnel, checking k3s and PVC health, then running Helm readback and
-the ECR refresh Job.
+Keep the EC2 node running during the independent MicroVM Git slice. It still
+hosts the Web/Slack control plane and storage, and provides outbound NAT for
+this compatibility Runtime. Stopping it interrupts all of those paths.
+
+A later, separately confirmed cost pause must first record active-run state,
+back up persistent data and accept that outage. Retain EBS, EIP, Secrets
+Manager records, ECR repositories and stack state. The known retained baseline
+is about $9.25/month for 60 GiB gp3, one public IPv4 address and two product
+Secrets, plus ECR and other usage; stopping EC2 does not remove those costs.
+Resume by starting the same node, reopening SSM, checking k3s/PVC health and
+the Runtime NAT route, then running Helm readback and the ECR refresh Job.
+Do not stop or delete shared unrelated resources.
 
 If a deployment fails, read the CloudFormation stack, SSM invocation, Pod
 events, Runtime status and Redis/Postgres dispatch state before retrying. The
@@ -391,8 +398,9 @@ separate secret rotation policy.
 This compatibility PoC keeps OpenSandbox as a transitional Kubernetes tool
 environment. The next phase first isolates platform credentials, then moves
 Agent and tool execution together into an AgentCore MicroVM; file and Browser
-capabilities can migrate after that boundary is secure. This fork does not
-implement that migration yet.
+capabilities can migrate after that boundary is secure. The independent
+[Git execution slice](../agentcore-git-slice/README.md) supplies a separate
+test entrypoint. Its acceptance does not migrate the existing Web/Slack path.
 
 Per-employee private GitHub authorization, indexing and retrieval across 200
 private repositories, and replacing the existing OpenSandbox browser with an
