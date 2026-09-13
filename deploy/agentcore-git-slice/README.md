@@ -9,7 +9,7 @@
 - **MicroVM** 保留 CubeLoop Agent、Git 工作区和 Shell。代码检出、测试、修改和本地提交都在 VM 内完成。
 - **Lambda broker** 是可信写入口。它读取 operator 管理的 manifest 和短期 repo-scoped GitHub writer，验证仓库、base、branch、commit、改动路径、大小、预算和 capability 后，才转发模型请求、push 或 PR 操作。
 
-VM 可以看到自己的临时 task IAM/capability，不能因此推断这些凭据不可读取；合同只保证平台数据库、Vault、Supabase、GitHub 主 token 和模型主凭据不会下发到 VM。GitHub token 不写进 VM，也不要求用户把个人 `main` token 交给 Worker。
+VM 可以看到自己的临时 task IAM/capability。设计上只给它调用当前任务 broker 的权限；平台数据库、Vault、Supabase、GitHub 主 token 和模型主凭据不下发到 VM，实际隔离还须由镜像检查和真实 IAM probe 验证。GitHub writer 只放在 broker，限定这个公开测试仓库并设置短期有效期。
 
 本次 fixture 是公开的 `Perfecto23/cubeplex-microvm-git-poc-20260913`。固定 branch 是 `agentcore/fix-inclusive-total`，允许发布的代码路径只有 `intervals.py`；base SHA 和其他运行约束以 operator manifest/broker 返回为准。完整字段和错误合同见 [CONTRACT.md](./CONTRACT.md) 与 [设计说明](../../docs/dev/specs/2026-09-13-agentcore-git-slice-design.md)。
 
@@ -39,13 +39,13 @@ Runtime input
 deploy/agentcore-git-slice/build.sh <committed-sha>
 ```
 
-这一步生成私有 archive、冻结依赖、source manifest，并构建 ARM64 Worker 与 broker 镜像。需要发布到 Testing ECR 时，再显式使用：
+这一步生成私有 archive、冻结依赖、source manifest，并构建 ARM64 Worker 与 broker 镜像。如果还要发布到 Testing ECR，直接选下面的构建加推送命令，两个命令不必连续执行：
 
 ```bash
 deploy/agentcore-git-slice/build.sh <committed-sha> --push
 ```
 
-`--push` 固定到 operator 指定的 Testing account/region。构建前应读回 source SHA、镜像 digest 和 ECR scan；当前 IaC/Runtime 尚在首轮修正和验收，不能把镜像构建写成 Runtime 已部署或业务已验收。
+`--push` 固定到 Testing account/region。构建前确认 source SHA，推送后读回镜像 digest 和 ECR scan；镜像构建、Runtime 部署和业务验收分别记录。
 
 ## 如何运行和验收
 
