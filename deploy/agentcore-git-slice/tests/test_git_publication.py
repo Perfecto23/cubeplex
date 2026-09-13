@@ -215,7 +215,7 @@ def test_github_api_target_headers_and_safe_error_boundary() -> None:
     assert not seen
     with pytest.raises(BrokerError) as raised:
         publication.remote_head()
-    assert str(raised.value) == "github_unavailable"
+    assert str(raised.value) == "github_http_500"
     assert seen[0].url.host == "api.github.com"
     assert "private-token" not in str(seen[0].url)
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 from botocore.exceptions import ClientError
 
@@ -168,13 +169,42 @@ class TaskStore:
 
         self.mutate(change)
 
-    def reserve_pr(self, commit: str) -> bool:
-        def change(state: dict[str, Any]) -> bool:
+    def reserve_pr(self, commit: str, *, intent: str) -> str | None:
+        attempt = uuid4().hex
+
+        def change(state: dict[str, Any]) -> str | None:
             if state.get("commit") != commit or state.get("push_phase") != "pushed":
                 raise BrokerError("commit_not_pushed")
-            if state.get("pr_phase") is not None:
+            phase = state.get("pr_phase")
+            # Existing pending records (including pre-diagnostic live rows)
+            # remain fenced. Only a confirmed rejected attempt can be retried.
+            if phase in {"pending", "created"} or state.get("pr") is not None:
+                return None
+            if phase not in {None, "rejected"}:
+                raise BrokerError("state_invalid")
+            if state.get("pr_intent") not in {None, intent}:
+                raise BrokerError("pr_intent_conflict")
+            if phase == "rejected" and state.get("pr_intent") != intent:
+                raise BrokerError("pr_intent_conflict")
+            state.update(pr_phase="pending", pr_intent=intent, pr_attempt=attempt)
+            state.pop("pr_diagnostic", None)
+            return attempt
+
+        return self.mutate(change)
+
+    def record_pr_failure(
+        self, attempt: str, diagnostic: dict[str, str], *, rejected: bool
+    ) -> bool:
+        def change(state: dict[str, Any]) -> bool:
+            if (
+                state.get("pr_phase") != "pending"
+                or state.get("pr_attempt") != attempt
+                or state.get("pr") is not None
+            ):
                 return False
-            state["pr_phase"] = "pending"
+            state["pr_diagnostic"] = dict(diagnostic)
+            if rejected:
+                state["pr_phase"] = "rejected"
             return True
 
         return bool(self.mutate(change))

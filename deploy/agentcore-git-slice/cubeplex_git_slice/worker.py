@@ -42,6 +42,9 @@ class PullRequest(BaseModel):
     body: str = Field(default="", max_length=16_000)
 
 
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
+
+
 def _result(text: str, *, error: bool = False, terminate: bool = False) -> Any:
     from cubeloop import AgentToolResult, TextContent
 
@@ -120,6 +123,7 @@ class GitWorkspace:
         branch = str(self.config["branch"])
         remote = str(self.config["remote_url"])
         base = str(self.config["base_sha"])
+        checkout_sha = self.config.get("checkout_sha")
         self.root.mkdir(parents=True, exist_ok=True)
         if (self.repo / ".git").exists():
             started = time.perf_counter()
@@ -143,6 +147,10 @@ class GitWorkspace:
             _, fetch_stderr = await fetch.communicate()
             if fetch.returncode:
                 raise WorkerError("reuse_fetch_failed")
+            if checkout_sha:
+                current_head = await self._command("git", "-C", str(self.repo), "rev-parse", "HEAD")
+                if current_head.strip() != str(checkout_sha):
+                    raise WorkerError("published_commit_changed")
             self.metrics.clone.reuse_ms = (time.perf_counter() - started) * 1000
             self.metrics.clone.reuse_received_bytes = self._trace_received_bytes(fetch_stderr)
             self.metrics.clone.reuse_object_bytes = self._object_bytes()
@@ -163,7 +171,10 @@ class GitWorkspace:
         stdout, stderr = await proc.communicate()
         if proc.returncode:
             raise WorkerError(f"clone_failed:{stderr.decode(errors='replace')[:512]}")
-        await self._run_checked("git", "-C", str(self.repo), "checkout", "-B", branch, base)
+        checkout_target = str(checkout_sha or base)
+        await self._run_checked(
+            "git", "-C", str(self.repo), "checkout", "-B", branch, checkout_target
+        )
         await self._run_checked(
             "git", "-C", str(self.repo), "config", "user.name", "CubePlex Agent"
         )
@@ -188,7 +199,10 @@ class GitWorkspace:
         self.metrics.clone.fresh_clone_ms = (time.perf_counter() - started) * 1000
         self.metrics.clone.fresh_received_bytes = self._trace_received_bytes(stderr)
         self.metrics.clone.fresh_object_bytes = self._object_bytes()
-        return {"mode": "fresh", "ms": self.metrics.clone.fresh_clone_ms}
+        result = {"mode": "fresh", "ms": self.metrics.clone.fresh_clone_ms}
+        if checkout_sha:
+            result["checkout"] = "published_commit_only"
+        return result
 
     async def _command(self, *args: str) -> str:
         proc = await asyncio.create_subprocess_exec(
@@ -396,6 +410,16 @@ class GitSliceWorker:
         completed = status.get("completed_stages") or {}
         if isinstance(completed, dict) and stage in completed:
             return {"status": "already_completed", "stage": stage, "result": completed[stage]}
+        published_commit: str | None = None
+        if stage == "work" and not (isinstance(completed, dict) and "work" in completed):
+            published_value = status.get("commit")
+            if published_value is not None:
+                if not isinstance(published_value, str) or not _COMMIT_SHA.fullmatch(
+                    published_value
+                ):
+                    raise WorkerError("published_commit_invalid")
+                published_commit = published_value
+        recovery_mode = "published_commit_only" if published_commit else None
         manifest = await self._load_manifest()
         probe = await run_probe(self.broker, canary_secret_arn=manifest.get("canary_secret_arn"))
         if probe.canary != "iam_denied":
@@ -410,6 +434,8 @@ class GitSliceWorker:
             "stage": self.broker.config.stage,
             "capability": self.broker.config.capability,
         }
+        if published_commit:
+            worker_config["checkout_sha"] = published_commit
         self.git = GitWorkspace(
             self.workspace,
             config=worker_config,
@@ -451,31 +477,60 @@ class GitSliceWorker:
         )
         from cubeloop import Agent, ReasoningControl
 
+        system_prompt = (
+            "Work only in the fixed repository. Use clone_repository first, then shell. "
+            "Bash, Git and Python are available; apply_patch is not installed. "
+        )
+        if recovery_mode:
+            system_prompt += (
+                "This is a published-commit-only continuation. The broker has already "
+                "published the current HEAD. Do not modify intervals.py, fix code, create "
+                "a commit, or push. Verify HEAD, run the focused tests, and use "
+                "create_pull_request only to confirm or complete the existing PR for that "
+                "unchanged HEAD. Before completion, leave README.md with a concise handoff "
+                "note and create an untracked continuation.md for the next VM. "
+            )
+        elif stage == "resume":
+            system_prompt += (
+                "The successful checkpoint has been restored. Do not fix code, create a "
+                "commit or change the saved handoff files. Verify HEAD and tests, and "
+                "confirm push/PR idempotently for the same commit."
+            )
+        else:
+            system_prompt += (
+                "Only intervals.py may change in the commit. Fix the failing test, run the "
+                "targeted tests, commit, push through the broker remote helper, and create "
+                "the pull request. Before completion, leave README.md with a concise handoff "
+                "note and create an untracked continuation.md for the next VM. "
+            )
+        system_prompt += "Do not print credentials or capability strings."
         agent: Any = Agent(
             model=model,
             tools=self._tools(),
             messages=seeded_messages,
             reasoning=ReasoningControl(mode="auto", effort="low", summary="auto"),
-            system_prompt=(
-                "Work only in the fixed repository. Use clone_repository first, then shell. "
-                "Only intervals.py may change in the commit. Fix the failing test, run the "
-                "targeted tests, commit, push through the broker remote helper, and create "
-                "the pull request. Before completion, leave README.md with a concise handoff "
-                "note and create an untracked continuation.md for the next VM. "
-                "Do not print credentials or capability strings."
-            ),
+            system_prompt=system_prompt,
         )
-        prompt = (
-            "Resume the existing handoff without redoing the fix. Verify HEAD, run the focused "
-            "tests, and idempotently confirm push and pull request publication."
-            if stage == "resume"
-            else (
+        if recovery_mode:
+            prompt = (
+                "Continue from the broker-published commit without redoing the fix. Call "
+                "clone_repository first, verify that HEAD is unchanged, run the focused "
+                "tests, and idempotently confirm the existing push and pull request. Do not "
+                "edit intervals.py, create a commit, or push. Then leave the uncommitted "
+                "README.md handoff patch and untracked continuation.md."
+            )
+        elif stage == "resume":
+            prompt = (
+                "Resume the existing handoff without redoing the fix. Verify HEAD, run the "
+                "focused tests, and idempotently confirm push and pull request publication."
+            )
+        else:
+            prompt = (
                 "Clone the repository and run python -m unittest -v BEFORE editing to record "
                 "the failing baseline. Inspect and fix intervals.py, run the same tests again, "
-                "commit only intervals.py, push the current branch to origin, and create the PR. "
-                "Then leave the README.md handoff patch and untracked continuation.md."
+                "commit only intervals.py, push the current branch to origin, and create the "
+                "PR. Then leave the README.md handoff patch and untracked continuation.md."
             )
-        )
         try:
             await agent.prompt(prompt)
         finally:
@@ -493,12 +548,20 @@ class GitSliceWorker:
                 raise WorkerError("handoff_readme_change_missing")
             if not (self.git.repo / "continuation.md").exists():
                 raise WorkerError("handoff_continuation_missing")
+            if recovery_mode:
+                status_paths = {
+                    line[3:] for line in status_text.splitlines() if line and len(line) >= 4
+                }
+                if status_paths - {"README.md", "continuation.md"}:
+                    raise WorkerError("published_continuation_changed_code")
         result = await self.broker.status()
         commit = str(result.get("commit") or "")
         head = (await self.git._run_checked("git", "rev-parse", "HEAD")).strip()
         pr = result.get("pr")
         if commit != head or not isinstance(pr, dict) or not pr.get("number") or not pr.get("url"):
             raise WorkerError("publication_incomplete")
+        if published_commit and commit != published_commit:
+            raise WorkerError("published_commit_changed")
         if stage == "work":
             # Measure reuse only after the Agent's branch exists on GitHub.
             await self.git.clone_repository()
@@ -506,6 +569,11 @@ class GitSliceWorker:
             self.metrics.model_calls,
             int(result.get("model_calls", initial_model_calls)) - initial_model_calls,
         )
+        metrics = self.metrics.to_dict()
+        result_payload = dict(result)
+        if recovery_mode:
+            metrics["recovery_mode"] = recovery_mode
+            result_payload["recovery_mode"] = recovery_mode
         snapshot = capture_snapshot(
             self.git.repo,
             stage=stage,
@@ -513,8 +581,8 @@ class GitSliceWorker:
             base_sha=str(manifest["base_sha"]),
             branch=str(manifest["branch"]),
             native_messages=[m.model_dump(mode="json") for m in agent.state.messages],
-            metrics={**self.metrics.to_dict(), "probe": probe.to_dict()},
-            result=result,
+            metrics={**metrics, "probe": probe.to_dict()},
+            result=result_payload,
             artifact_paths=set(manifest["artifact_paths"]),
             max_snapshot_bytes=int(manifest.get("max_snapshot_bytes", 4_194_304)),
         )
@@ -522,6 +590,6 @@ class GitSliceWorker:
         return {
             "status": "complete",
             "stage": stage,
-            "result": result,
-            "metrics": self.metrics.to_dict(),
+            "result": result_payload,
+            "metrics": metrics,
         }

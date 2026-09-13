@@ -18,12 +18,24 @@ from urllib.parse import quote
 
 import httpx
 
-from .state import BrokerError, TaskStore
+from .state import BrokerError, TaskStore, digest
 
 REPO = "Perfecto23/cubeplex-microvm-git-poc-20260913"
 BRANCH = "agentcore/fix-inclusive-total"
 REMOTE = f"https://github.com/{REPO}.git"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+DEFINITE_PR_REJECTIONS = {400, 401, 403, 404, 405, 422, 429}
+
+
+class GitHubHTTPError(BrokerError):
+    """Safe HTTP evidence; response text and credential-bearing headers are excluded."""
+
+    def __init__(self, status: int, request_id: str | None) -> None:
+        super().__init__(f"github_http_{status}")
+        self.status = status
+        self.diagnostic = {"code": self.code}
+        if request_id and re.fullmatch(r"[0-9A-Fa-f]{4,32}(?::[0-9A-Fa-f]{4,32}){1,7}", request_id):
+            self.diagnostic["request_id"] = request_id
 
 
 def unbase64(value: Any, maximum: int) -> bytes:
@@ -76,17 +88,22 @@ class GitPublication:
                 if response.status_code == 404 and method == "GET":
                     return None
                 if response.status_code not in {200, 201}:
-                    raise BrokerError("github_unavailable")
+                    raise GitHubHTTPError(
+                        response.status_code, response.headers.get("x-github-request-id")
+                    )
                 raw = bytearray()
                 for part in response.iter_bytes():
                     raw.extend(part)
                     if len(raw) > 1024 * 1024:
-                        raise BrokerError("github_unavailable")
-                return json.loads(raw)
+                        raise BrokerError("github_response_unknown")
+                try:
+                    return json.loads(raw)
+                except (ValueError, UnicodeError) as exc:
+                    raise BrokerError("github_response_unknown") from exc
         except BrokerError:
             raise
         except Exception as exc:
-            raise BrokerError("github_unavailable") from exc
+            raise BrokerError("github_transport_unknown") from exc
 
     def remote_head(self) -> str | None:
         value = self._api("GET", f"/repos/{REPO}/git/ref/heads/{quote(BRANCH, safe='')}")
@@ -310,7 +327,11 @@ class GitPublication:
         if existing is not None:
             self.store.finish_pr(existing)
             return {**existing, "status": "already_exists"}
-        if readonly or not self.store.reserve_pr(commit):
+        if readonly:
+            raise BrokerError("pr_outcome_unknown")
+        intent = digest({"repo": REPO, "head": BRANCH, "base": "main", "commit": commit})
+        attempt = self.store.reserve_pr(commit, intent=intent)
+        if attempt is None:
             raise BrokerError("pr_outcome_unknown")
         try:
             self._api(
@@ -323,8 +344,25 @@ class GitPublication:
                     "body": data["body"],
                 },
             )
-        except BrokerError:
-            pass
+        except GitHubHTTPError as exc:
+            rejected = exc.status in DEFINITE_PR_REJECTIONS
+            self.store.record_pr_failure(attempt, exc.diagnostic, rejected=rejected)
+            if rejected:
+                if exc.status == 422:
+                    # 422 is not itself proof of a duplicate. A matching PR
+                    # may have become visible since the initial readback.
+                    try:
+                        existing = self._find_pr(commit)
+                    except BrokerError:
+                        existing = None
+                    if existing is not None:
+                        self.store.finish_pr(existing)
+                        return {**existing, "status": "already_exists"}
+                # A fresh broker request may explicitly retry this same
+                # publication intent. This call never sends another POST.
+                raise
+        except BrokerError as exc:
+            self.store.record_pr_failure(attempt, {"code": exc.code}, rejected=False)
         try:
             confirmed = self._find_pr(commit)
         except BrokerError as exc:

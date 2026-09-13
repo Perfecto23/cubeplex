@@ -90,8 +90,8 @@ def test_publication_has_one_owner_and_never_changes_commit() -> None:
     with pytest.raises(BrokerError, match="commit_conflict"):
         store.reserve_push("b")
     store.finish_push("a")
-    assert store.reserve_pr("a")
-    assert not store.reserve_pr("a")
+    assert store.reserve_pr("a", intent="same-publication")
+    assert not store.reserve_pr("a", intent="same-publication")
     store.finish_pr({"number": 1, "url": "test"})
     store.claim_model("model-1", 20)
     snapshot = {"stage": "work", "head_sha": "a", "result": {"status": "complete"}}
@@ -104,3 +104,25 @@ def test_publication_has_one_owner_and_never_changes_commit() -> None:
     assert store.public_status()["completed_stages"] == {"work": {"status": "complete"}}
     assert all(not key.endswith("manifest.json") for key in store.s3.writes)
     assert json.loads(canonical(snapshot)) == snapshot
+
+
+def test_rejected_pr_retry_has_one_owner_and_late_failure_cannot_downgrade() -> None:
+    store = make_store()
+    store.reserve_push("a")
+    store.finish_push("a")
+    first = store.reserve_pr("a", intent="same-target")
+    assert first is not None
+    assert store.record_pr_failure(first, {"code": "github_http_403"}, rejected=True)
+    with pytest.raises(BrokerError, match="pr_intent_conflict"):
+        store.reserve_pr("a", intent="different-target")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        attempts = list(pool.map(lambda _: store.reserve_pr("a", intent="same-target"), range(8)))
+    owners = [attempt for attempt in attempts if attempt is not None]
+    assert len(owners) == 1 and owners[0] != first
+    assert not store.record_pr_failure(first, {"code": "github_http_422"}, rejected=True)
+    assert store.state()["pr_phase"] == "pending"
+    assert store.state()["pr_attempt"] == owners[0]
+    store.finish_pr({"number": 1, "url": "same-pr"})
+    assert not store.record_pr_failure(owners[0], {"code": "github_http_403"}, rejected=True)
+    assert store.state()["pr_phase"] == "created"
+    assert store.reserve_pr("a", intent="same-target") is None
