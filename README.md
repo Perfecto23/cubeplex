@@ -49,6 +49,12 @@ Backend 和 Worker 各有 1 条供应商尚未提供修复的 High zlib CVE，�
 执行形态。下一阶段先解决平台凭据隔离，评估 AgentCore MicroVM 同时承担 Agent 和工具执行，
 随后再迁移文件与 Browser 能力；本 fork 当前文档不把该迁移写成已实现能力。
 
+## Native MicroVM 接入
+
+[Native 执行适配](deploy/agentcore-native-entry/README.md)已实现并通过本地整链测试：CubeLoop 与 Git/Shell/文件工具在独立 Worker 内执行，经任务凭据调用 Backend；原生聊天检查点、事件、下载成果和人工确认仍使用 CubePlex 现有存储及接口。真实 HTTP 联调覆盖了命令执行、文件展示、暂停、回答及新 Worker 恢复续跑。当前尚未完成 Testing 部署及新链路网页/Slack 用户验收。
+
+Native 普通文件快照不含 `.git`、隐藏文件、凭据或安装环境；独立 Git slice 的受限 push/PR broker 尚未接到产品入口。旧兼容 Runtime 与 OpenSandbox 保留。完整部署与本轮能力边界以 [Native 运行指南](deploy/agentcore-native-entry/README.md) 为准。
+
 ## 从哪里开始
 
 | 阅读目的 | 入口 |

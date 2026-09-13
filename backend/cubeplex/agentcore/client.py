@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 from uuid import UUID
 
@@ -23,10 +23,12 @@ class AgentCoreClient:
         runtime_arn: str,
         region_name: str | None = None,
         client: Any | None = None,
+        payload_factory: Callable[[UUID], Mapping[str, object]] | None = None,
     ) -> None:
         if not runtime_arn:
             raise ValueError("agentcore_runtime_arn_required")
         self.runtime_arn = runtime_arn
+        self._payload_factory = payload_factory or invocation_payload
         self._client = client or boto3.Session(region_name=region_name).client(
             "bedrock-agentcore",
             region_name=region_name,
@@ -40,7 +42,7 @@ class AgentCoreClient:
     async def invoke(self, dispatch_id: UUID) -> Mapping[str, object]:
         """Invoke one dispatch; never retry an uncertain network outcome."""
         session_id = agentcore_session_id(dispatch_id)
-        payload = json.dumps(invocation_payload(dispatch_id), separators=(",", ":")).encode()
+        payload = json.dumps(self._payload_factory(dispatch_id), separators=(",", ":")).encode()
         response = await asyncio.to_thread(
             self._client.invoke_agent_runtime,
             agentRuntimeArn=self.runtime_arn,

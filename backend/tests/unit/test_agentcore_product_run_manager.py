@@ -34,7 +34,7 @@ async def test_remote_execute_persists_dispatch_before_invoke(
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     manager = _manager(redis)
     monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
-    dispatch = SimpleNamespace(id="dispatch-1", status="created")
+    dispatch = SimpleNamespace(id="dispatch-1", request={}, status="created")
     create = AsyncMock(return_value=dispatch)
     invoke = AsyncMock()
     monkeypatch.setattr(manager, "_create_remote_prompt_dispatch", create)
@@ -60,6 +60,7 @@ async def test_remote_stop_unknown_does_not_cancel_control_plane_task(
     monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
     remote = SimpleNamespace(
         id="d1",
+        request={},
         run_id="r1",
         heartbeat_at=datetime.now(UTC),
         claimed_at=datetime.now(UTC),
@@ -74,7 +75,7 @@ async def test_remote_stop_unknown_does_not_cancel_control_plane_task(
         AsyncMock(return_value=[remote]),
     )
     monkeypatch.setattr(manager, "_publish_control", AsyncMock(side_effect=TimeoutError()))
-    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(stop=AsyncMock()))
+    monkeypatch.setattr(manager, "_agentcore_client", lambda *_: SimpleNamespace(stop=AsyncMock()))
     monkeypatch.setattr(
         "cubeplex.agentcore.dispatch.mark_dispatch_stop_unknown",
         AsyncMock(),
@@ -95,8 +96,8 @@ async def test_remote_cancel_ack_with_active_dispatch_is_stop_unknown(
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     manager = _manager(redis)
     monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
-    remote = SimpleNamespace(id="d1", run_id="r1", status="claimed")
-    unknown = SimpleNamespace(id="d1", run_id="r1", status="stop_unknown")
+    remote = SimpleNamespace(id="d1", run_id="r1", request={}, status="claimed")
+    unknown = SimpleNamespace(id="d1", run_id="r1", request={}, status="stop_unknown")
     monkeypatch.setattr(
         "cubeplex.agentcore.dispatch.active_dispatch_for_run",
         AsyncMock(side_effect=[remote, unknown]),
@@ -129,7 +130,7 @@ async def test_remote_cancel_reads_terminal_dispatch_before_runtime_stop(
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     manager = _manager(redis)
     monkeypatch.setattr(manager, "_agentcore_remote_enabled", lambda: True)
-    remote = SimpleNamespace(id="d1", run_id="r1", status="claimed")
+    remote = SimpleNamespace(id="d1", run_id="r1", request={}, status="claimed")
     stop = AsyncMock()
     monkeypatch.setattr(
         "cubeplex.agentcore.dispatch.active_dispatch_for_run",
@@ -140,7 +141,7 @@ async def test_remote_cancel_reads_terminal_dispatch_before_runtime_stop(
         AsyncMock(return_value=[remote]),
     )
     monkeypatch.setattr(manager, "_publish_control", AsyncMock(side_effect=TimeoutError()))
-    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(stop=stop))
+    monkeypatch.setattr(manager, "_agentcore_client", lambda *_: SimpleNamespace(stop=stop))
 
     result = await manager.dispatch_cancel("r1", ack_timeout=0.1)
 
@@ -311,6 +312,7 @@ async def test_remote_reconcile_max_lifetime_ends_with_bounded_stop(
     manager = _manager(redis)
     remote = SimpleNamespace(
         id="d1",
+        request={},
         run_id="r1",
         heartbeat_at=datetime.now(UTC),
         claimed_at=datetime.now(UTC),
@@ -321,7 +323,7 @@ async def test_remote_reconcile_max_lifetime_ends_with_bounded_stop(
         AsyncMock(return_value=remote),
     )
     stop = AsyncMock()
-    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(stop=stop))
+    monkeypatch.setattr(manager, "_agentcore_client", lambda *_: SimpleNamespace(stop=stop))
     mark_unknown = AsyncMock()
     monkeypatch.setattr(
         "cubeplex.agentcore.dispatch.mark_dispatch_stop_unknown",
@@ -349,10 +351,10 @@ async def test_accepted_remote_invoke_attaches_one_monitor(
 ) -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     manager = _manager(redis)
-    dispatch = SimpleNamespace(id="d1", run_id="r1", status="created")
+    dispatch = SimpleNamespace(id="d1", run_id="r1", request={}, status="created")
     invoke = AsyncMock(return_value={"status": "accepted", "dispatch_id": "d1"})
     attach = MagicMock()
-    monkeypatch.setattr(manager, "_agentcore_client", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(manager, "_agentcore_client", lambda *_: SimpleNamespace(invoke=invoke))
     monkeypatch.setattr(manager, "_ensure_remote_monitor", attach)
 
     await manager._invoke_remote_dispatch(dispatch)

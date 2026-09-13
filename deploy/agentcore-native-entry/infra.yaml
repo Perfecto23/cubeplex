@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Native CubeLoop MicroVM execution using the existing CubePlex control plane
+Parameters:
+  Prefix:
+    Type: String
+    Default: cubeplex-agentcore-native-entry-20260913
+    AllowedPattern: '[a-z0-9-]+'
+  RuntimeName:
+    Type: String
+    Default: cubeplex_native_entry_20260913
+    AllowedPattern: '[A-Za-z][A-Za-z0-9_]+'
+  ImageUri:
+    Type: String
+    Default: ''
+  ControlPlaneUrl:
+    Type: String
+    Default: https://cubeplex.34.218.93.56.sslip.io
+    AllowedPattern: https://[^/]+/?
+  ControllerRole:
+    Type: String
+    Default: cubeplex-product-20260912-NodeRole-mkG6JWn1AQ8j
+Conditions:
+  DeployRuntime:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: ImageUri
+      - ''
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName:
+        Fn::Sub: ${Prefix}/worker
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Expire untagged layers after 7 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}}]}'
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${Prefix}-worker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock-agentcore.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount:
+                Ref: AWS::AccountId
+            ArnLike:
+              aws:SourceArn:
+                Fn::Sub: arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${RuntimeName}*
+      Policies:
+      - PolicyName: native-image-and-logs-only
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+            Resource:
+              Fn::GetAtt: Repository.Arn
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:DescribeLogStreams
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}*
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}*:*
+          - Effect: Deny
+            Action:
+            - secretsmanager:*
+            - ssm:Get*
+            - kms:Decrypt
+            - kms:GenerateDataKey*
+            - sts:AssumeRole*
+            - iam:*
+            - s3:*
+            - lambda:Invoke*
+            Resource: '*'
+  Runtime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployRuntime
+    Properties:
+      AgentRuntimeName:
+        Ref: RuntimeName
+      Description: Native CubeLoop Agent and local tools; task-only Backend callbacks
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri:
+            Ref: ImageUri
+      RoleArn:
+        Fn::GetAtt: WorkerRole.Arn
+      ProtocolConfiguration: HTTP
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: 60
+        MaxLifetime: 900
+      EnvironmentVariables:
+        CUBEPLEX_NATIVE_CONTROL_PLANE_URL:
+          Ref: ControlPlaneUrl
+        AWS_REGION:
+          Ref: AWS::Region
+      Tags:
+        Project:
+          Ref: Prefix
+  ControllerInvokePolicy:
+    Type: AWS::IAM::Policy
+    Condition: DeployRuntime
+    Properties:
+      PolicyName: invoke-native-cubeplex-worker
+      Roles:
+      - Ref: ControllerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - bedrock-agentcore:InvokeAgentRuntime
+          - bedrock-agentcore:StopRuntimeSession
+          Resource:
+          - Fn::GetAtt: Runtime.AgentRuntimeArn
+          - Fn::Sub: ${Runtime.AgentRuntimeArn}/runtime-endpoint/DEFAULT
+Outputs:
+  RepositoryUri:
+    Value:
+      Fn::GetAtt: Repository.RepositoryUri
+  WorkerRoleArn:
+    Value:
+      Fn::GetAtt: WorkerRole.Arn
+  RuntimeArn:
+    Condition: DeployRuntime
+    Value:
+      Fn::GetAtt: Runtime.AgentRuntimeArn

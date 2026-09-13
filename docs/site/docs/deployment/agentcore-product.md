@@ -25,6 +25,12 @@ and its execution process. When the AgentCore session is reclaimed, the next
 followup loads the native CubeLoop checkpoint from shared storage; it does not
 depend on the old VM session still existing.
 
+## Native MicroVM adapter
+
+A separate native adapter is being integrated. It runs CubeLoop and the Git/Shell/file tools together in a PUBLIC AgentCore MicroVM. The Backend keeps provider credentials, scoped history, PostgreSQL callback receipts, event delivery and file storage. It does not give the tool VM direct database, Redis, object-store or provider credentials.
+
+Its live Web/Slack acceptance is still pending; the compatibility results below do not prove this new route. The native snapshot currently preserves ordinary workspace files, excluding `.git` and hidden or credential files. The one-repository push/PR broker from the independent Git slice is not connected to the native product entrypoints. See the [native operator guide](https://github.com/Perfecto23/cubeplex/blob/feat/2026-09-13-agentcore-native-entry/deploy/agentcore-native-entry/README.md) for the actual tool and recovery limits.
+
 ## Current status
 
 The Testing control plane and Runtime v3 are deployed on a small single-node

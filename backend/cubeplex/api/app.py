@@ -658,6 +658,9 @@ def create_app(
     )
 
     app.include_router(system.router, prefix="/api/v1")
+    from cubeplex.agentcore.native_router import router as native_agentcore_router
+
+    app.include_router(native_agentcore_router, prefix="/api/v1")
     app.include_router(onboarding.router, prefix="/api/v1")
     app.include_router(workspaces_router, prefix="/api/v1")
     # Search router goes first: it owns `/conversations/search`, while the
