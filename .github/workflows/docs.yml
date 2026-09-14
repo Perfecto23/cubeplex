@@ -60,7 +60,9 @@ jobs:
 
   deploy-cloudflare:
     name: Deploy docs to Cloudflare Pages
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      (github.repository == 'cubeplexai/cubeplex' || vars.DOCS_CLOUDFLARE_DEPLOY_ENABLED == 'true') &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs: build-and-check
     runs-on: ubuntu-latest
     steps:
