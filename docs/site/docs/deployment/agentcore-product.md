@@ -135,7 +135,7 @@ checks; do not delete the retained Node or disk.
 
 Private employee GitHub authorization, indexing across 200 private repositories
 and replacing the OpenSandbox Browser with an AgentCore Browser remain deferred.
-The [Native operator guide](../../../../deploy/agentcore-native-entry/README.md)
+The [Native operator guide](https://github.com/Perfecto23/cubeplex/blob/main/deploy/agentcore-native-entry/README.md)
 contains the current tool and recovery boundary. The
-[retired Git slice guide](../../../../deploy/agentcore-git-slice/README.md) is
+[retired Git slice guide](https://github.com/Perfecto23/cubeplex/blob/main/deploy/agentcore-git-slice/README.md) is
 historical evidence only.
