@@ -2,7 +2,7 @@
 
 This adapter keeps CubePlex's accounts, workspaces, conversations, run IDs, Slack transport and storage in its existing Backend. CubeLoop and the local Git/Shell/file tools run together in a task-specific AgentCore MicroVM. The Backend exposes only dispatch-scoped callbacks for the model, history, progress, saved files and human answers.
 
-The local integration flow has passed: the real CubeLoop Worker calls the actual HTTP router, PostgreSQL, Redis and RustFS to execute a command, present a file, pause for human input and resume from a fresh workspace. The native Runtime is now `READY` in Testing and real Web/Slack task and follow-up checks have passed. See the [design](../../docs/dev/specs/2026-09-13-agentcore-native-entry-design.md) and [plan](../../docs/dev/plans/2026-09-13-agentcore-native-entry.md). The independent [Git slice](../agentcore-git-slice/README.md) has its own cloud evidence and is not the native product acceptance result.
+The local integration flow has passed: the real CubeLoop Worker calls the actual HTTP router, PostgreSQL, Redis and RustFS to execute a command, present a file, pause for human input and resume from a fresh workspace. The Native Runtime is the only AgentCore product runtime, is `READY` in Testing, and real Web/Slack task and follow-up checks have passed. See the [design](../../docs/dev/specs/2026-09-13-agentcore-native-entry-design.md) and [plan](../../docs/dev/plans/2026-09-13-agentcore-native-entry.md). The independent [Git slice](../agentcore-git-slice/README.md) is retired historical evidence, not a product runtime.
 
 The current Testing baseline uses Runtime `cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source
 `09f272ec4088f72fe709cc89b01d7abd68fe45d3` with digest
@@ -22,7 +22,7 @@ Each new prompt or resumed human answer uses its own dispatch and Runtime sessio
 - Available local tools: bounded Bash execution, Git via Bash, UTF-8 file read/write/edit, explicit file presentation and CubeLoop `ask_user`.
 - Public repositories can be cloned, read and tested in the MicroVM. Ordinary, non-hidden workspace files are saved in the existing S3-compatible storage. The native tool environment does not receive model provider, database, object-store or GitHub master credentials. Native conversations and downloadable file cards use the existing CubePlex event and artifact paths.
 - `.git`, hidden files, credentials, installed packages and background processes are not restored. A saved source directory is not a resumed Git checkout. The independent slice's one-repository push/PR broker is not connected to these native entrypoints. Do not claim native authenticated push/PR or complete Git-state persistence.
-- Attachments, non-Responses providers, model fallback chains and configured organization command rules currently cause preparation to fail closed. Other CubePlex tools, plugins and OpenSandbox-specific capabilities remain available on the retained compatibility route.
+- Attachments, non-Responses providers, model fallback chains and configured organization command rules currently cause preparation to fail closed. Browser, Terminal and sandbox file-sidebar capabilities remain on the retained OpenSandbox service.
 
 These boundaries keep this stage focused on the control-plane/execution connection. They do not grant access to company private repositories or change Slack subscriptions.
 
@@ -36,9 +36,9 @@ Successful completion requires both a durable CubeLoop completed-run checkpoint 
 
 ## Build and deploy
 
-Use the normal repository hooks and commit reviewed source before building. [build.sh](build.sh) creates images from a clean Git archive and records the commit and image identity. The MicroVM image is ARM64; the existing Testing node uses an AMD64 Backend image. The Frontend and compatibility Worker do not need rebuilding for this adapter.
+Use the normal repository hooks and commit reviewed source before building. [build.sh](build.sh) creates the Native ARM64 image and matched AMD64 Backend image from a clean Git archive and records the commit and image identity. The deployed Frontend image is unchanged.
 
-[infra.yaml](infra.yaml) creates an immutable, scanned ECR repository and a minimal Runtime role. Providing the immutable image URI enables the PUBLIC Runtime and adds an exact invoke/stop permission to the existing controller role. The template creates no EC2, EKS, NAT Gateway, database or Secrets Manager secret. This PoC target is account `986420599013`, region `us-west-2`, profile `moego-testing`; verify it with explicit-profile STS readback before each deployment operation.
+[infra.yaml](infra.yaml) creates the Native immutable ECR repository and minimal Runtime role. Providing the immutable image URI enables the PUBLIC Runtime and adds an exact invoke/stop permission to the existing Product `NodeRole`. The template creates no EC2, EKS, NAT Gateway, database or Secrets Manager secret. The Native Dockerfile uses the Git slice Worker digest `sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d` as its base; keep that one base image and repository for future rebuilds even though the Git slice Runtime, Lambda, S3 state and dedicated Secrets are retired. This target is account `986420599013`, region `us-west-2`, profile `moego-testing`; verify it with explicit-profile STS readback before any deployment change.
 
 Configure the Backend with:
 
@@ -47,13 +47,14 @@ execution:
   backend: agentcore
 agentcore:
   execution_mode: native
+  runtime_arn: <verified Native Runtime ARN>
   native_runtime_arn: <verified Runtime ARN>
   region: us-west-2
 ```
 
-The existing auth signing secret stays in the Backend credential store. Run the generated `agentcore_callbacks` migration before enabling the native route. Update only the Backend image and native execution configuration after callback and persistence checks pass.
+The existing auth signing secret stays in the Backend credential store. Run the generated `agentcore_callbacks` migration before enabling the Native route. The Backend uses `execution.backend=agentcore`, `agentcore.execution_mode=native`, and the same verified Native ARN in both `runtime_arn` and `native_runtime_arn`. Update only the Backend image and Native execution configuration after callback and persistence checks pass.
 
-Rollback selects `agentcore.execution_mode: compatibility` while retaining the current Backend and migration image; the old Runtime ARN remains configured. Do not downgrade the database. If the main application image itself must be rolled back, retain the newer migration init container so it can recognize the current Alembic revision. A Native dispatch stores its selected Runtime ARN, so stop and recovery must target the Runtime that actually owns it. Keep the existing node and OpenSandbox running; the node still hosts the website, persistent services and the old Runtime's VPC egress route.
+The former compatibility Runtime is retired and is no longer a rollback target. Older deployment images have been removed, so an application rollback first requires rebuilding a reviewed source revision. Retain the newer migration init container so it can recognize the current Alembic revision; do not downgrade the database. A Native dispatch stores its selected Runtime ARN, so stop and recovery must target the Native Runtime that owns it. Keep the existing node, OpenSandbox services and PVCs running while the product is in service; they host the website, persistent services and Browser/Terminal/file-sidebar capabilities.
 
 ## Current acceptance boundary
 
@@ -64,18 +65,10 @@ Native Runtime is `READY` and the final Native Worker/Backend image pair above i
 The final Web and Slack acceptance completed after local SSM, Kubernetes, database/Redis forwarding and
 test Docker services were stopped; it used the deployed service path rather than a local relay.
 
-Compatibility rollback has been verified with the new Backend migration container and preserved context;
-the database was not downgraded. Native mode has been restored and read back. The Native credential
-boundary probe also passed: the Worker role matched, the platform package was unavailable, protected
-credential fingerprints had zero matches in env/proc, Secrets Manager and S3 reads were denied, the fake capability was
-rejected, and the exact Runtime session stopped with HTTP 200. Earlier
-failed probe attempts remain historical evidence only. The old compatibility Runtime v3, Frontend, and
-OpenSandbox remain deployed/retained as rollback and legacy tool paths.
+Native mode is the current and only product execution mode. The Native credential boundary probe also passed: the Worker role matched, the platform package was unavailable, protected credential fingerprints had zero matches in env/proc, Secrets Manager and S3 reads were denied, the fake capability was rejected, and the exact Runtime session stopped with HTTP 200. Earlier failed probe attempts remain historical evidence only. The Frontend and OpenSandbox remain deployed for the product UI and legacy Browser/Terminal/file-sidebar capabilities.
 
 Native ordinary workspace snapshots exclude `.git`, hidden files, credentials and installed environments.
-The independent Git slice owns the constrained push/PR broker; it is not connected to the Native product
-entrypoint. Browser and terminal file-sidebar behavior remains on the legacy OpenSandbox route. Per-employee
-private GitHub authorization, 200-repository retrieval and AgentCore Browser migration remain future work.
+The retired Git slice is not connected to the Native product entrypoint. Browser and terminal file-sidebar behavior remains on the OpenSandbox route. Per-employee private GitHub authorization, 200-repository retrieval and AgentCore Browser migration remain future work.
 
 ## Bounded simplification
 

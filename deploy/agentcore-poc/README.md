@@ -1,4 +1,11 @@
-# Run the CubePlex AgentCore PoC
+# Historical CubePlex AgentCore PoC (retired)
+
+> This experiment has been retired. Its Runtime, ECR repository, execution role
+> and Provider Secret are no longer active. The commands below document the
+> original experiment and must not be used for the current deployment: they can
+> recreate billable resources. Use the [Native product guide](../agentcore-native-entry/README.md)
+> for the current Web/Slack service. The original source and verification records
+> remain available for reference.
 
 This directory belongs to the `Perfecto23/cubeplex` fork of
 [`cubeplexai/cubeplex`](https://github.com/cubeplexai/cubeplex), based on upstream
@@ -11,7 +18,7 @@ invokes the handler using AWS IAM authentication, then posts the answer as a bot
 to the original thread. The handler calls the configured Responses-compatible
 model and reads GitHub source at one fixed commit. No Kubernetes Pod is created.
 
-## Before running
+## Historical prerequisites
 
 - Work from the root of the fork checkout containing this PR. Use an isolated
   worktree for changes.
@@ -71,11 +78,13 @@ The controller verifies each token's identity. Slack tokens stay on the operator
 machine and are not transmitted to AgentCore. Never add either env file to the
 checkout, image, request payload or logs.
 
-## 3. Use an existing deployment
+## 3. Historical deployment readback
 
-For the already provisioned PoC, keep its operator state under
+The retired PoC's historical operator state is under
 `~/.local/state/cubeplex-agentcore-poc/20260912/`. It contains resource identifiers
-and deployment/readback evidence, not the plaintext Provider key.
+and deployment/readback evidence, not the plaintext Provider key. Its old cloud
+targets have been removed; the readback command below is not a current health
+check and must not be followed by recreating the retired resources.
 
 ```bash
 uv run --project deploy/agentcore-poc \
@@ -87,7 +96,7 @@ original deployment. A new machine must recover that authorized state first;
 do not run `foundation` to recreate existing names. Readback compares the exact
 artifact, role, network, lifecycle and environment configuration.
 
-## 4. First deployment only
+## 4. Historical first-deployment procedure
 
 These operations create AWS resources. Verify that the checked-in target is the
 intended account and that the names are unused. The helper validates the actual

@@ -5,8 +5,8 @@ title: Kubernetes control plane with AgentCore
 
 # CubePlex control plane with AgentCore
 
-This fork keeps CubePlex's Web and native Slack experience in Kubernetes and
-moves the native CubeLoop agent loop to an Amazon Bedrock AgentCore Runtime:
+This fork keeps CubePlex Web and native Slack in Kubernetes and runs the
+CubeLoop agent loop in one Amazon Bedrock AgentCore Native Runtime:
 
 ```text
 Web / Slack
@@ -15,149 +15,127 @@ Kubernetes CubePlex control plane
     accounts · workspaces · conversations · RunManager · delivery
     ↓ dispatch identity + task capability
 AgentCore Native ARM64 MicroVM
-    CubeLoop · Git/Shell · local files
+    CubeLoop · bounded Git/Shell · local files · HITL
     ↓ scoped model / checkpoint / event / file callbacks
 CubePlex Backend → Web SSE / Slack durable tailer
 ```
 
-Kubernetes owns the durable product state. AgentCore owns one claimed dispatch
-and its execution process. When the AgentCore session is reclaimed, the next
-followup loads the native CubeLoop checkpoint from shared storage; it does not
-depend on the old VM session still existing.
+Kubernetes owns durable product state. AgentCore owns one claimed dispatch and
+its execution process. When a Native session is reclaimed, the next followup
+loads the CubeLoop checkpoint from shared storage; it does not depend on the old
+VM session still existing.
+
+## Current baseline
+
+Testing Native Runtime v2 is `READY`. The current baseline is Runtime
+`cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source
+`09f272ec4088f72fe709cc89b01d7abd68fe45d3` / digest
+`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`,
+Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest
+`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`,
+and Frontend digest
+`sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1`.
+The Backend migration image and main image remain a matched baseline.
+
+The Backend uses `execution.backend=agentcore`,
+`agentcore.execution_mode=native`, and the same verified Native ARN in both
+`runtime_arn` and `native_runtime_arn`. The old compatibility Runtime and the
+independent Git slice Runtime, Broker/Lambda, S3 state and dedicated Secrets
+are retired.
+
+Browser, Terminal and sandbox file-sidebar behavior remains on OpenSandbox.
+The OpenSandbox server, controller and PVCs are still product dependencies;
+they are not an AgentCore rollback Runtime.
 
 ## Native MicroVM adapter
 
-The native adapter runs CubeLoop and the Git/Shell/file tools together in a PUBLIC AgentCore MicroVM. The Backend keeps provider credentials, scoped history, PostgreSQL callback receipts, event delivery and file storage. It does not give the tool VM direct database, Redis, object-store or provider credentials.
+The Native adapter runs CubeLoop and bounded Git/Shell/file tools together in a
+PUBLIC AgentCore MicroVM. The Backend keeps provider credentials, scoped
+history, PostgreSQL callback receipts, event delivery and file storage. The VM
+does not receive direct database, Redis, object-store or provider credentials.
 
-Testing Runtime v2 is `READY` and real Web/Slack task and follow-up checks have passed, including file cards, HITL pause/answer in a new Worker, Backend restart, stop/reclaim and duplicate callback fencing. The current baseline is Runtime `cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source `09f272ec4088f72fe709cc89b01d7abd68fe45d3` / digest `sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`, and Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest `sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`; the migration and image remain on the same source baseline.
+Each prompt or HITL answer creates one immutable dispatch and one derived
+Runtime session. The worker claims once, resolves identity and scope from the
+server-created dispatch, and publishes progress and terminal state through the
+existing Redis stream. Duplicate invokes return existing dispatch state rather
+than calling the model twice.
 
-The Native credential boundary is verified: the Worker role matched, the platform package was unavailable,
-protected credential fingerprints had zero matches in env/proc, Secrets Manager and S3 reads were denied, the fake capability
-was rejected, the CP login returned 200, and the exact Runtime session stopped with HTTP 200. Earlier failed probe attempts are retained as history only. The native
-snapshot currently preserves ordinary workspace files, excluding `.git` and hidden or credential files.
-The one-repository push/PR broker from the independent Git slice is not connected to native product
-entrypoints. Browser and terminal file-sidebar behavior remains on OpenSandbox. See the [native operator
-guide](https://github.com/Perfecto23/cubeplex/blob/feat/2026-09-13-agentcore-native-entry/deploy/agentcore-native-entry/README.md)
-for actual tool and recovery limits.
+The Native credential boundary was verified: protected credential fingerprints
+had zero matches in env/proc, Secrets Manager and S3 reads were denied, the
+fake capability was rejected, and the exact Runtime session stopped with HTTP
+200. Native snapshots exclude `.git`, hidden files, credentials, installed
+environments and background processes.
 
-## Retained compatibility baseline
+## Resource boundary
 
-The retained compatibility Runtime v3 shares the Testing control plane on a single-node
-k3s cluster, and the Runtime readback is `READY`. Web compute, HITL, ordinary
-followup, file readback after AgentCore reclaim, long tasks, Backend restart,
-normal native Slack, duplicate replay, prepared stop and stop-then-followup have
-passed real checks. The final running-command stop also passed: execution was
-confirmed before Stop, and no late marker appeared after its original deadline.
-This is a single-node compatibility PoC with the limits below.
-
-The Native Runtime v2 is a separate execution baseline for the same control plane. Its Web/Slack task,
-follow-up, HITL, stop/reclaim and duplicate callback checks are complete; the compatibility Runtime v3,
-Frontend and OpenSandbox remain retained for rollback and legacy capabilities. A previous compatibility
-rollback was also verified with the new Backend migration container; it did not downgrade the database.
-The final Web and Slack acceptance completed after local forwarding and test Docker services were stopped,
-using the deployed service path.
-
-The compatibility baseline image source is commit
-`11a4a524713fe06d290f5610196099c694f9b132`. Its previous Backend image was
-`sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc`; Runtime v3 uses
-the ARM64 Worker
-`sha256:d632fe8f985fb88a2552a25068d090dc1a1747ef6f173355c1eb7d5938b62e40`.
-
-The fork starts from merged commit `8fb3b5d6` after upstream PR #1. The
-historical bounded Slack/AgentCore PoC is documented separately in
-[AgentCore PoC](./agentcore-poc.md). The full operator runbook is in the
-[product deployment guide](https://github.com/Perfecto23/cubeplex/blob/main/deploy/agentcore-product/README.md).
-
-## Deployment boundary
-
-| Component | Responsibility | Durable authority |
+| Component | Current responsibility | Retention boundary |
 |---|---|---|
-| CubePlex Backend on k3s | auth, workspace scope, RunManager, dispatch admission, SSE, native Slack ingress and delivery | Postgres + Redis |
-| Compatibility AgentCore Runtime | Runtime v3 claims one dispatch, runs native CubeLoop, invokes tools, persists checkpoints and events, and tracks async work as `HealthyBusy` | shared Postgres/Redis/RustFS/OpenSandbox |
-| Native AgentCore Runtime v2 | CubeLoop, bounded Git/Shell/file tools, HITL and control-plane callbacks inside one task MicroVM | PostgreSQL callbacks/checkpoints + Redis events + RustFS workspace files |
-| Postgres | conversations, memberships, dispatches, checkpoints and product records | source of truth for product history |
-| Redis | run coordination, event streams, delivery cursors and locks | live coordination and replay window |
-| RustFS/S3 | attachments and artifacts | durable object bytes |
-| OpenSandbox | existing CubePlex shell/file/browser tool environment | sandbox workspace/PVC state |
+| CubePlex Backend on k3s | auth, workspace scope, RunManager, dispatch admission, SSE, Slack ingress and delivery | ProductStack Node, Postgres, Redis, RustFS |
+| Native AgentCore Runtime v2 | CubeLoop, bounded tools, HITL and scoped callbacks | Native stack and Native Worker image |
+| OpenSandbox | Browser, Terminal and sandbox file tools | Server/controller Pods and PVCs |
+| Backend/Frontend ECR | current product images | ProductStack repositories with `Retain` |
+| Native ECR | Native Worker image | Native stack repository with immutable tags |
+| Git slice Worker base | Native Dockerfile `FROM` base only | Keep `sha256:454e290...`; retire Git slice runtime resources |
 
-The compatibility invocation payload contains a version and dispatch ID. Native invocations additionally carry a short-lived task capability; privileged state is accessed through scoped Backend callbacks.
-Both paths resolve identity and scope from the server-created dispatch and
-rejects caller-supplied scope. Prompt and HITL answers use separate durable
-dispatches. Duplicate invokes return the existing dispatch state rather than
-calling the model twice.
+## ProductStack template
 
-The node's invoke policy is deliberately narrow: `InvokeAgentRuntime` and
-`StopRuntimeSession` are granted for the exact Runtime ARN and the exact
-AgentCore default endpoint ARN. The compatibility Runtime uses its immutable ARM64 image in the private VPC subnet. The Native Runtime uses its separate immutable ARM64 image with PUBLIC networking.
+[`deploy/agentcore-product/infra.yaml`](../../../../deploy/agentcore-product/infra.yaml)
+is a Native-only retention template. It keeps the existing Node, NodeRole,
+NodeProfile, NodeSecurityGroup, EIP, Backend/Frontend ECR repositories and
+KubeconfigSecret. It no longer creates an AgentCore Runtime, WorkerRole,
+WorkerConfigSecret, Worker ECR repository, private Runtime subnet, route table,
+Runtime security group or old invoke policy.
 
-Stop and delivery have separate outcomes. A confirmed stop tears down the
-native run; an unconfirmed stop remains fenced as `stop_unknown`. A Slack
-transport retry resumes its delivery checkpoint and does not create a new
-AgentCore execution.
+Use the template only to review a change set against the existing Testing
+stack. Do not use an old deploy recipe to create a new experiment stack or pass
+`WorkerImageUri` to ProductStack. Native Runtime creation and its invoke policy
+belong to [`deploy/agentcore-native-entry/infra.yaml`](../../../../deploy/agentcore-native-entry/infra.yaml),
+which reuses the Product `NodeRole` and uses PUBLIC networking.
 
-## Testing topology
+The Native Dockerfile uses the Git slice Worker digest
+`sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d` as
+its base. Keep that one ECR base image and repository for Native rebuilds; the
+retired Git slice Runtime, Broker/Lambda, S3 state and dedicated Secrets do not
+need to be recreated.
 
-The economical target uses one amd64 `t3a.xlarge` k3s node (4 vCPU, 16 GiB),
-60 GiB encrypted gp3 storage, local-path PVCs, host-network Caddy and SSM
-access. The private AgentCore subnet reaches only the required node ports for
-Postgres, Redis, RustFS and OpenSandbox plus outbound HTTPS. This is a
-single-node non-HA test topology.
+## Kubernetes and access
 
-The fixed baseline is about **$118.24/month** at 730 hours, or **$3.89/day**,
-before the two new Secrets Manager secrets (about **$0.80/month**), ECR,
-AgentCore, model and traffic usage. Keep the node running during the independent
-Git slice: it hosts the product and storage and provides NAT for the existing
-VPC Runtime. A later cost pause needs a confirmed outage window and recovery
-checks; retained disk, public IPv4 and two product Secrets still cost about
-$9.25/month before ECR and other usage.
+The single-node Testing control plane uses local-path PVCs for Postgres, Redis
+and RustFS, one Backend and Frontend replica, host-network Caddy, and the
+retained OpenSandbox server/controller. Use SSM for k3s access and keep the
+kubeconfig in the retained KubeconfigSecret. Keep operator values and all
+runtime credentials outside Git.
+
+Verify Deployments, StatefulSets, PVCs, OpenSandbox CRDs and the RustFS bucket
+before user acceptance. A healthy Helm release proves control-plane readiness;
+Native acceptance also requires a real Web or Slack dispatch and readback.
 
 ## Acceptance boundary
 
-| Path | Current state |
+| Path | Current Native state |
 |---|---|
-| Web prompt, progress and result | Compute/progress passed on v1; final-version ordinary followup passed on v3 |
-| Web HITL and ordinary followup | HITL respond passed on v1 using the same run; ordinary followup passed on v3 using a new run and the existing conversation checkpoint |
-| File readback after AgentCore reclaim | Passed |
-| Web Stop during the short tool path | Passed with teardown verification and no late marker |
-| Long-running async task | Passed on v2: tracked async execution and fresh heartbeats continued beyond the 60-second idle timeout |
-| Backend restart during remote work | Passed on v2: Backend restarted at 85 seconds during a 150-second task, without replay or a second reply |
-| Normal native Slack task/reply | Passed after identity linking |
-| Duplicate Slack/dispatch replay | Passed without duplicate execution or final reply |
-| Stop before execution starts | Passed; native cancel and dispatch terminal state completed in about 0.22s with no `stop_unknown` |
-| Stop during command execution | Passed on v3: confirmed command start, stop at about 50 seconds, cancelled/finished in about 0.30 seconds, no late marker after the original deadline |
-| Stop followed by a new followup | Passed; a new AgentCore run returned the expected Web result without a tool call |
+| Web/Slack product path | Prior real Web/Slack task and followup acceptance passed; current cleanup Web readback returned `CLEANUP-NATIVE-OK` with one model callback |
+| HITL after Backend restart | Same-run question/answer passed after Backend restart; a fresh Worker restored the Native checkpoint and workspace |
+| File/workspace continuity | Previous `Alpha` history remained readable after the cleanup session was absent |
+| Stop B | Prepared running-command stop completed with no late file write or marker |
+| Duplicate admission and callback replay | Passed without duplicate execution or final reply |
+| Cleanup readback | 31 dispatches were `finished`; Native session was absent; 8 Pods were Ready and 6 PVCs were unchanged |
 
-The operator guide records the source-freeze, CFN, SSM tunnel, private values,
-Helm, ECR-refresh, Caddy, Runtime and Slack steps needed to reproduce these
-checks. The agreed compatibility PoC acceptance is complete. Preparation
-cancellation releases the run immediately, but the existing Sandbox reservation
-can take about 10.5 minutes to clear (`create_timeout=300s`, `ready_timeout=300s`,
-`cleanup_interval=30s`, `pause_enabled=false`). Ordinary followup works during
-that window; another tool request using the same Sandbox scope may wait.
+These Native records are separate from the retired compatibility Runtime and
+Git slice evidence. OpenSandbox sandbox reservations still follow their
+configured cleanup window.
 
-## Security and deferred scope
+## Cost and deferred scope
 
-Public registration is closed at the Caddy layer for this Testing deployment.
-The operator bootstraps the test account through the private tunnel and grants
-organization admin with `python -m cubeplex.cli admin grant-admin`; the existing
-`default-org` is not treated as a first-registration owner flow.
+The fixed single-node figure of **$3.89/day** is a historical baseline estimate,
+not a current repricing. Current continuing cost items include the Node, EBS,
+public IPv4, ECR/Native base image, AgentCore and model usage. A cost pause
+needs an explicit outage window, active-run readback, data backup and recovery
+checks; do not delete the retained Node or disk.
 
-Native Slack is Socket Mode with a test xapp, a linked CubePlex identity, and
-an allowlist limited to the test user and channel. Credentials stay in Secrets
-Manager or Kubernetes Secrets and never enter Git, image build arguments or
-logs.
-
-This compatibility route keeps OpenSandbox as a Kubernetes tool environment for
-rollback and legacy Browser/terminal file-sidebar behavior. Native Runtime v2
-now runs the Agent and bounded Git/Shell/file tools together in an AgentCore
-MicroVM. The next phase covers private GitHub authorization, retrieval across
-200 private repositories and replacing the OpenSandbox Browser. The fork also
-contains an independent Git execution slice under `deploy/agentcore-git-slice`,
-with separate source and live acceptance evidence; it does not migrate this
-Web/Slack product path.
-
-The current phase defers per-employee private GitHub authorization, retrieval
-across 200 private repositories, and replacing OpenSandbox Browser with
-AgentCore Browser. The current Backend and Worker images still have one
-unresolved vendor zlib High finding; the current Node 24.21.0 Frontend image
-scan is clean.
+Private employee GitHub authorization, indexing across 200 private repositories
+and replacing the OpenSandbox Browser with an AgentCore Browser remain deferred.
+The [Native operator guide](../../../../deploy/agentcore-native-entry/README.md)
+contains the current tool and recovery boundary. The
+[retired Git slice guide](../../../../deploy/agentcore-git-slice/README.md) is
+historical evidence only.

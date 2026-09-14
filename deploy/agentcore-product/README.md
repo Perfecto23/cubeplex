@@ -8,22 +8,21 @@ Web / native Slack
         ▼
 Kubernetes CubePlex control plane
 (accounts, workspaces, conversations, RunManager, SSE, delivery)
-        │ durable dispatch + Redis event stream
-        ▼
+        ├── Postgres / Redis / RustFS / OpenSandbox in Kubernetes
+        │ invoke / dispatch-scoped HTTPS callbacks
+        ↕
 Amazon Bedrock AgentCore Runtime
 (ARM64 native CubeLoop worker)
-        │
-        └── Postgres / Redis / RustFS / OpenSandbox on the private path
 ```
 
 The guide targets the economical Testing deployment in AWS account
 `986420599013`, region `us-west-2`, stack `cubeplex-product-20260912`. The
-control plane and retained compatibility Runtime v3 are deployed; the Native
-Runtime v2 is the current execution baseline and is `READY`.
-Web compute, HITL, ordinary followup, file readback after AgentCore reclaim,
-long tasks, Backend restart, normal native Slack, duplicate replay, prepared
-stop and stop-then-followup have passed real checks. This is a compatibility
-PoC: the final running-command stop and followup checks have also passed.
+Native Runtime v2 is the only AgentCore product runtime and is `READY`.
+Native Web/Slack tasks and followups, saved-file recovery, same-run HITL after
+Backend restart, running-command stop without a late write, and duplicate
+admission/callback checks have passed. See the Native guide for the evidence
+boundary. The former compatibility
+Runtime v3 and the independent Git execution Runtime are retired.
 
 The newer Native Runtime v2 is documented separately in the [Native entrypoint
 guide](../agentcore-native-entry/README.md). It uses the same Kubernetes control
@@ -35,8 +34,9 @@ AgentCore MicroVM. Its current Testing baseline is Runtime
 Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest
 `sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`.
 The migration and image are a matched baseline. Native Web/Slack task and
-follow-up, HITL, stop/reclaim, restart and duplicate-callback checks have passed;
-the older Runtime v3 and OpenSandbox remain the compatibility rollback path.
+follow-up, HITL, stop/reclaim, restart and duplicate-callback checks have passed.
+OpenSandbox remains for Browser, Terminal and sandbox file-sidebar capabilities;
+it is not an AgentCore rollback Runtime.
 
 The fork starts from merged commit `8fb3b5d6a171451848d7939be0209709e8ea05b3`
 (upstream product version `0.7.2`). The older bounded Slack polling PoC remains
@@ -52,7 +52,7 @@ is not the product ingress described here.
 | Postgres | conversations, memberships, dispatch identity/status, checkpoints, outbound delivery state/cursors and saved product records | transient live stream delivery |
 | Redis | run coordination, event streams, locks and active-run metadata | the authoritative conversation history |
 | RustFS/S3 | artifact and attachment bytes | user/workspace authorization |
-| OpenSandbox | the existing CubePlex sandbox tools and workspace files | AgentCore Runtime lifecycle |
+| OpenSandbox | the existing CubePlex Browser, Terminal and sandbox file tools | AgentCore Runtime lifecycle |
 
 One prompt or HITL answer creates one immutable dispatch and one derived
 AgentCore session ID. The worker claims it atomically before entering
@@ -73,59 +73,41 @@ The current target is deliberately small:
 - Ubuntu 24.04, k3s `v1.36.4+k3s1`, containerd `2.3.4`;
 - 60 GiB encrypted gp3 root disk retained on stack deletion;
 - one public EIP used for Caddy HTTPS and SSM-managed access;
-- one private Runtime subnet (`172.31.128.0/24`) with outbound HTTPS through
-  the node's NAT rules;
-- no EKS control-plane charge, managed NAT Gateway or ALB in this PoC;
+- no EKS control-plane charge, managed NAT Gateway or ALB;
 - the node is amd64, so the PGroonga/pgvector Postgres image is scheduled on
   this architecture.
 
-The measured baseline fixed cost is approximately **$118.24/month** at 730
-hours, or **$3.89/day**, before the two new Secrets Manager secrets (about
-**$0.80/month**), ECR storage and scans, AgentCore execution, model calls and
-traffic. Standard CPU credits can
+The historical baseline estimate is approximately **$118.24/month** at 730
+hours, or **$3.89/day**, before ECR storage and scans, AgentCore execution,
+model calls and traffic. It is not a current repricing. Standard CPU credits can
 slow a busy node. Stop the node when testing is paused to reduce compute cost,
-but remember that retained EBS, EIP and credential-store resources still have
-their own costs. Do not delete the retained disk until the recovery decision is
-made.
+but remember that retained EBS, EIP and ECR resources still have their own
+costs. Do not delete the retained disk until the recovery decision is made.
 
 ## 1. Freeze source and build immutable images
+The current Testing image pair is already built and deployed from committed
+sources. Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` uses digest
+`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`.
+Native Worker source `09f272ec4088f72fe709cc89b01d7abd68fe45d3` uses digest
+`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`.
+The deployed Frontend uses digest
+`sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1`.
 
-Build only from a committed SHA. `build.sh` creates a private `git archive`,
-exports `requirements-frozen.txt` with `uv --frozen`, builds the standard
-Backend for `linux/amd64` and the AgentCore worker target for `linux/arm64`,
-and records the source manifest and ECR digests. It refuses to use the current
-dirty worktree and `--push` is restricted to the Testing account, region and
-repository prefix.
-
-```bash
-SOURCE_SHA=<committed-product-sha>
-deploy/agentcore-product/build.sh "$SOURCE_SHA" --push
-```
-
-The worker build is intentionally separate from the frontend build. The
-Backend Dockerfile has two named final targets: `backend` remains the default
-target, while `agentcore-worker` runs `python -m cubeplex.agentcore.runtime` on
-port 8080. The worker image must be pushed to:
-
-```text
-986420599013.dkr.ecr.us-west-2.amazonaws.com/cubeplex-product-20260912/worker@<digest>
-```
-
-The retained compatibility image readbacks for Runtime v3 are:
-
-```text
-source=11a4a524713fe06d290f5610196099c694f9b132
-backend@sha256:fa68ed7d039065064b6a3f24d57ca1312dfce07b4c3127257e4c472b039441bc
-worker@sha256:d632fe8f985fb88a2552a25068d090dc1a1747ef6f173355c1eb7d5938b62e40
-frontend@sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1
-```
+If a future Native rebuild is required, use
+[`../agentcore-native-entry/build.sh`](../agentcore-native-entry/build.sh),
+which creates a clean archive and records the source manifest. Its Dockerfile
+uses the Git slice Worker digest
+`sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d` as
+its base. Retain that one Git slice Worker image and repository for rebuilding;
+the Git slice Runtime, broker, Lambda, S3 state and dedicated Secrets are
+retired.
 
 The Frontend image is Node 24.21.0 and its ECR scan is clean. Backend and
-Worker each have one unresolved vendor High in zlib (`CVE-2026-85091`); do not
-describe the current images as vulnerability-free until the vendor publishes a
-fixed Debian package.
+Native Worker each have one unresolved vendor High in zlib (`CVE-2026-85091`),
+and the Native image has the recorded nghttp2 Medium; do not describe these
+images as vulnerability-free until the vendor publishes fixed packages.
 
-## 2. Create the small AWS foundation
+## 2. Review ProductStack retention
 
 Use only the Testing profile and region:
 
@@ -135,38 +117,37 @@ export AWS_REGION=us-west-2
 export STACK_NAME=cubeplex-product-20260912
 ```
 
-The first CloudFormation deployment should leave `WorkerImageUri` empty. That
-creates the node, private Runtime subnet, ECR repositories, worker config
-Secret, worker IAM role, node IAM role and SSM access without creating a
-Runtime from an unverified image. The template is
-[`infra.yaml`](infra.yaml).
+The ProductStack template is now Native-only. It retains the existing Node,
+NodeRole, NodeProfile, NodeSecurityGroup, EIP, Backend/Frontend ECR
+repositories and KubeconfigSecret. It no longer creates an AgentCore Runtime,
+WorkerRole, WorkerConfigSecret, Worker ECR repository, private Runtime subnet,
+route table, security group or old Runtime invoke policy.
 
-Supply the VPC, public subnet, Availability Zone and Ubuntu AMI chosen from
-current AWS readback. The current Testing selection is the default VPC in
-`us-west-2a`; do not copy an old subnet or AMI into another account.
+Use [`infra.yaml`](infra.yaml) only to review a change set against the existing
+Testing stack. Do not use the old `aws cloudformation deploy` recipe to create
+a new experiment stack, and do not pass `WorkerImageUri` to this ProductStack
+template. Native Runtime creation and its invoke policy belong to
+[`../agentcore-native-entry/infra.yaml`](../agentcore-native-entry/infra.yaml).
+The Native template reuses the Product `NodeRole`; its Runtime is PUBLIC and
+has no ProductStack worker Secret or private subnet dependency.
 
-```bash
-aws cloudformation deploy \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --stack-name "$STACK_NAME" \
-  --template-file deploy/agentcore-product/infra.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    VpcId=<testing-vpc-id> \
-    PublicSubnetId=<testing-public-subnet-id> \
-    AvailabilityZone=us-west-2a \
-    ImageId=<ubuntu-24.04-ami-id> \
-    WorkerImageUri=
-```
+The 2026-09-14 cleanup is complete. After AWS released the old AgentCore ENI,
+dependency checks found no consumers of the orphaned security group or subnet;
+both were deleted and direct EC2 reads confirmed they no longer exist.
+CloudFormation had reported `UPDATE_COMPLETE` despite `DELETE_FAILED` resource
+events, so stack status alone is not evidence that retired resources are gone.
 
-Read back the stack outputs and node state before continuing. The node role
-pulls only the product ECR repositories and has the SSM managed policy. The
-AgentCore role reads only the worker config Secret, pulls only the worker
-repository, and writes its own runtime log group. When `WorkerImageUri` is
-non-empty, the template additionally creates the AgentCore Runtime and grants
-the node only `InvokeAgentRuntime` and `StopRuntimeSession` for the exact
-Runtime ARN **and** the exact AgentCore default endpoint ARN. Both resources
-are required by IAM even though the invoke call targets the Runtime ARN.
+The fork's documentation workflow builds and checks these pages on PRs and
+main. Cloudflare publication is opt-in: enable repository variable
+`DOCS_CLOUDFLARE_DEPLOY_ENABLED=true` only after configuring `CF_API_TOKEN` and
+`CF_ACCOUNT_ID` for the intended `cubeplex-docs` Pages project. The upstream
+repository retains its existing publication behavior.
+
+Read back the stack, Node, EIP, ECR repositories and KubeconfigSecret before
+any change. Keep the retained Node and its storage protected. The separate
+Native ECR base image `sha256:454e290...` remains required because the Native
+Dockerfile uses it as `FROM`; retirement of the Git slice runtime does not
+retire that build dependency.
 
 ## 3. Obtain cluster access through SSM
 
@@ -293,40 +274,35 @@ use a cached Backend image even when the previous ECR token has expired.
 Read the Job outcome as `ecr_refresh_succeeded`; the job never prints the ECR
 token, request body or Secret value.
 
-## 7. Connect AgentCore after the worker image is frozen
+## 7. Use the Native Runtime
 
-For a fresh deployment, create the Runtime only after the final ARM64 worker
-image has been pushed and its immutable digest has been read back from ECR. The
-retained Testing compatibility Runtime v3 is `READY` with the Worker image above, private VPC
-networking, 60-second idle timeout and 900-second maximum lifetime. Its tracked
-async task state reports `HealthyBusy` while work is active, and API restart
-attaches a monitor to the existing remote task instead of treating it as a new
-dispatch. The long-task, Backend-restart, duplicate replay, prepared-stop and
-stop-then-followup and running-command stop checks have passed.
+The Native Runtime is already connected to the current Backend. Its immutable
+ARM64 image is `sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`.
+The Native stack owns the Runtime, WorkerRole and Native ECR repository. The
+ProductStack owns the Node and its NodeRole; the Native stack attaches the
+exact invoke/stop policy to that existing role.
 
-1. Populate the Secrets Manager worker config record with the flat
-   `CUBEPLEX_*` environment map. It includes database, Redis, RustFS,
-   sandbox, auth vault and `ENV_FOR_DYNACONF=production` values. The API
-   control plane additionally needs `CUBEPLEX_EXECUTION__BACKEND=agentcore` and
-   `CUBEPLEX_AGENTCORE__RUNTIME_ARN=<runtime-arn>` in its private config.
-2. Update the CloudFormation stack with the ARM64 worker immutable URI as
-   `WorkerImageUri`. The Runtime uses VPC networking to reach the private
-   Postgres, Redis, RustFS and OpenSandbox NodePorts.
-3. Read back the Runtime ARN, version, role, image digest, lifecycle settings
-   and readiness. The current template uses a 60-second idle timeout and
-   900-second maximum lifetime for Testing. Read back the node policy and
-   confirm both the exact Runtime ARN and the exact AgentCore default endpoint
-   ARN are present in the `InvokeAgentRuntime` and `StopRuntimeSession` resource
-   list.
-4. Update the Backend control plane with the Runtime ARN, restart it, and
-   verify that a new RunManager prompt creates a durable dispatch before the
-   AgentCore invoke.
+The Backend private configuration uses:
 
-The worker loads its config Secret before importing CubePlex configuration.
-The invocation wire contains only protocol version and dispatch ID; it does
-not contain provider keys or caller-supplied scope. The worker loads the
-server-owned dispatch from Postgres, verifies org/workspace/conversation/user
-scope, claims once, and publishes to the existing Redis stream.
+```yaml
+execution:
+  backend: agentcore
+agentcore:
+  execution_mode: native
+  runtime_arn: <verified-native-runtime-arn>
+  native_runtime_arn: <same-verified-native-runtime-arn>
+  region: us-west-2
+```
+
+The Runtime is PUBLIC and has no ProductStack worker Secret, private subnet or
+ProductStack Worker ECR dependency. The Worker loads the server-owned dispatch
+through the Native callback API. The Backend owns dispatch claims and publishes
+callback progress and terminal state to the existing Redis stream.
+
+Read back the Runtime ARN, version, Worker image digest, readiness and the
+exact `InvokeAgentRuntime`/`StopRuntimeSession` resources after any Native
+stack change. Do not recreate the retired compatibility Runtime or the retired
+Git slice Runtime, Lambda, S3 state or dedicated Secrets.
 
 ## 8. Configure native Slack safely
 
@@ -357,66 +333,60 @@ retry does not create a second AgentCore dispatch or a second final reply.
 
 ## 9. Acceptance sequence
 
-Record the source SHA, image digests, Runtime version, conversation/run/dispatch
-IDs and user-visible result for every check:
+Record the Native source SHA, image digests, Runtime version,
+conversation/run/dispatch IDs and user-visible result for every check. The
+historical compatibility Runtime evidence is not reassigned to Native.
 
-| Path | Current evidence | Remaining boundary |
-|---|---|---|
-| Web prompt, progress and final result | Web compute/progress passed on v1; final-version ordinary followup passed on v3 | None for the tested path |
-| Web HITL answer and ordinary followup | HITL respond passed on v1 with a new dispatch for the same run; ordinary followup passed on v3 with a new run and the existing conversation checkpoint | None for the tested path |
-| File/artifact read after AgentCore reclaim | Passed; content remained readable after session absence | None for the tested path |
-| Web Stop during the short tool path | Passed with teardown and no late marker | None for the tested path |
-| Long-running async task | Passed on v2: tracked async execution and fresh heartbeats continued beyond the 60-second idle timeout | None for the tested path |
-| Backend restart during remote work | Passed on v2: Backend was restarted at 85 seconds during a 150-second task; no replay or second reply | None for the tested path |
-| Normal native Slack task and reply | Passed after real user identity link | None for the tested path |
-| Duplicate Slack/dispatch replay | Passed; no duplicate execution or final reply | None for the tested path |
-| Stop before execution starts | Passed; native cancel and dispatch terminal state completed in about 0.22s with no `stop_unknown` | Keep the readback in the acceptance evidence |
-| Stop during command execution | Passed on v3: the start marker was independently observed; stop at about 50 seconds reached cancelled/finished in about 0.30 seconds; no late marker after the original deadline | None for the tested path |
-| Stop followed by a new followup | Passed; a new AgentCore run returned the expected Web result without a tool call | None for the tested path |
+| Path | Current Native evidence |
+|---|---|
+| Web and Slack product path | Real Web/Slack task and followup acceptance passed; the current cleanup Web readback returned `CLEANUP-NATIVE-OK` with one model callback |
+| HITL after Backend restart | Same-run question/answer passed after Backend restart; a fresh Worker restored the Native checkpoint and workspace |
+| File/workspace continuity | Previous `Alpha` history remained readable after the cleanup session was absent |
+| Stop B | The prepared running-command stop completed with no late file write or marker |
+| Duplicate admission and callback replay | Passed without duplicate execution or final reply |
+| Cleanup readback | 31 dispatches were `finished`; the Native session was absent; 8 Pods were Ready and 6 PVCs were unchanged |
 
-The agreed compatibility PoC acceptance is complete. Preparation cancellation
-releases the run immediately, but the existing Sandbox reservation can remain
-until its cleanup window: `create_timeout=300s`, `ready_timeout=300s` and
-`cleanup_interval=30s` with `pause_enabled=false`. The observed cleanup took
-about 10.5 minutes. Ordinary followup works during that window; another tool
-request in the same Sandbox scope may wait. This PR preserves that behavior.
+See the [Native entrypoint guide](../agentcore-native-entry/README.md) for the
+Native evidence boundary. OpenSandbox sandbox reservations still follow the
+configured cleanup window; ordinary followup works during that window and
+another tool request in the same Sandbox scope may wait.
 
 ## 10. Stop, retain and recover
 
-Keep the EC2 node running during the independent MicroVM Git slice. It still
-hosts the Web/Slack control plane and storage, and provides outbound NAT for
-this compatibility Runtime. Stopping it interrupts all of those paths.
+Keep the EC2 node running while the current Web/Slack control plane, persistent
+storage and OpenSandbox services are in use. The retired compatibility egress
+has been removed; Git slice Lambda and S3 state were never hosted on this node.
+Stopping the node interrupts the current product path.
 
-A later, separately confirmed cost pause must first record active-run state,
-back up persistent data and accept that outage. Retain EBS, EIP, Secrets
-Manager records, ECR repositories and stack state. The known retained baseline
-is about $9.25/month for 60 GiB gp3, one public IPv4 address and two product
-Secrets, plus ECR and other usage; stopping EC2 does not remove those costs.
+A separately confirmed cost pause must first record active-run state, back up
+persistent data and accept the outage. Retain the Node, EBS, EIP, Backend and
+Frontend ECR repositories, KubeconfigSecret, Native ECR repository and the
+Git slice Worker base image required by the Native Dockerfile. Stopping EC2
+does not remove retained-resource costs.
+
 Resume by starting the same node, reopening SSM, checking k3s/PVC health and
-the Runtime NAT route, then running Helm readback and the ECR refresh Job.
-Do not stop or delete shared unrelated resources.
+running the ECR refresh and Helm readbacks. Do not stop or delete shared
+unrelated resources.
 
 If a deployment fails, read the CloudFormation stack, SSM invocation, Pod
-events, Runtime status and Redis/Postgres dispatch state before retrying. The
-durable dispatch is the authority for whether a worker may execute; an unknown
-invoke or stop must be reconciled, never blindly replayed.
+events, Native Runtime status and Redis/Postgres dispatch state before retrying.
+The durable dispatch is the authority for whether a worker may execute; an
+unknown invoke or stop must be reconciled, never blindly replayed.
 
 This is a single-node Testing topology. A lost node can lose local-path PVC
-availability even though the Kubernetes objects and AgentCore session are
-still present. Production would need replicated storage, multiple control-plane
+availability even though the Kubernetes objects and Native session are still
+present. Production would need replicated storage, multiple control-plane
 instances, a managed or HA Kubernetes topology, stronger inbound auth and a
 separate secret rotation policy.
 
 ## Next phase and deferred capabilities
 
-This compatibility route keeps OpenSandbox as a Kubernetes tool environment for
-rollback and legacy Browser/terminal file-sidebar behavior. Native Runtime v2
-now runs the Agent and bounded Git/Shell/file tools together in an AgentCore
-MicroVM. The next phase covers private GitHub authorization, retrieval across
-200 private repositories and replacing the OpenSandbox Browser. The independent
-[Git execution slice](../agentcore-git-slice/README.md) supplies a separate test
-entrypoint; its acceptance does not migrate the existing Web/Slack path.
+OpenSandbox remains the Kubernetes environment for Browser, Terminal and
+sandbox file-sidebar capabilities. Native Runtime v2 runs the Agent and
+bounded Git/Shell/file tools together in an AgentCore MicroVM.
 
-Per-employee private GitHub authorization, indexing and retrieval across 200
-private repositories, and replacing the existing OpenSandbox browser with an
-AgentCore Browser capability remain deferred until the next phase.
+The independent [Git execution slice](../agentcore-git-slice/README.md) is
+retired historical evidence. Per-employee private GitHub authorization,
+indexing and retrieval across 200 private repositories, and replacing the
+existing OpenSandbox browser with an AgentCore Browser capability remain
+deferred until a separately approved next phase.
