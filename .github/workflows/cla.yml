@@ -1,0 +1,47 @@
+name: Contributor License Agreement
+
+on:
+  pull_request_target:
+    types: [opened, closed, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: CLA
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (github.event.comment.body == 'recheck' ||
+      github.event.comment.body == 'I have read and agree to the CubePlex Contributor License Agreement'))
+    steps:
+      - name: Check contributor agreements
+        uses: ribtoks/cla-github-action@f22feedd1f3f46f23fab3bc100081d349f9108af # v2.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CUBEPLEX_CLA_TOKEN }}
+        with:
+          path-to-document: https://github.com/cubeplexai/cubeplex/blob/main/CLA.md
+          remote-organization-name: cubeplexai
+          remote-repository-name: cubeplex-cla
+          path-to-signatures: signatures/icla-v1.json
+          branch: main
+          custom-pr-sign-comment: I have read and agree to the CubePlex Contributor License Agreement
+          custom-notsigned-prcomment: |
+            Thank you for contributing to CubePlex. Please read [CLA.md](https://github.com/cubeplexai/cubeplex/blob/main/CLA.md)
+            and post the following exact comment on this pull request:
+
+            ```text
+            I have read and agree to the CubePlex Contributor License Agreement
+            ```
+          custom-allsigned-prcomment: |
+            ✅ All human commit authors have signed the CubePlex Contributor License Agreement.
+          allowlist: dependabot[bot],github-actions[bot],renovate[bot]
