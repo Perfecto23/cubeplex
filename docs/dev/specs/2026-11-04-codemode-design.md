@@ -272,20 +272,20 @@ from docx import Document
 async def main():
     # 1. Fetch raw data from Linear MCP
     issues = await tools.linear__list_issues(team="INFRA", state="closed")
-    
+
     # 2. Parallel LLM summarization of root causes
     summaries = await asyncio.gather(*[
         llm.generate(f"Summarize root cause in 1 sentence: {item['description']}")
         for item in issues[:10]
     ])
-    
+
     # 3. Create formatted Word document directly on the workspace volume
     doc = Document()
     doc.add_heading("Monthly Incident Report", level=1)
     for issue, summary in zip(issues[:10], summaries):
         doc.add_heading(issue["title"], level=2)
         doc.add_paragraph(summary)
-    
+
     doc.save("/workspace/projects/incident-report.docx")
     print("Report generated successfully at /workspace/projects/incident-report.docx")
 

@@ -171,7 +171,7 @@ class ToolCatalog:
     def list(self) -> list[dict[str, str]]:
         """Return list of available tools as [{'name': ..., 'description': ...}]."""
         ...
-        
+
     def describe(self, name: str) -> dict[str, Any]:
         """Return full parameter schema and documentation for a specific tool."""
         ...
