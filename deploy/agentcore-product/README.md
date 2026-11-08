@@ -17,24 +17,19 @@ Amazon Bedrock AgentCore Runtime
 
 The guide targets the economical Testing deployment in AWS account
 `986420599013`, region `us-west-2`, stack `cubeplex-product-20260912`. The
-Native Runtime v2 is the only AgentCore product runtime and is `READY`.
+Native Runtime is the only AgentCore product execution path. The November source refresh synchronizes upstream main and CubeLoop 0.16.1; deployment identity is recorded in the fork release manifest.
 Native Web/Slack tasks and followups, saved-file recovery, same-run HITL after
 Backend restart, running-command stop without a late write, and duplicate
 admission/callback checks have passed. See the Native guide for the evidence
 boundary. The former compatibility
 Runtime v3 and the independent Git execution Runtime are retired.
 
-The newer Native Runtime v2 is documented separately in the [Native entrypoint
+The Native Runtime is documented separately in the [Native entrypoint
 guide](../agentcore-native-entry/README.md). It uses the same Kubernetes control
 plane but runs CubeLoop and the bounded Git/Shell/file tools together in an
-AgentCore MicroVM. Its current Testing baseline is Runtime
-`cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source
-`09f272ec4088f72fe709cc89b01d7abd68fe45d3` / digest
-`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`, and
-Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest
-`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`.
-The migration and image are a matched baseline. Native Web/Slack task and
-follow-up, HITL, stop/reclaim, restart and duplicate-callback checks have passed.
+AgentCore MicroVM. Use the [fork Releases](https://github.com/Perfecto23/cubeplex/releases) manifest
+for the current source, three image digests and Runtime version. September's
+Native v2 evidence is historical; new artifacts require their own acceptance.
 OpenSandbox remains for Browser, Terminal and sandbox file-sidebar capabilities;
 it is not an AgentCore rollback Runtime.
 
@@ -85,27 +80,16 @@ but remember that retained EBS, EIP and ECR resources still have their own
 costs. Do not delete the retained disk until the recovery decision is made.
 
 ## 1. Freeze source and build immutable images
-The current Testing image pair is already built and deployed from committed
-sources. Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` uses digest
-`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`.
-Native Worker source `09f272ec4088f72fe709cc89b01d7abd68fe45d3` uses digest
-`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`.
-The deployed Frontend uses digest
-`sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1`.
+The [Native build script](../agentcore-native-entry/build.sh) builds Native,
+Backend and Frontend from the same committed archive. The Worker and Backend
+pin the same CubeLoop commit. Each release manifest records immutable images;
+container dependency readback verifies the Worker rather than relying on its tag.
 
-If a future Native rebuild is required, use
-[`../agentcore-native-entry/build.sh`](../agentcore-native-entry/build.sh),
-which creates a clean archive and records the source manifest. Its Dockerfile
-uses the Git slice Worker digest
-`sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d` as
-its base. Retain that one Git slice Worker image and repository for rebuilding;
-the Git slice Runtime, broker, Lambda, S3 state and dedicated Secrets are
-retired.
-
-The Frontend image is Node 24.21.0 and its ECR scan is clean. Backend and
-Native Worker each have one unresolved vendor High in zlib (`CVE-2026-85091`),
-and the Native image has the recorded nghttp2 Medium; do not describe these
-images as vulnerability-free until the vendor publishes fixed packages.
+The Native Dockerfile still uses Git slice Worker digest
+`sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d`
+for its system tools, while installing its own current frozen Python dependencies.
+Keep that base image available for rebuilds. The independent Git runtime/broker
+and its state are retired.
 
 ## 2. Review ProductStack retention
 
@@ -276,8 +260,7 @@ token, request body or Secret value.
 
 ## 7. Use the Native Runtime
 
-The Native Runtime is already connected to the current Backend. Its immutable
-ARM64 image is `sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`.
+Use the release manifest to update the existing Native Runtime and the three application images. Follow the [maintenance upgrade steps](../agentcore-native-entry/README.md#upgrading-the-september-deployment) for a September database.
 The Native stack owns the Runtime, WorkerRole and Native ECR repository. The
 ProductStack owns the Node and its NodeRole; the Native stack attaches the
 exact invoke/stop policy to that existing role.
@@ -331,13 +314,13 @@ queue admission before acknowledging the event. The outbound tailer resumes
 from its durable checkpoint and uses stable client message IDs, so a Slack
 retry does not create a second AgentCore dispatch or a second final reply.
 
-## 9. Acceptance sequence
+## 9. Acceptance and September evidence
 
 Record the Native source SHA, image digests, Runtime version,
 conversation/run/dispatch IDs and user-visible result for every check. The
 historical compatibility Runtime evidence is not reassigned to Native.
 
-| Path | Current Native evidence |
+| Path | September Native evidence |
 |---|---|
 | Web and Slack product path | Real Web/Slack task and followup acceptance passed; the current cleanup Web readback returned `CLEANUP-NATIVE-OK` with one model callback |
 | HITL after Backend restart | Same-run question/answer passed after Backend restart; a fresh Worker restored the Native checkpoint and workspace |

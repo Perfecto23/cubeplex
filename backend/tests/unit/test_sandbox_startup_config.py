@@ -2,7 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_sandbox_coordinator_and_cleanup_stop_as_one_shutdown_phase() -> None:
+    from cubeplex.api.app import _stop_sandbox_background_tasks
+
+    started = [asyncio.Event(), asyncio.Event()]
+    coordinator_stopped = asyncio.Event()
+
+    async def _background(index: int) -> None:
+        started[index].set()
+        await asyncio.Event().wait()
+
+    class Coordinator:
+        async def stop(self) -> None:
+            coordinator_stopped.set()
+
+    delivery = asyncio.create_task(_background(0))
+    cleanup = asyncio.create_task(_background(1))
+    await asyncio.gather(*(event.wait() for event in started))
+
+    await _stop_sandbox_background_tasks(Coordinator(), delivery, cleanup)
+
+    assert delivery.cancelled()
+    assert cleanup.cancelled()
+    assert coordinator_stopped.is_set()
 
 
 @pytest.mark.parametrize(
@@ -43,6 +71,7 @@ def test_validate_sandbox_config_rejects_incomplete_required_configuration(
         "sandbox.domain": "opensandbox.example:8090",
         "sandbox.image": "registry.example/cubeplex-sandbox:latest",
         "sandbox.api_key": "test-key",
+        "sandbox.command_default_timeout_seconds": 3600,
         **values,
     }
     monkeypatch.setattr(config, "get", lambda key, default=None: configured.get(key, default))
@@ -63,9 +92,30 @@ def test_validate_sandbox_config_accepts_complete_required_configuration(
         "sandbox.domain": "opensandbox.example:8090",
         "sandbox.image": "registry.example/cubeplex-sandbox:latest",
         "sandbox.api_key": "test-key",
+        "sandbox.command_default_timeout_seconds": 3600,
     }
     monkeypatch.setattr(config, "get", lambda key, default=None: configured.get(key, default))
 
     from cubeplex.api.app import validate_sandbox_config
 
     validate_sandbox_config()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 1.5, "3600", None, True, False])
+def test_startup_rejects_invalid_managed_command_default(
+    monkeypatch: pytest.MonkeyPatch, timeout: object
+) -> None:
+    from cubeplex.api.app import validate_sandbox_config
+    from cubeplex.config import config
+
+    configured = {
+        "sandbox.enabled": True,
+        "sandbox.domain": "opensandbox.example:8090",
+        "sandbox.image": "registry.example/cubeplex-sandbox:latest",
+        "sandbox.api_key": "test-key",
+        "sandbox.command_default_timeout_seconds": timeout,
+    }
+    monkeypatch.setattr(config, "get", lambda key, default=None: configured.get(key, default))
+
+    with pytest.raises(RuntimeError, match="COMMAND_DEFAULT_TIMEOUT_SECONDS.*positive integer"):
+        validate_sandbox_config()

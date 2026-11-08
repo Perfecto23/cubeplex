@@ -2,24 +2,64 @@
 
 import asyncio
 import base64
+import inspect
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
+from typing import Any
 
 import opensandbox
 from loguru import logger
+from opensandbox.adapters import command_adapter as _cmd_adapter
+from opensandbox.adapters.converter.command_execution import (
+    decode_sse_event_data as _decode_sse_event_data,
+)
 from opensandbox.config import ConnectionConfig
+from opensandbox.exceptions import SandboxApiException as _ProviderApiError
 from opensandbox.exceptions import SandboxException as _ProviderError
 from opensandbox.models.execd import ExecutionHandlers, RunCommandOpts
 
-from cubeplex.sandbox.base import BrowserEndpoint, ExecuteResult, Sandbox, SandboxError
+from cubeplex.sandbox.base import (
+    BrowserEndpoint,
+    ExecuteResult,
+    ProcessHandle,
+    ProcessHandleNotFoundError,
+    ProcessOutput,
+    ProcessSnapshot,
+    Sandbox,
+    SandboxError,
+    SandboxInstanceGoneError,
+)
 from cubeplex.sandbox.panel_token import (
     get_panel_base_url,
     get_panel_secret,
     sign_panel_token,
 )
+
+_orig_aiter_sse_events = _cmd_adapter.aiter_sse_events  # type: ignore[attr-defined]
+
+
+async def _fast_aiter_sse_events(response: Any) -> Any:
+    """Stream SSE events and exit immediately upon execution completion.
+
+    OpenSandbox SDK's default foreground streaming drains to EOF instead of
+    breaking on ``execution_complete`` / ``error``, which adds a ~1s delay per
+    call because the execd server holds the chunked HTTP connection open for
+    a grace-period sleep (#1528 in opensandbox only broke for background mode).
+    By terminating the event stream as soon as terminal completion events arrive,
+    foreground commands complete in milliseconds over standard SSE with zero
+    polling.
+    """
+    async for event in _orig_aiter_sse_events(response):
+        yield event
+        node = _decode_sse_event_data(getattr(event, "data", ""))
+        if node is not None and node.type in ("execution_complete", "error"):
+            break
+
+
+_cmd_adapter.aiter_sse_events = _fast_aiter_sse_events  # type: ignore[attr-defined]
 
 # Sourced by /etc/bash.bashrc in the sandbox image — keep the two in sync.
 # /run is container-local: writing under /workspace would strand placeholders on
@@ -83,6 +123,7 @@ class OpenSandbox(Sandbox):
         self._run_uid = run_uid
         self._run_gid = run_gid
         self._run_user = run_user
+        self._log_cursors: dict[str, int | None] = {}
 
     @property
     def id(self) -> str:
@@ -103,6 +144,7 @@ class OpenSandbox(Sandbox):
         timeout: int | None = None,
         envs: dict[str, str] | None = None,
         as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> ExecuteResult:
         # Merge: run-level env (set by manager) is the base; per-call envs win.
         merged = {**self._run_env, **(envs or {})}
@@ -124,32 +166,52 @@ class OpenSandbox(Sandbox):
             if isinstance(value, str) and value:
                 execution_id = value
 
+        output_parts: list[str] = []
+
+        async def _handle_output(msg: Any) -> None:
+            text = getattr(msg, "text", "") or ""
+            if not text:
+                return
+            if on_chunk is not None:
+                try:
+                    on_chunk(text)
+                except Exception:
+                    logger.exception("OpenSandbox on_chunk failed")
+            output_parts.append(text)
+
+        handlers = ExecutionHandlers(
+            on_init=_on_init,
+            on_stdout=_handle_output,
+            on_stderr=_handle_output,
+            skip_accumulation=True,
+        )
+
         async def _run() -> ExecuteResult:
             nonlocal execution_id
             with _as_sandbox_error():
-                execution = await self._sandbox.commands.run(
-                    command,
-                    opts=opts,
-                    handlers=ExecutionHandlers(on_init=_on_init),
-                )
+                execution = await self._sandbox.commands.run(command, opts=opts, handlers=handlers)
+                output = "".join(output_parts)
+                if not output and getattr(execution, "logs", None):
+                    lines = [m.text for m in execution.logs.stdout] + [
+                        m.text for m in execution.logs.stderr
+                    ]
+                    output = "\n".join(lines) if lines else ""
 
                 if execution_id is None and execution.id:
                     execution_id = execution.id
 
-                output_lines: list[str] = []
-                for msg in execution.logs.stdout:
-                    output_lines.append(msg.text)
-                for msg in execution.logs.stderr:
-                    output_lines.append(msg.text)
-                output = "\n".join(output_lines) if output_lines else ""
-
-                exit_code: int | None = None
-                if execution.id:
+                exit_code = getattr(execution, "exit_code", None)
+                exec_id = getattr(execution, "id", None)
+                if not isinstance(exit_code, int) and isinstance(exec_id, str):
                     try:
-                        status = await self._sandbox.commands.get_command_status(execution.id)
-                        exit_code = status.exit_code
+                        status = await self._sandbox.commands.get_command_status(exec_id)
+                        code = getattr(status, "exit_code", None)
+                        if isinstance(code, int):
+                            exit_code = code
                     except Exception as e:
                         logger.warning("Could not get exit code for command: {}", e)
+                if exit_code is not None and not isinstance(exit_code, int):
+                    exit_code = 0
 
                 return ExecuteResult(output=output, exit_code=exit_code)
 
@@ -223,6 +285,133 @@ class OpenSandbox(Sandbox):
                 return
             await asyncio.sleep(0.1)
         raise SandboxCancellationUnknown("remote command remained running")
+
+    def supports_background(self) -> bool:
+        return True
+
+    def supports_background_reconnect(self) -> bool:
+        return True
+
+    async def _raise_if_instance_gone(self) -> None:
+        try:
+            info = await self._sandbox.get_info()
+        except _ProviderApiError as exc:
+            if exc.status_code == 404:
+                raise SandboxInstanceGoneError(self.id) from exc
+            return
+        except Exception:
+            return
+        if info.status.state in ("Failed", "Terminated", "Succeed"):
+            raise SandboxInstanceGoneError(self.id)
+
+    async def observe(self, handle: ProcessHandle) -> ProcessSnapshot:
+        with _as_sandbox_error():
+            try:
+                status = await self._sandbox.commands.get_command_status(handle.provider_ref)
+            except _ProviderApiError as exc:
+                if exc.status_code == 404:
+                    raise ProcessHandleNotFoundError(handle.provider_ref) from exc
+                raise
+        running = getattr(status, "running", None)
+        code = getattr(status, "exit_code", None)
+        raw_error = getattr(status, "error", None)
+        error = raw_error if isinstance(raw_error, str) else None
+        if not isinstance(running, bool) or (code is not None and type(code) is not int):
+            raise SandboxError("provider returned an invalid process status")
+        return ProcessSnapshot(
+            status="running" if running else "exited", exit_code=code, error=error
+        )
+
+    async def start(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        provider_timeout: bool = False,
+        envs: dict[str, str] | None = None,
+        as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
+        on_started: Callable[[str], Any] | None = None,
+    ) -> ProcessHandle:
+        del on_chunk
+        merged = {**self._run_env, **(envs or {})}
+        uid: int | None = None if as_root else self._run_uid
+        gid: int | None = None if as_root or uid is None else self._run_gid
+        opts = RunCommandOpts(
+            working_directory=self._workdir,
+            envs=merged if merged else None,
+            # Subagent deadlines survive a worker restart; main commands retain their lifecycle.
+            timeout=(
+                timedelta(seconds=timeout) if provider_timeout and timeout is not None else None
+            ),
+            uid=uid,
+            gid=gid,
+            background=True,
+        )
+        started: list[str] = []
+
+        async def _on_init(msg: Any) -> None:
+            eid = getattr(msg, "execution_id", None) or getattr(msg, "id", None)
+            if eid is None:
+                return
+            ref = str(eid)
+            started.append(ref)
+            if on_started is not None:
+                maybe = on_started(ref)
+                if inspect.isawaitable(maybe):
+                    await maybe
+
+        try:
+            with _as_sandbox_error():
+                execution = await self._sandbox.commands.run(
+                    command,
+                    opts=opts,
+                    handlers=ExecutionHandlers(on_init=_on_init, skip_accumulation=True),
+                )
+        except SandboxError:
+            await self._raise_if_instance_gone()
+            raise
+        ref = started[0] if started else str(execution.id or "")
+        self._log_cursors[ref] = 0
+        if on_started is not None and not started and ref:
+            maybe = on_started(ref)
+            if inspect.isawaitable(maybe):
+                await maybe
+        return ProcessHandle(command_id="", provider_ref=ref)
+
+    async def poll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        try:
+            status = await self.observe(handle)
+            output = await self.read_output(handle)
+        except SandboxError:
+            await self._raise_if_instance_gone()
+            raise
+        return ProcessSnapshot(
+            status=status.status,
+            exit_code=status.exit_code,
+            new_output=output.new_output,
+            log_cursor=output.log_cursor,
+            error=status.error,
+        )
+
+    async def read_output(self, handle: ProcessHandle) -> ProcessOutput:
+        ref = handle.provider_ref
+        cursor = (
+            int(handle.log_cursor) if handle.log_cursor is not None else self._log_cursors.get(ref)
+        )
+        with _as_sandbox_error():
+            logs = await self._sandbox.commands.get_background_command_logs(ref, cursor=cursor)
+        new_output = getattr(logs, "content", "") or ""
+        next_cursor = getattr(logs, "cursor", None)
+        serialized_cursor = str(next_cursor) if next_cursor is not None else handle.log_cursor
+        return ProcessOutput(
+            new_output=new_output,
+            log_cursor=serialized_cursor,
+        )
+
+    async def kill(self, handle: ProcessHandle) -> None:
+        with _as_sandbox_error():
+            await self._sandbox.commands.interrupt(handle.provider_ref)
 
     async def upload(self, files: list[tuple[str, bytes]]) -> None:
         """Write files then chown by numeric uid so agent can edit them.

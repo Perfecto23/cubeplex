@@ -15,3 +15,7 @@ in deploy/agentcore-product/access.yaml.
 Inspect:
   kubectl -n {{ .Release.Namespace }} get pods,svc,ingress
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "cubeplex.backend.fullname" . }}
+{{- if .Values.tempo.enabled }}
+
+Tempo is in-cluster at {{ include "cubeplex.tempo.host" . }}:3200 and is not on Ingress.
+{{- end }}

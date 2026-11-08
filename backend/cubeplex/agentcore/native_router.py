@@ -20,6 +20,8 @@ from cubeplex.agentcore.native_service import (
     NativeTaskError,
     callback_transaction,
     load_native_dispatch,
+    native_claim_token,
+    require_native_execution,
 )
 from cubeplex.agentcore.native_storage import load_workspace, present_file, save_workspace
 from cubeplex.cache import RedisHandle, redis_dep
@@ -129,6 +131,13 @@ async def claim(
                 or active != d.run_id
             ):
                 raise NativeTaskError("native_run_claim_conflict")
+            expected_claim = native_claim_token(d)
+            if expected_claim is not None:
+                current_claim = await rds.client.hget(  # type: ignore[misc]
+                    _run_meta_key(rds.key_prefix, d.run_id), "claim_token"
+                )
+                if current_claim != expected_claim:
+                    raise NativeTaskError("native_run_claim_conflict")
             if d.operation == "respond":
                 from cubeplex.agents.checkpointer import shared_checkpointer
 
@@ -145,6 +154,7 @@ async def claim(
                     or pending[0].question_id != d.request.get("question_id")
                 ):
                     raise NativeTaskError("native_respond_claim_conflict")
+            await require_native_execution(tx.session, d, worker_entry=True, run_store=rds)
             d.status = "claimed"
             d.claimed_at = datetime.now(UTC)
             d.heartbeat_at = d.claimed_at
@@ -177,6 +187,14 @@ async def control(
         if d.status == "created":
             raise NativeTaskError("native_task_not_claimed")
         if d.status == "claimed" and not d.stop_requested:
+            try:
+                await require_native_execution(session, d, run_store=rds)
+            except NativeTaskError as exc:
+                if exc.code != "native_execution_revoked":
+                    raise
+                d.stop_requested = True
+                session.add(d)
+                return wrapped({"status": d.status, "stop_requested": True})
             now = datetime.now(UTC)
             if d.heartbeat_at is None or (now - d.heartbeat_at).total_seconds() >= 10:
                 d.heartbeat_at = now
@@ -187,13 +205,20 @@ async def control(
                 run_id=d.run_id,
                 conversation_id=d.conversation_id,
                 ttl_seconds=stream_settings()["ttl_seconds"],
+                claim_token=native_claim_token(d),
             )
-        return wrapped({"status": d.status, "stop_requested": d.stop_requested})
+        return wrapped(
+            {"status": d.status, "stop_requested": d.stop_requested or d.status != "claimed"}
+        )
 
 
 @router.post("/checkpoint")
-async def checkpoint(dispatch_id: UUID, body: CheckpointRequest) -> dict[str, Any]:
-    return wrapped(await checkpoint_call(dispatch_id, body.request_id, body.op, body.args))
+async def checkpoint(
+    dispatch_id: UUID, body: CheckpointRequest, rds: Annotated[RedisHandle, Depends(redis_dep)]
+) -> dict[str, Any]:
+    return wrapped(
+        await checkpoint_call(dispatch_id, body.request_id, body.op, body.args, run_store=rds)
+    )
 
 
 @router.post("/events")
@@ -213,24 +238,33 @@ async def events(
 
 
 @router.post("/workspace")
-async def workspace_put(dispatch_id: UUID, body: WorkspaceRequest) -> dict[str, Any]:
+async def workspace_put(
+    dispatch_id: UUID, body: WorkspaceRequest, rds: Annotated[RedisHandle, Depends(redis_dep)]
+) -> dict[str, Any]:
     return wrapped(
         await save_workspace(
-            dispatch_id, body.request_id, [file.model_dump() for file in body.files]
+            dispatch_id, body.request_id, [file.model_dump() for file in body.files], run_store=rds
         )
     )
 
 
 @router.get("/workspace")
-async def workspace_get(dispatch_id: UUID) -> dict[str, Any]:
-    return wrapped(await load_workspace(dispatch_id))
+async def workspace_get(
+    dispatch_id: UUID, rds: Annotated[RedisHandle, Depends(redis_dep)]
+) -> dict[str, Any]:
+    return wrapped(await load_workspace(dispatch_id, run_store=rds))
 
 
 @router.post("/present")
-async def present(dispatch_id: UUID, body: PresentRequest) -> dict[str, Any]:
+async def present(
+    dispatch_id: UUID, body: PresentRequest, rds: Annotated[RedisHandle, Depends(redis_dep)]
+) -> dict[str, Any]:
     return wrapped(
         await present_file(
-            dispatch_id, body.request_id, body.model_dump(exclude={"version", "request_id"})
+            dispatch_id,
+            body.request_id,
+            body.model_dump(exclude={"version", "request_id"}),
+            run_store=rds,
         )
     )
 
@@ -241,9 +275,14 @@ async def model_responses(
     body: dict[str, Any],
     request: Request,
     request_id: Annotated[UUID, Header(alias="X-AgentCore-Request-Id")],
+    rds: Annotated[RedisHandle, Depends(redis_dep)],
 ) -> Response:
     text = await proxy_model(
-        dispatch_id, request_id, body, encryption_backend=request.app.state.encryption_backend
+        dispatch_id,
+        request_id,
+        body,
+        encryption_backend=request.app.state.encryption_backend,
+        run_store=rds,
     )
     return Response(text, media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 

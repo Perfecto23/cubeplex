@@ -99,3 +99,32 @@ def compose_after_tool_call(
         )
 
     return composed
+
+
+def _overrides_on_run_end(mw: Middleware) -> bool:
+    method = getattr(type(mw), "on_run_end", None)
+    return method is not None and method is not Middleware.on_run_end
+
+
+def compose_on_run_end(
+    middlewares: list[Middleware],
+) -> Callable[..., Awaitable[list[Any] | None]] | None:
+    """Compose ``on_run_end`` hooks in stable middleware order."""
+
+    chain = [m for m in middlewares if _overrides_on_run_end(m)]
+    if not chain:
+        return None
+
+    async def composed(
+        ctx: Any,
+        *,
+        signal: asyncio.Event | None = None,
+    ) -> list[Any] | None:
+        inject: list[Any] = []
+        for mw in chain:
+            result = await mw.on_run_end(ctx, signal=signal)
+            if result:
+                inject.extend(result)
+        return inject or None
+
+    return composed

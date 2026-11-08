@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -7,6 +8,19 @@ import pytest
 
 from cubeplex_native.tools import NativeTools
 from cubeplex_native.workspace import Workspace, WorkspacePathError
+
+
+@pytest.mark.asyncio
+async def test_revoked_tool_authority_prevents_local_side_effects(tmp_path: Path) -> None:
+    async def revoked() -> None:
+        raise asyncio.CancelledError("execution revoked")
+
+    tools = NativeTools(tmp_path, require_authority=revoked)
+    with pytest.raises(asyncio.CancelledError, match="revoked"):
+        await tools.write_file("late.txt", "late write")
+    with pytest.raises(asyncio.CancelledError, match="revoked"):
+        await tools.execute("touch late.txt")
+    assert not (tmp_path / "late.txt").exists()
 
 
 @pytest.mark.asyncio

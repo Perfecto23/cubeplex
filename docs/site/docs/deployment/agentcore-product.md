@@ -27,15 +27,19 @@ VM session still existing.
 
 ## Current baseline
 
-Testing Native Runtime v2 is `READY`. The current baseline is Runtime
-`cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source
-`09f272ec4088f72fe709cc89b01d7abd68fe45d3` / digest
-`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`,
-Backend source `5e616137415f7b93d3e86b9514739ba129d9a7c4` / digest
-`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`,
-and Frontend digest
-`sha256:5c2816ef1f898fb585246b585cc3d17efabb807a956e2af8233012ef81c7dbc1`.
-The Backend migration image and main image remain a matched baseline.
+The November fork refresh integrates upstream main and CubeLoop 0.16.1. Use
+[the fork release manifest](https://github.com/Perfecto23/cubeplex/releases) for
+source, Backend/Frontend/Native image digests and the deployed Runtime version.
+The Backend migration image and main image use the same release. September
+Native v2 acceptance is a historical baseline, not a deployment test of new images.
+
+An existing September database requires maintenance: back up data, stop the old
+Backend writers, run the new image's `python -m cubeplex.scripts.lifecycle_upgrade
+--maintenance` command, then deploy the matching application images. Preserve
+existing PVCs and authentication secrets. Follow the
+[Native operator guide](https://github.com/Perfecto23/cubeplex/blob/main/deploy/agentcore-native-entry/README.md)
+for the exact sequence and rollback boundary.
+
 
 The Backend uses `execution.backend=agentcore`,
 `agentcore.execution_mode=native`, and the same verified Native ARN in both
@@ -71,7 +75,7 @@ environments and background processes.
 | Component | Current responsibility | Retention boundary |
 |---|---|---|
 | CubePlex Backend on k3s | auth, workspace scope, RunManager, dispatch admission, SSE, Slack ingress and delivery | ProductStack Node, Postgres, Redis, RustFS |
-| Native AgentCore Runtime v2 | CubeLoop, bounded tools, HITL and scoped callbacks | Native stack and Native Worker image |
+| Native AgentCore Runtime | CubeLoop, bounded tools, HITL and scoped callbacks | Native stack and Native Worker image |
 | OpenSandbox | Browser, Terminal and sandbox file tools | Server/controller Pods and PVCs |
 | Backend/Frontend ECR | current product images | ProductStack repositories with `Retain` |
 | Native ECR | Native Worker image | Native stack repository with immutable tags |
@@ -110,11 +114,11 @@ Verify Deployments, StatefulSets, PVCs, OpenSandbox CRDs and the RustFS bucket
 before user acceptance. A healthy Helm release proves control-plane readiness;
 Native acceptance also requires a real Web or Slack dispatch and readback.
 
-## Acceptance boundary
+## September acceptance baseline
 
-| Path | Current Native state |
+| Path | Historical Native evidence |
 |---|---|
-| Web/Slack product path | Prior real Web/Slack task and followup acceptance passed; current cleanup Web readback returned `CLEANUP-NATIVE-OK` with one model callback |
+| Web/Slack product path | Prior real Web/Slack task and followup acceptance passed; September cleanup Web readback returned `CLEANUP-NATIVE-OK` with one model callback |
 | HITL after Backend restart | Same-run question/answer passed after Backend restart; a fresh Worker restored the Native checkpoint and workspace |
 | File/workspace continuity | Previous `Alpha` history remained readable after the cleanup session was absent |
 | Stop B | Prepared running-command stop completed with no late file write or marker |

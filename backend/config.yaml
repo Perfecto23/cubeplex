@@ -37,6 +37,9 @@ default:
     port: 8000
     reload: false          # dev enables autoreload in config.development.yaml
     public_url: ""
+    # Bound Uvicorn's wait for active HTTP requests. Permanent SSE streams
+    # must release before the separate agent drain begins.
+    transport_shutdown_timeout_seconds: 10
 
   # Egress secret-injection exchange endpoint.
   #   auth.mode "mtls"  → production: identity is the CN of the per-sandbox
@@ -92,6 +95,8 @@ default:
   # opensandbox timeout is set to None (disabled) — CubePlex controls termination via TTL.
   sandbox:
     enabled: true
+    # Total deadline for newly reserved managed execute tasks, not an HTTP timeout.
+    command_default_timeout_seconds: 3600
     # domain: "localhost:8090"
     domain: "@format {env[CUBEPLEX_SANDBOX__DOMAIN]}"
     image: "@format {env[CUBEPLEX_SANDBOX__IMAGE]}"
@@ -186,9 +191,13 @@ default:
   # `mcp.servers` config block was removed in M2.
   mcp:
     # Backend egress initiated by tenant-configured MCP connectors.
+    # Modes: disabled, public_only, allowlist_only, public_and_allowlist, unrestricted.
     outbound_policy: "public_and_allowlist"
+    # Keep HTTPS-only by default; development also permits HTTP for local services.
     allowed_schemes: ["https"]
+    # Explicit DNS hostnames; omit the scheme and path (for example, "mcp.internal").
     allowed_hosts: []
+    # Explicit IPv4/IPv6 CIDRs (for example, "10.20.0.0/16" or "fd00:1234::/64").
     allowed_cidrs: []
     progressive_disclosure:
       enabled: "auto"        # "auto" | "on" | "off"
@@ -401,6 +410,11 @@ default:
     # record_content=true captures full prompts / responses / tool args+results
     # in the trace — useful for debugging, larger files, may contain sensitive data.
     record_content: false
+    # JSONL on-disk export. Default on so local-dev traces still land under
+    # `directory`. Helm/Compose turn this off so OTLP-only deploys do not
+    # fill the backend container's writable layer.
+    jsonl:
+      enabled: true
     otlp:
       # Full OTLP HTTP traces URL, e.g. "http://localhost:4318/v1/traces".
       # Leave null to keep tracing JSONL-only.

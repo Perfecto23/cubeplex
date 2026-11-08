@@ -32,6 +32,7 @@ class ClaimResumeResult:
 # ARGV[1] = expected_run_id, ARGV[2] = new_claim_token,
 # ARGV[3] = ttl_seconds, ARGV[4] = last_event_at_iso,
 # ARGV[5] = conversation_id, ARGV[6] = started_at_iso
+# ARGV[7] = cleanup-only claim may preserve an existing terminal status
 #
 # Returns: "ok" | "already_running" | "conflict"
 #
@@ -56,16 +57,31 @@ if current and current ~= ARGV[1] then
   return 'conflict'
 end
 local meta_exists = redis.call('EXISTS', KEYS[2]) == 1
+if ARGV[7] == '1' and not meta_exists then
+  return 'conflict'
+end
+local terminal = false
 if meta_exists then
+  local finalizing = redis.call('HGET', KEYS[2], 'resume_finalizing_token')
+  if finalizing then
+    local lease_until = tonumber(redis.call('HGET', KEYS[2], 'resume_finalizing_until'))
+    local now = tonumber(redis.call('TIME')[1])
+    if lease_until and now < lease_until then
+      return 'already_running'
+    end
+    redis.call('HDEL', KEYS[2], 'resume_finalizing_token', 'resume_finalizing_until')
+  end
   local status = redis.call('HGET', KEYS[2], 'status')
   if status == 'running' then
     return 'already_running'
   end
-  if status ~= 'paused_hitl' and status ~= 'stale' then
+  terminal = status == 'completed' or status == 'cancelled'
+    or status == 'errored' or status == 'failed'
+  if status ~= 'paused_hitl' and status ~= 'stale' and not (ARGV[7] == '1' and terminal) then
     return 'conflict'
   end
   redis.call('HSET', KEYS[2],
-    'status', 'running',
+    'status', terminal and status or 'running',
     'claim_token', ARGV[2],
     'last_event_at', ARGV[4]
   )
@@ -81,7 +97,10 @@ else
   )
 end
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
-redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[3]))
+-- Receipt-only recovery must never make an already-released terminal run active again.
+if not terminal or current then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[3]))
+end
 return 'ok'
 """
 
@@ -94,6 +113,7 @@ async def claim_resume(
     expected_run_id: str,
     started_at: str,
     ttl_seconds: int,
+    cleanup_only: bool = False,
 ) -> ClaimResumeResult:
     """Atomically claim a paused/stale/missing active-run slot for resume.
 
@@ -101,7 +121,8 @@ async def claim_resume(
     Redis TTL) has to re-populate the meta hash with all the fields
     _meta_from_hash requires. Callers get started_at from the
     pending_hitl.requested_at payload (which is itself derived from
-    the DB pending).
+    the DB pending). Only no-model cleanup may reclaim a terminal run;
+    its stored result is never changed back to running.
     """
     new_token = uuid.uuid4().hex
     now_iso = datetime.now(UTC).isoformat()
@@ -116,6 +137,7 @@ async def claim_resume(
         now_iso,
         conversation_id,
         started_at,
+        "1" if cleanup_only else "0",
     )
     outcome_str = outcome.decode() if isinstance(outcome, bytes) else outcome
     return ClaimResumeResult(
@@ -162,15 +184,85 @@ def classify_terminal_status(
     return TerminalClassification(status="paused_hitl", clear_pending=False)
 
 
-# KEYS[1] = meta_key
-# ARGV[1] = expected_claim_token, ARGV[2] = new_status
-# Returns 1 if status was set, 0 if token mismatch (caller's claim was
-# superseded by some other flow — do not clobber).
-_FINALIZE_IF_CLAIM_MATCHES_LUA = """
+# KEYS[1] = meta_key, KEYS[2] = active_key
+# ARGV[1] = expected_claim_token, ARGV[2] = expected_run_id,
+# ARGV[3] = ttl_seconds, ARGV[4] = lease_seconds
+# ARGV[5] = cleanup-only finalization may retain an existing terminal status
+# Returns 1 after reserving finalization, 0 if the caller no longer owns
+# the resume claim. The marker prevents stale recovery from handing the same
+# question to another resume attempt while durable cleanup is in flight.
+_BEGIN_FINALIZATION_IF_CLAIM_MATCHES_LUA = """
+local active = redis.call('GET', KEYS[2])
+local status = redis.call('HGET', KEYS[1], 'status')
+local terminal = status == 'completed' or status == 'cancelled'
+  or status == 'errored' or status == 'failed'
+local released_cleanup = ARGV[5] == '1' and terminal and not active
+if active ~= ARGV[2] and not released_cleanup then return 0 end
 if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[1] then
   return 0
 end
+if status ~= 'running' and not (ARGV[5] == '1' and terminal) then
+  return 0
+end
+local now = tonumber(redis.call('TIME')[1])
+redis.call('HSET', KEYS[1],
+  'resume_finalizing_token', ARGV[1],
+  'resume_finalizing_until', tostring(now + tonumber(ARGV[4]))
+)
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+if redis.call('GET', KEYS[2]) == ARGV[2] then
+  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+end
+return 1
+"""
+
+
+async def begin_resume_finalization(
+    redis: Redis,
+    *,
+    prefix: str,
+    conversation_id: str,
+    run_id: str,
+    claim_token: str,
+    ttl_seconds: int,
+    lease_seconds: int,
+    cleanup_only: bool = False,
+) -> bool:
+    """Lease the resume claim across durable cleanup and event projection."""
+    result = await redis.eval(  # type: ignore[misc]
+        _BEGIN_FINALIZATION_IF_CLAIM_MATCHES_LUA,
+        2,
+        _run_meta_key(prefix, run_id),
+        _active_run_key(prefix, conversation_id),
+        claim_token,
+        run_id,
+        str(max(ttl_seconds, lease_seconds)),
+        str(lease_seconds),
+        "1" if cleanup_only else "0",
+    )
+    return int(result) == 1
+
+
+# KEYS[1] = meta_key, KEYS[2] = optional active_key
+# ARGV[1] = expected_claim_token, ARGV[2] = new_status, ARGV[3] = optional run_id
+# Returns 1 if status was set, 0 if token mismatch (caller's claim was
+# superseded by some other flow — do not clobber).
+_FINALIZE_IF_CLAIM_MATCHES_LUA = """
+if ARGV[3] ~= '' and redis.call('GET', KEYS[2]) ~= ARGV[3] then
+  return 0
+end
+if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[1] then
+  return 0
+end
+local finalizing = redis.call('HGET', KEYS[1], 'resume_finalizing_token')
+if finalizing and finalizing ~= ARGV[1] then
+  return 0
+end
 redis.call('HSET', KEYS[1], 'status', ARGV[2])
+-- An admitted owner still needs its claim for the durable finish receipt.
+if ARGV[3] == '' or ARGV[2] == 'paused_hitl' then
+  redis.call('HDEL', KEYS[1], 'resume_finalizing_token', 'resume_finalizing_until')
+end
 return 1
 """
 
@@ -182,6 +274,7 @@ async def finalize_run_meta_if_claim_matches(
     run_id: str,
     claim_token: str,
     status: str,
+    conversation_id: str | None = None,
 ) -> bool:
     """Write the terminal status to the run meta only if the claim token
     still matches. Returns True if status was written; False if some other
@@ -192,12 +285,63 @@ async def finalize_run_meta_if_claim_matches(
     """
     result = await redis.eval(  # type: ignore[misc]
         _FINALIZE_IF_CLAIM_MATCHES_LUA,
-        1,
+        2,
         _run_meta_key(prefix, run_id),
+        _active_run_key(prefix, conversation_id) if conversation_id is not None else "",
         claim_token,
         status,
+        run_id if conversation_id is not None else "",
     )
     return int(result) == 1
+
+
+async def resume_claim_matches(
+    redis: Redis,
+    *,
+    prefix: str,
+    run_id: str,
+    claim_token: str,
+) -> bool:
+    """Return whether ``claim_token`` still owns this resume attempt."""
+    current_raw = await redis.hget(  # type: ignore[misc]
+        _run_meta_key(prefix, run_id), "claim_token"
+    )
+    if current_raw is None:
+        return False
+    current = current_raw.decode() if isinstance(current_raw, bytes) else str(current_raw)
+    return current == claim_token
+
+
+async def get_resume_claim_token(
+    redis: Redis,
+    *,
+    prefix: str,
+    run_id: str,
+) -> str | None:
+    """Return the current distributed resume owner token, if one exists."""
+    current_raw = await redis.hget(  # type: ignore[misc]
+        _run_meta_key(prefix, run_id), "claim_token"
+    )
+    if current_raw is None:
+        return None
+    return current_raw.decode() if isinstance(current_raw, bytes) else str(current_raw)
+
+
+def stale_answered_pending(
+    *,
+    final_status: str,
+    loaded_pending: tuple[Any, Any] | None,
+    answered_question_id: str,
+    answered_run_id: str,
+) -> Any | None:
+    """Select only the stale pending row belonging to this completed answer."""
+    if final_status != "completed" or loaded_pending is None:
+        return None
+    pending = loaded_pending[0]
+    pending_run_id = loaded_pending[1]
+    if pending.question_id != answered_question_id or pending_run_id != answered_run_id:
+        return None
+    return pending
 
 
 def _as_dict(obj: Any) -> dict[str, Any]:

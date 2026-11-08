@@ -1,25 +1,34 @@
 """Conversations API routes."""
 
+import hashlib
 import json
 import logging
 import re
 import secrets
-import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal
 
 from cubeloop.providers.base import ReasoningControl
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from cubeplex.agents.schemas import AgentEvent
 from cubeplex.api.exceptions import InvalidInputError
-from cubeplex.api.schemas.conversations import InviteToGroupRequest
+from cubeplex.api.schemas.conversations import (
+    AdmittedRunResponse,
+    DeleteConversationResponse,
+    ExecutionGenerationResponse,
+    InviteToGroupRequest,
+    StopAllRequest,
+    StopAllResponse,
+    StopRunRequest,
+    StopRunResponse,
+)
 from cubeplex.api.schemas.ws_topics import UpgradeToTopicRequest
 from cubeplex.api.serializers import serialize_conversation as _serialize_conversation
 from cubeplex.auth.context import RequestContext
@@ -29,6 +38,7 @@ from cubeplex.config import config as _config
 from cubeplex.db import get_session
 from cubeplex.db.engine import _build_database_url, async_session_maker
 from cubeplex.models import Conversation
+from cubeplex.models.background_task import TaskStopReason
 from cubeplex.models.conversation_participant import ConversationParticipant
 from cubeplex.repositories import (
     ConversationParticipantRepository,
@@ -37,6 +47,7 @@ from cubeplex.repositories import (
     SteeringMessageRepository,
     UserSandboxRepository,
 )
+from cubeplex.repositories.background_task import ConversationExecutionAdmissionRepository
 from cubeplex.repositories.conversation import (
     ForkGroupChatError,
     ForkNewThreadExistsError,
@@ -51,6 +62,18 @@ from cubeplex.repositories.steering_message import (
     SteeringMessageQueueFullError,
 )
 from cubeplex.services.avatar_store import resolve_avatar_url
+from cubeplex.services.background_task_query import BackgroundTaskQueryService
+from cubeplex.services.conversation_execution import (
+    ConversationExecutionService,
+    DirectExecutionResult,
+    ExecutionConflictError,
+    ExecutionRevokedError,
+    UserMessageIntent,
+)
+from cubeplex.services.conversation_execution_status import (
+    ConversationExecutionStatusService,
+)
+from cubeplex.services.execution_signals import signal_stopped_runs
 from cubeplex.skills.cache import SkillCache
 from cubeplex.streams.replay_coalescer import ReplayCoalescer
 from cubeplex.streams.run_events import (
@@ -310,6 +333,7 @@ async def _maybe_install_from_user_message(
     workspace_id: str,
     actor_user_id: str,
     text: str,
+    commit: bool = True,
 ) -> str | None:
     """If the user message is `install <canonical_name>`, install it and return
     a replacement assistant note. Otherwise return None and let the message flow.
@@ -357,7 +381,7 @@ async def _maybe_install_from_user_message(
         actor_user_id=actor_user_id,
     )
     try:
-        result = await install_svc.install(match_cand.candidate_id)
+        result = await install_svc.install(match_cand.candidate_id, commit=commit)
     except SkillInstallError as e:
         return f"Failed to install `{canonical}`: {e}"
     return (
@@ -576,12 +600,13 @@ async def fork_conversation(
     return _serialize_conversation(new_conv)
 
 
-@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{conversation_id}", response_model=DeleteConversationResponse)
 async def delete_conversation(
     conversation_id: str,
+    raw_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     ctx: Annotated[RequestContext, Depends(require_member)],
-) -> None:
+) -> DeleteConversationResponse:
     """Soft-delete a conversation.
 
     Stamps ``deleted_at`` and hides the row from subsequent reads. Child
@@ -603,12 +628,32 @@ async def delete_conversation(
         )
     # Delete: C(conv) ∨ O(topic) per spec § Access matrix.
     await _require_topic_owner_or_creator_if_topic(session, ctx, existing)
-    deleted = await repo.delete_conversation(conversation_id)
+    now = datetime.now(UTC)
+    closed = await ConversationExecutionService(
+        session, org_id=ctx.org_id, workspace_id=ctx.workspace_id
+    ).close_generation(
+        conversation_id=conversation_id,
+        actor_user_id=ctx.user.id,
+        execution_generation=existing.execution_generation,
+        reason=TaskStopReason.conversation_deleted,
+        now=now,
+    )
+    deleted = await repo.delete_conversation(conversation_id, now=now)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation {conversation_id} not found",
         )
+    await session.commit()
+    await signal_stopped_runs(
+        raw_request.app.state.run_manager,
+        conversation_id=conversation_id,
+        run_ids=closed.run_ids,
+        user_id=ctx.user.id,
+        org_id=ctx.org_id,
+        workspace_id=ctx.workspace_id,
+    )
+    return DeleteConversationResponse(deleted=True, cleanup_pending=closed.cleanup_pending)
 
 
 async def _adopt_external_bindings(
@@ -754,6 +799,7 @@ def _serialize_conv_participant(
         if user
         else None,
         "avatar_seed": user.avatar_seed if user else None,
+        "avatar_style": user.avatar_style if user else None,
     }
     if include_email:
         row["email"] = user.email if user else None
@@ -982,11 +1028,25 @@ class SteerMessageRequest(BaseModel):
     content: str
     steer_id: str = Field(min_length=1, max_length=64)
 
+    @field_validator("steer_id")
+    @classmethod
+    def reject_internal_wake_id(cls, value: str) -> str:
+        if value.startswith(("bge-", "scmd-", "scmw-")):
+            raise ValueError("steer_id uses a reserved prefix")
+        return value
+
 
 class CancelSteerRequest(BaseModel):
     """Request body for cancelling a not-yet-drained steer."""
 
     steer_id: str = Field(min_length=1, max_length=64)
+
+    @field_validator("steer_id")
+    @classmethod
+    def reject_internal_wake_id(cls, value: str) -> str:
+        if value.startswith(("bge-", "scmd-", "scmw-")):
+            raise ValueError("steer_id uses a reserved prefix")
+        return value
 
 
 def _durable_steer_status(state: object) -> str:
@@ -1012,22 +1072,112 @@ class SendMessageRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    client_message_id: str = Field(min_length=1, max_length=200, pattern=r"^\S+$")
     content: str = ""
     attachments: list[str] = []
     model_key: str | None = None
-    reasoning: ReasoningControl = Field(default_factory=ReasoningControl)
-
-    @model_validator(mode="after")
-    def _reject_unsupported_auto_reasoning(self) -> Self:
-        if self.reasoning.mode == "auto":
-            raise ValueError("reasoning.mode='auto' is not supported by current presets")
-        return self
+    reasoning: ReasoningControl | None = None
 
 
 class SendMessageResponse(BaseModel):
     """Response body for starting a new run."""
 
     run_id: str
+
+
+def _build_direct_result_response(result: DirectExecutionResult) -> StreamingResponse:
+    ts = utc_isoformat(result.timestamp)
+
+    async def event_stream() -> AsyncIterator[str]:
+        yield _format_sse_event(
+            "0-1",
+            {
+                "type": "text_delta",
+                "timestamp": ts,
+                "agent_id": None,
+                "agent_name": None,
+                "data": {"content": result.content},
+            },
+        )
+        yield _format_sse_event(
+            "0-2",
+            {
+                "type": "done",
+                "timestamp": ts,
+                "agent_id": None,
+                "agent_name": None,
+                "data": {},
+            },
+        )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _commit_direct_result_checkpoint(
+    *,
+    admission_id: str,
+    client_message_id: str,
+    conversation_id: str,
+    org_id: str,
+    workspace_id: str,
+) -> tuple[DirectExecutionResult, bool]:
+    from cubeloop.providers.base import AssistantMessage, TextContent, UserMessage
+
+    from cubeplex.agents.checkpointer import shared_checkpointer
+
+    async with async_session_maker() as session:
+        service = ConversationExecutionService(
+            session,
+            org_id=org_id,
+            workspace_id=workspace_id,
+        )
+        result, already_committed = await service.lock_direct_checkpoint_result(
+            admission_id=admission_id
+        )
+        if not already_committed:
+            user_message_id = f"{admission_id}:user"
+            assistant_message_id = f"{admission_id}:assistant"
+            async with shared_checkpointer() as checkpointer:
+                checkpoint = await checkpointer.load(conversation_id)
+                messages = checkpoint.messages if checkpoint is not None else []
+                existing_ids = {
+                    message_id
+                    for message in messages
+                    if isinstance((message_id := message.metadata.get("message_id")), str)
+                }
+                present = existing_ids.intersection((user_message_id, assistant_message_id))
+                if present and present != {user_message_id, assistant_message_id}:
+                    raise RuntimeError("direct result checkpoint is only partially committed")
+                if not present:
+                    timestamp = result.timestamp.timestamp()
+                    await checkpointer.append(
+                        conversation_id,
+                        [
+                            UserMessage(
+                                content=[TextContent(text=result.request_content)],
+                                timestamp=timestamp,
+                                metadata={
+                                    "message_id": user_message_id,
+                                    "client_message_id": client_message_id,
+                                },
+                            ),
+                            AssistantMessage(
+                                content=[TextContent(text=result.content)],
+                                timestamp=timestamp + 0.001,
+                                metadata={"message_id": assistant_message_id},
+                            ),
+                        ],
+                    )
+            await service.mark_direct_checkpoint_committed(
+                admission_id=admission_id,
+                now=datetime.now(UTC),
+            )
+        await session.commit()
+    return result, not already_committed
 
 
 def _build_run_streaming_response(
@@ -1301,19 +1451,45 @@ async def send_message(
         if refreshed is not None:
             conversation = refreshed
 
-    # Chat-fallback skill-install parser: `install <canonical_name>` short-circuits the
-    # agent loop — persists a user + assistant message pair directly to the checkpointer
-    # and returns early, so the agent never runs for this turn.
-    #
-    # We must claim the conversation's active-run slot BEFORE doing the install or
-    # touching history: the normal path serializes turns through
-    # run_manager.start_run, and a read-only check would still (a) let the catalog
-    # install happen before refusing, and (b) race a concurrent run starting between
-    # the check and the checkpointer append. create_run is an atomic CAS claim, so a
-    # conflicting active run makes it return None → 409 with no side effects.
+    # The install shortcut has no model run, but it still uses durable source admission.
+    # A retry replays the stored result and reconciles its stable checkpoint pair instead
+    # of repeating the installation.
     _install_cmd = request_obj.content and not request_obj.attachments
     if _install_cmd and _INSTALL_RE.match(request_obj.content.strip()):
-        fallback_run_id = f"install-fallback-{secrets.token_hex(6)}"
+        intent = UserMessageIntent(
+            content=request_obj.content,
+            model_key=request_obj.model_key,
+            reasoning=request_obj.reasoning,
+        )
+        try:
+            async with async_session_maker() as admission_session:
+                admitted_direct = await ConversationExecutionService(
+                    admission_session,
+                    org_id=ctx.org_id,
+                    workspace_id=ctx.workspace_id,
+                ).admit_direct_user_message(
+                    conversation_id=conversation_id,
+                    actor_user_id=ctx.user.id,
+                    namespace="web",
+                    source_id=request_obj.client_message_id,
+                    intent=intent,
+                    operation="skill_install",
+                    now=datetime.now(UTC),
+                )
+                await admission_session.commit()
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Conversation not found") from exc
+        except ExecutionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        admission_id = admitted_direct.admission.id
+        if (
+            admitted_direct.result is not None
+            and admitted_direct.admission.checkpoint_committed_at is not None
+        ):
+            return _build_direct_result_response(admitted_direct.result)
+
+        fallback_run_id = f"install-fallback:{admission_id}"
         ttl = int(_config.get("lifecycle.stale_run_threshold_seconds", 180))
         claimed = await create_run(
             rds.client,
@@ -1331,54 +1507,68 @@ async def send_message(
                 detail="A run is already active for this conversation",
             )
 
-        install_note: str | None = None
         try:
-            async with async_session_maker() as install_session:
-                from cubeplex.repositories.organization import OrganizationRepository as _OrgRepo
+            result = admitted_direct.result
+            if result is None:
+                try:
+                    async with async_session_maker() as claim_session:
+                        await ConversationExecutionService(
+                            claim_session,
+                            org_id=ctx.org_id,
+                            workspace_id=ctx.workspace_id,
+                        ).claim_direct_execution(
+                            admission_id=admission_id,
+                            conversation_id=conversation_id,
+                            actor_user_id=ctx.user.id,
+                            now=datetime.now(UTC),
+                        )
+                        await claim_session.commit()
+                except (ExecutionConflictError, ExecutionRevokedError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-                _org = await _OrgRepo(install_session).get(ctx.org_id)
-                _org_slug = _org.slug if _org else ctx.org_id
-                install_note = await _maybe_install_from_user_message(
-                    session=install_session,
-                    org_id=ctx.org_id,
-                    org_slug=_org_slug,
-                    workspace_id=ctx.workspace_id,
-                    actor_user_id=ctx.user.id,
-                    text=request_obj.content,
-                )
-            # _INSTALL_RE matched above, so the parser always returns a note here.
-            if install_note is not None:
-                from cubeloop.providers.base import AssistantMessage, TextContent, UserMessage
-
-                await _update_conversation_timestamp(
-                    conversation_id,
-                    org_id=ctx.org_id,
-                    workspace_id=ctx.workspace_id,
-                    user_id=ctx.user.id,
-                )
-                from cubeplex.agents.checkpointer import shared_checkpointer
-
-                now = time.time()
-                async with shared_checkpointer() as _cp:
-                    await _cp.append(
-                        conversation_id,
-                        [
-                            UserMessage(
-                                content=[TextContent(text=request_obj.content)],
-                                timestamp=now,
-                            ),
-                            AssistantMessage(
-                                content=[TextContent(text=install_note)],
-                                timestamp=now + 0.001,
-                            ),
-                        ],
+                async with async_session_maker() as install_session:
+                    from cubeplex.repositories.organization import (
+                        OrganizationRepository as _OrgRepo,
                     )
-                # Enqueue indexing AFTER the synthetic messages land in
-                # checkpointer storage. Doing it inside the timestamp hook
-                # (or before this append) would let the worker claim the
-                # job during the window when conversation history is still
-                # empty and index nothing — no subsequent run-completion
-                # hook covers this fallback path.
+
+                    org = await _OrgRepo(install_session).get(ctx.org_id)
+                    org_slug = org.slug if org else ctx.org_id
+                    install_note = await _maybe_install_from_user_message(
+                        session=install_session,
+                        org_id=ctx.org_id,
+                        org_slug=org_slug,
+                        workspace_id=ctx.workspace_id,
+                        actor_user_id=ctx.user.id,
+                        text=request_obj.content,
+                        commit=False,
+                    )
+                    if install_note is None:
+                        raise RuntimeError("matched install command produced no result")
+                    result = DirectExecutionResult(
+                        kind="skill_install",
+                        request_content=request_obj.content,
+                        content=install_note,
+                        timestamp=datetime.now(UTC),
+                    )
+                    await ConversationExecutionService(
+                        install_session,
+                        org_id=ctx.org_id,
+                        workspace_id=ctx.workspace_id,
+                    ).finish_direct_execution(
+                        admission_id=admission_id,
+                        result=result,
+                        now=datetime.now(UTC),
+                    )
+                    await install_session.commit()
+
+            result, checkpoint_added = await _commit_direct_result_checkpoint(
+                admission_id=admission_id,
+                client_message_id=request_obj.client_message_id,
+                conversation_id=conversation_id,
+                org_id=ctx.org_id,
+                workspace_id=ctx.workspace_id,
+            )
+            if checkpoint_added:
                 await _enqueue_search_index(
                     conversation_id,
                     org_id=ctx.org_id,
@@ -1386,50 +1576,13 @@ async def send_message(
                     user_id=ctx.user.id,
                 )
         finally:
-            # The fallback spawns no background run — release the slot now that
-            # the install + append (the only writes we needed to serialize) are done.
             await clear_active_run(
                 rds.client,
                 prefix=rds.key_prefix,
                 conversation_id=conversation_id,
                 run_id=fallback_run_id,
             )
-
-        if install_note is not None:
-            # Emit a one-shot SSE response so the frontend renders the assistant
-            # reply and finalizes via its normal text_delta/done handlers. Returning
-            # a fake run_id here would 404 the immediate GET /runs/{id}/stream the
-            # web client issues for non-SSE JSON responses.
-            note = install_note
-            ts = utc_isoformat(datetime.now(UTC))
-
-            async def _chat_install_fallback_stream() -> AsyncIterator[str]:
-                yield _format_sse_event(
-                    "0-1",
-                    {
-                        "type": "text_delta",
-                        "timestamp": ts,
-                        "agent_id": None,
-                        "agent_name": None,
-                        "data": {"content": note},
-                    },
-                )
-                yield _format_sse_event(
-                    "0-2",
-                    {
-                        "type": "done",
-                        "timestamp": ts,
-                        "agent_id": None,
-                        "agent_name": None,
-                        "data": {},
-                    },
-                )
-
-            return StreamingResponse(
-                _chat_install_fallback_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
+        return _build_direct_result_response(result)
 
     from cubeplex.api.exceptions import (
         AttachmentReferenceInvalidError,
@@ -1461,16 +1614,9 @@ async def send_message(
                 if row is None or row.status not in {"pending", "attached"}:
                     raise AttachmentReferenceInvalidError(fid)
 
-    # Validate preset early so unknown_preset / broken_preset surface as HTTP
-    # errors rather than mid-stream SSE error events. The actual run picks up
-    # its own snapshot inside _build_agent_for_conversation.
-    #
-    # NOTE: this runs BEFORE the attachment mark_attached_bulk and conversation
-    # timestamp bump below. resolve_model_preset can raise (UnknownPresetError /
-    # BrokenPresetError / NoDefaultPresetError) and those need to surface as
-    # 4xx without leaving orphaned attachment state or a bumped has_messages /
-    # updated_at on a turn that never ran.
-    from cubeplex.llm.resolver import resolve_model_preset
+    # Load the model catalog before admission. Preset resolution itself happens
+    # in the admission transaction so an invalid selection cannot attach files
+    # or mutate the conversation.
     from cubeplex.llm.snapshot import load_llm_snapshot
 
     async with async_session_maker() as _validate_session:
@@ -1479,24 +1625,36 @@ async def send_message(
             ctx.org_id,
             raw_request.app.state.encryption_backend,
         )
-    # Validate the requested model selection. BrokenPresetError (the preset's
-    # model refs are missing) and NoDefaultPresetError stay 4xx. An
-    # UnknownPresetError means the chosen key (a tier/custom preset) was since
-    # deleted — a stale client cache, or a key stored on the conversation whose
-    # preset is gone. Fall back to the workspace default instead of bricking the
-    # send with a 400, and persist the fallback so the conversation heals.
-    from cubeplex.llm.errors import UnknownPresetError
-
+    intent = UserMessageIntent(
+        content=request_obj.content,
+        attachment_ids=tuple(request_obj.attachments),
+        model_key=request_obj.model_key,
+        reasoning=request_obj.reasoning,
+    )
     try:
-        resolve_model_preset(_snap, request_obj.model_key)
-        effective_model_key = request_obj.model_key
-    except UnknownPresetError:
-        # Re-validate the default synchronously so BrokenPresetError /
-        # NoDefaultPresetError still raise (4xx) BEFORE any mutation, exactly
-        # like the non-fallback path — never let them slip into the stream after
-        # has_messages / updated_at / model_key were already changed.
-        resolve_model_preset(_snap, None)
-        effective_model_key = None
+        async with async_session_maker() as admission_session:
+            admitted = await ConversationExecutionService(
+                admission_session,
+                org_id=ctx.org_id,
+                workspace_id=ctx.workspace_id,
+            ).admit_user_message(
+                conversation_id=conversation_id,
+                actor_user_id=ctx.user.id,
+                namespace="web",
+                source_id=request_obj.client_message_id,
+                intent=intent,
+                snapshot=_snap,
+                now=datetime.now(UTC),
+            )
+            await admission_session.commit()
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+    except ExecutionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ExecutionRevokedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise InvalidInputError(message=str(exc)) from exc
 
     (
         _topic_id,
@@ -1505,37 +1663,6 @@ async def send_message(
         _sandbox_mode,
         _topic_creator_user_id,
     ) = await _resolve_topic_run_context(conversation, ctx)
-
-    if request_obj.attachments:
-        from cubeplex.repositories import AttachmentRepository
-
-        async with async_session_maker() as att_session:
-            att_repo = AttachmentRepository(
-                att_session,
-                org_id=ctx.org_id,
-                workspace_id=ctx.workspace_id,
-            )
-            # Flip pending → attached synchronously, before the run starts.
-            # The background _execute_run path also calls this (idempotent),
-            # but doing it here closes a race where the client navigates to
-            # the conversation page and rehydrates `pending` attachments
-            # back into the InputBar staging area.
-            await att_repo.mark_attached_bulk(
-                conversation_id=conversation_id,
-                attachment_ids=list(request_obj.attachments),
-            )
-
-    # Mark the conversation active synchronously, before the run starts.
-    # This ensures the conversation becomes visible in list_all even if the
-    # stream errors before the post-stream persistence runs, and bumps
-    # updated_at on every send so recency ordering tracks activity.
-    await _update_conversation_timestamp(
-        conversation_id,
-        org_id=ctx.org_id,
-        workspace_id=ctx.workspace_id,
-        user_id=ctx.user.id,
-        model_setting=(effective_model_key, request_obj.reasoning.model_dump()),
-    )
 
     run_manager = raw_request.app.state.run_manager
     run_ctx = RunContext(
@@ -1557,11 +1684,14 @@ async def send_message(
             content=request_obj.content,
             attachments=list(request_obj.attachments),
             ctx=run_ctx,
-            model_key=effective_model_key,
+            run_id=admitted.admission.run_id,
+            model_key=request_obj.model_key,
             reasoning=request_obj.reasoning,
             llm_snapshot=_snap,
+            input_metadata={"client_message_id": request_obj.client_message_id},
+            admission_id=admitted.admission.id,
         )
-    except RuntimeError as exc:
+    except (ExecutionConflictError, ExecutionRevokedError, RuntimeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -1631,13 +1761,67 @@ async def list_messages(
 
     effective_limit = min(limit or _history_tail_limit(), _MAX_HISTORY_WINDOW)
     window = await load_history_window(
-        session, conversation_id, before_seq=before_seq, limit=effective_limit
+        session,
+        conversation_id,
+        before_seq=before_seq,
+        limit=effective_limit,
+        include_background_notices=True,
     )
     return {
         "messages": window.messages,
         "oldest_seq": window.oldest_seq,
         "has_more": window.has_more,
     }
+
+
+@router.get(
+    "/{conversation_id}/execution-generation",
+    response_model=ExecutionGenerationResponse,
+)
+async def get_conversation_execution_generation(
+    conversation_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ctx: Annotated[RequestContext, Depends(require_member)],
+) -> ExecutionGenerationResponse:
+    """Read the durable Stop-all target without Redis or checkpointer dependencies."""
+    conversation = await ConversationRepository(
+        session,
+        org_id=ctx.org_id,
+        workspace_id=ctx.workspace_id,
+        user_id=ctx.user.id,
+    ).get_by_id(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return ExecutionGenerationResponse(execution_generation=conversation.execution_generation)
+
+
+@router.get("/{conversation_id}/admitted-run", response_model=AdmittedRunResponse)
+async def get_admitted_run(
+    conversation_id: str,
+    client_message_id: Annotated[str, Query(min_length=1, max_length=200)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ctx: Annotated[RequestContext, Depends(require_member)],
+) -> AdmittedRunResponse:
+    """Resolve only the run durably bound to this browser message request."""
+    conversation = await ConversationRepository(
+        session,
+        org_id=ctx.org_id,
+        workspace_id=ctx.workspace_id,
+        user_id=ctx.user.id,
+    ).get_by_id(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    admission = await ConversationExecutionAdmissionRepository(
+        session, org_id=ctx.org_id, workspace_id=ctx.workspace_id
+    ).get_source(source_kind="user_message", source_id=f"web:{client_message_id}")
+    if (
+        admission is None
+        or admission.conversation_id != conversation_id
+        or admission.actor_user_id != ctx.user.id
+        or admission.execution_kind != "run"
+    ):
+        return AdmittedRunResponse(run_id=None)
+    return AdmittedRunResponse(run_id=admission.run_id)
 
 
 @router.get("/{conversation_id}/bootstrap")
@@ -1647,7 +1831,7 @@ async def get_conversation_bootstrap(
     session: Annotated[AsyncSession, Depends(get_session)],
     ctx: Annotated[RequestContext, Depends(require_member)],
     rds: Annotated[RedisHandle, Depends(redis_dep)],
-) -> dict[str, object]:
+) -> Response:
     """Return history tail + active-run metadata + usage panel data in one round trip.
 
     History is the most recent ``lifecycle.bootstrap_history_tail`` messages
@@ -1676,7 +1860,12 @@ async def get_conversation_bootstrap(
     # Redis + cubeloop-pool work — those do not touch ``session``, so there is
     # no SQLAlchemy concurrency conflict.
     history, active_run, pending_pair, last_run_error_raw = await asyncio.gather(
-        load_history_window(session, conversation_id, limit=_history_tail_limit()),
+        load_history_window(
+            session,
+            conversation_id,
+            limit=_history_tail_limit(),
+            include_background_notices=True,
+        ),
         get_active_run(rds.client, prefix=rds.key_prefix, conversation_id=conversation_id),
         _load_pending_hitl(conversation_id),
         get_conversation_last_error(
@@ -1717,6 +1906,7 @@ async def get_conversation_bootstrap(
 
     pending_req, persisted_run_id = pending_pair
     pending_hitl: dict[str, Any] | None = None
+    pending_run_id_for_bootstrap: str | None = None
     if pending_req is not None:
         # Run_id resolution order: Redis active-run (cheapest, hot path) first,
         # DB-persisted fallback for long-pause TTL recovery. When the stage-A
@@ -1747,6 +1937,7 @@ async def get_conversation_bootstrap(
             )
         else:
             pending_hitl = serialize_pending_hitl(pending_req, run_id=run_id_for_pending)
+            pending_run_id_for_bootstrap = run_id_for_pending
 
     last_run_error_payload: dict[str, Any] | None = None
     if last_run_error_raw is not None:
@@ -1785,8 +1976,39 @@ async def get_conversation_bootstrap(
         workspace_id=ctx.workspace_id,
     )
     pending_steering = await steering_repo.list_for_bootstrap(conversation_id)
+    background_query = BackgroundTaskQueryService(
+        session,
+        org_id=ctx.org_id,
+        workspace_id=ctx.workspace_id,
+    )
+    background_summary = await background_query.summary(conversation_id=conversation_id)
+    background_events = await background_query.list_events(
+        conversation_id=conversation_id,
+        delivery="all",
+        cursor=None,
+        limit=50,
+    )
+    execution_status = ConversationExecutionStatusService(
+        session,
+        org_id=ctx.org_id,
+        workspace_id=ctx.workspace_id,
+    )
+    stop_all_status = await execution_status.stop_all_status(conversation=conversation)
+    control_run_id = active_run.run_id if active_run is not None else pending_run_id_for_bootstrap
+    if control_run_id is None:
+        control_run_id = await execution_status.latest_stopping_run_id(
+            conversation_id=conversation_id
+        )
+    run_control = (
+        await execution_status.run_status(
+            conversation_id=conversation_id,
+            run_id=control_run_id,
+        )
+        if control_run_id is not None
+        else None
+    )
 
-    return {
+    payload = {
         "messages": history.messages,
         "oldest_seq": history.oldest_seq,
         "has_more": history.has_more,
@@ -1796,6 +2018,62 @@ async def get_conversation_bootstrap(
         "last_run_error": last_run_error_payload,
         "usage_summary": usage_summary,
         "pending_hitl": pending_hitl,
+        "execution_generation": conversation.execution_generation,
+        "stop_all": (
+            None
+            if stop_all_status is None
+            else {
+                "execution_generation": stop_all_status.execution_generation,
+                "requested_at": utc_isoformat(stop_all_status.requested_at),
+                "cleanup_pending": stop_all_status.cleanup_pending,
+            }
+        ),
+        "run_control": (
+            None
+            if run_control is None
+            else {
+                "run_id": run_control.run_id,
+                "stop_requested_at": (
+                    utc_isoformat(run_control.stop_requested_at)
+                    if run_control.stop_requested_at is not None
+                    else None
+                ),
+                "cleanup_pending": run_control.cleanup_pending,
+                "can_stop": run_control.can_stop,
+            }
+        ),
+        "background_summary": {
+            "has_inflight": background_summary.has_inflight,
+            "has_pending": background_summary.has_pending,
+            "has_cleanup": background_summary.has_cleanup,
+            "can_stop": background_summary.can_stop,
+        },
+        "background_events": {
+            "items": [
+                {
+                    "id": item.event.id,
+                    "task_id": item.event.task_id,
+                    "task_kind": item.task_kind,
+                    "execution_generation": item.event.execution_generation,
+                    "reason": item.event.reason,
+                    "summary": item.event.summary,
+                    "result_ref": item.event.result_ref,
+                    "state": item.event.state,
+                    "discard_reason": item.event.discard_reason,
+                    "revision": item.event.revision,
+                    "created_at": utc_isoformat(item.event.created_at),
+                    "updated_at": utc_isoformat(item.event.updated_at),
+                    "delivered_at": (
+                        utc_isoformat(item.event.delivered_at)
+                        if item.event.delivered_at is not None
+                        else None
+                    ),
+                }
+                for item in background_events.items
+            ],
+            "next_cursor": background_events.next_cursor,
+            "has_more": background_events.has_more,
+        },
         "pending_steers": [
             {
                 "steer_id": row.client_steer_id,
@@ -1806,6 +2084,18 @@ async def get_conversation_bootstrap(
             for row in pending_steering
         ],
     }
+    body = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    etag = f'W/"{hashlib.sha256(body).hexdigest()}"'
+    headers = {"ETag": etag, "Cache-Control": "private, no-store"}
+    validator = raw_request.headers.get("if-none-match", "").strip()
+    # Hash the whole projection so control-only changes also invalidate the baseline.
+    if validator == "*" or etag.removeprefix("W/") in {
+        tag.strip().removeprefix("W/") for tag in validator.split(",")
+    }:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(body, media_type="application/json", headers=headers)
 
 
 def _parse_error_params(raw: str | None) -> dict[str, Any] | None:
@@ -1947,6 +2237,7 @@ async def get_run_meta_route(
 @router.post("/{conversation_id}/compact", status_code=status.HTTP_200_OK)
 async def compact_conversation(
     conversation_id: str,
+    raw_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     ctx: Annotated[RequestContext, Depends(require_member)],
     rds: Annotated[RedisHandle, Depends(redis_dep)],
@@ -1976,7 +2267,9 @@ async def compact_conversation(
     # not let finally delete a later owner's lock).
     lock_key = f"{rds.key_prefix}:conversation_compact_lock:{conversation_id}"
     lock_token = secrets.token_hex(16)
-    acquired = bool(await rds.client.set(lock_key, lock_token, nx=True, ex=120))
+    # The summary model can outlast the old 120s window. A later compact must
+    # not start while this one is still calling the model.
+    acquired = bool(await rds.client.set(lock_key, lock_token, nx=True, ex=300))
     if not acquired:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1999,7 +2292,15 @@ async def compact_conversation(
         result = await force_compact_conversation(
             conversation_id,
             is_busy=_run_active,
+            session=session,
+            org_id=ctx.org_id,
+            encryption_backend=getattr(raw_request.app.state, "encryption_backend", None),
         )
+        if result.reason in {"summarizer_failed", "summarizer_unavailable"}:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Could not summarize conversation context",
+            )
         if not result.ok and result.reason in {"busy", "busy_after_save"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -2029,82 +2330,86 @@ async def compact_conversation(
         )
 
 
-@router.post("/{conversation_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{conversation_id}/cancel",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=StopRunResponse,
+)
 async def cancel_active_run(
     conversation_id: str,
+    body: StopRunRequest,
     raw_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     ctx: Annotated[RequestContext, Depends(require_member)],
-    rds: Annotated[RedisHandle, Depends(redis_dep)],
-) -> dict[str, object]:
-    """Cancel the conversation's active run, if any."""
-    conv_repo = ConversationRepository(
-        session,
+) -> StopRunResponse:
+    """Durably stop the named run without closing its conversation generation."""
+    try:
+        stopped = await ConversationExecutionService(
+            session, org_id=ctx.org_id, workspace_id=ctx.workspace_id
+        ).stop_run(
+            conversation_id=conversation_id,
+            run_id=body.run_id,
+            actor_user_id=ctx.user.id,
+            now=datetime.now(UTC),
+        )
+        await session.commit()
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Execution not found") from exc
+    response = StopRunResponse(
+        run_id=stopped.run_id, accepted=stopped.accepted, cleanup_pending=stopped.cleanup_pending
+    )
+    await signal_stopped_runs(
+        raw_request.app.state.run_manager,
+        conversation_id=conversation_id,
+        run_ids=(stopped.run_id,),
+        user_id=ctx.user.id,
         org_id=ctx.org_id,
         workspace_id=ctx.workspace_id,
-        user_id=ctx.user.id,
     )
-    conversation = await conv_repo.get_by_id(conversation_id)
-    if not conversation:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Conversation {conversation_id} not found",
-        )
+    return response
 
-    active_run = await get_active_run(
-        rds.client, prefix=rds.key_prefix, conversation_id=conversation_id
-    )
 
-    from cubeplex.agents.checkpointer import shared_checkpointer
-
-    run_manager = raw_request.app.state.run_manager
-
-    # Cancel-on-paused dispatch — covers both the live paused_hitl case
-    # AND the long-pause TTL-expired case where the Redis active-run row
-    # is gone but cubepi_threads.pending_request + run_id still exist.
-    # bootstrap + answer routes already fall back to the DB-persisted
-    # run_id in this case; cancel needs the same fallback or the user
-    # sees a card they can't cancel.
-    paused_run_id: str | None = None
-    if active_run is not None and active_run.status == "paused_hitl":
-        paused_run_id = active_run.run_id
-    elif active_run is None:
-        async with shared_checkpointer() as _cp:
-            persisted_run_id = await _cp.load_pending_run_id(conversation_id)
-        if persisted_run_id is not None:
-            paused_run_id = persisted_run_id
-
-    if paused_run_id is not None:
-        run_ctx = RunContext(
-            user_id=ctx.user.id,
-            org_id=ctx.org_id,
-            workspace_id=ctx.workspace_id,
+@router.post(
+    "/{conversation_id}/stop-all",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=StopAllResponse,
+)
+async def stop_all_execution(
+    conversation_id: str,
+    body: StopAllRequest,
+    raw_request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ctx: Annotated[RequestContext, Depends(require_member)],
+) -> StopAllResponse:
+    """Close only the requested generation, including work without an active run."""
+    try:
+        stopped = await ConversationExecutionService(
+            session, org_id=ctx.org_id, workspace_id=ctx.workspace_id
+        ).close_generation(
             conversation_id=conversation_id,
-            conversation_creator_user_id=conversation.creator_user_id,
-            trigger=await _trigger_for_resume(rds, run_id=paused_run_id),
+            actor_user_id=ctx.user.id,
+            execution_generation=body.execution_generation,
+            now=datetime.now(UTC),
         )
-        try:
-            await run_manager.cancel_paused_run(
-                conversation_id=conversation_id,
-                run_id=paused_run_id,
-                reason="cancelled by user",
-                ctx=run_ctx,
-            )
-        except ResumeNoPending:
-            # Pending got cleared between our DB read and our claim —
-            # treat as already done.
-            return {"status": "no_active_run", "run_id": None}
-        except ResumeInFlight as exc:
-            raise HTTPException(status_code=409, detail={"code": "resume_in_flight"}) from exc
-        except ResumeConflict as exc:
-            raise HTTPException(status_code=409, detail={"code": "conversation_moved"}) from exc
-        return {"status": "cancelled", "run_id": paused_run_id}
-
-    if active_run is None or active_run.status != "running":
-        return {"status": "no_active_run", "run_id": None}
-
-    dispatch_status = await run_manager.dispatch_cancel(active_run.run_id)
-    return {"status": dispatch_status, "run_id": active_run.run_id}
+        await session.commit()
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+    except ExecutionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response = StopAllResponse(
+        execution_generation=stopped.execution_generation,
+        accepted=stopped.accepted,
+        cleanup_pending=stopped.cleanup_pending,
+    )
+    await signal_stopped_runs(
+        raw_request.app.state.run_manager,
+        conversation_id=conversation_id,
+        run_ids=stopped.run_ids,
+        user_id=ctx.user.id,
+        org_id=ctx.org_id,
+        workspace_id=ctx.workspace_id,
+    )
+    return response
 
 
 @router.post("/{conversation_id}/steer", status_code=status.HTTP_202_ACCEPTED)
@@ -2167,7 +2472,11 @@ async def steer_active_run(
         client_steer_id=body.steer_id,
     )
     if existing is not None:
-        if existing.content != body.content or existing.sender_user_id != ctx.user.id:
+        if (
+            existing.source_kind != "user_message"
+            or existing.content != body.content
+            or existing.sender_user_id != ctx.user.id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "steer_id_conflict"},
@@ -2194,6 +2503,13 @@ async def steer_active_run(
     )
     if pending_request is not None and pending_run_id is not None and pending_is_deliverable:
         try:
+            input_admission = await ConversationExecutionService(
+                session, org_id=ctx.org_id, workspace_id=ctx.workspace_id
+            ).require_run_input_actor(
+                conversation_id=conversation_id,
+                run_id=pending_run_id,
+                actor_user_id=ctx.user.id,
+            )
             queued, _created = await steering_repo.enqueue(
                 conversation_id=conversation_id,
                 run_id=pending_run_id,
@@ -2202,6 +2518,11 @@ async def steer_active_run(
                 sender_user_id=ctx.user.id,
                 sender_display_name=_sender_display_name,
                 hitl_question_id=pending_request.question_id,
+                execution_generation=(
+                    input_admission.execution_generation
+                    if input_admission is not None
+                    else conversation.execution_generation
+                ),
             )
         except SteeringMessageContentTooLargeError as exc:
             raise HTTPException(
@@ -2223,6 +2544,8 @@ async def steer_active_run(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Conversation {conversation_id} not found",
             ) from exc
+        except (ExecutionConflictError, ExecutionRevokedError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await session.commit()
         current_active_run = await get_active_run(
             rds.client,
@@ -2268,20 +2591,80 @@ async def steer_active_run(
     if active_run is None or active_run.status != "running":
         return {"status": "no_active_run", "run_id": None, "steer_id": body.steer_id}
 
-    steer_metadata: dict[str, Any] = {}
-    if _sender_display_name:
-        steer_metadata["sender_user_id"] = ctx.user.id
-        steer_metadata["sender_display_name"] = _sender_display_name
+    try:
+        input_admission = await ConversationExecutionService(
+            session, org_id=ctx.org_id, workspace_id=ctx.workspace_id
+        ).require_run_input_actor(
+            conversation_id=conversation_id,
+            run_id=active_run.run_id,
+            actor_user_id=ctx.user.id,
+        )
+        queued, _created = await steering_repo.enqueue(
+            conversation_id=conversation_id,
+            run_id=active_run.run_id,
+            client_steer_id=body.steer_id,
+            content=body.content,
+            sender_user_id=ctx.user.id,
+            sender_display_name=_sender_display_name,
+            hitl_question_id=None,
+            execution_generation=(
+                input_admission.execution_generation
+                if input_admission is not None
+                else conversation.execution_generation
+            ),
+        )
+    except SteeringMessageContentTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail={"code": "steer_content_too_large"},
+        ) from exc
+    except SteeringMessageQueueFullError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "steer_queue_full"},
+        ) from exc
+    except SteeringMessageConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "steer_id_conflict"},
+        ) from exc
+    except SteeringConversationUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation {conversation_id} not found",
+        ) from exc
+    except (ExecutionConflictError, ExecutionRevokedError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await session.commit()
+
+    current_active_run = await get_active_run(
+        rds.client, prefix=rds.key_prefix, conversation_id=conversation_id
+    )
+    if (
+        current_active_run is None
+        or current_active_run.run_id != queued.run_id
+        or current_active_run.status != "running"
+    ):
+        await steering_repo.fail_queued(row_id=queued.id)
+        await session.commit()
+        return {
+            "status": "failed",
+            "run_id": queued.run_id,
+            "steer_id": queued.client_steer_id,
+        }
 
     run_manager = raw_request.app.state.run_manager
-    dispatch_status = await run_manager.dispatch_steer(
-        active_run.run_id,
-        body.content,
-        steer_id=body.steer_id,
-        metadata=steer_metadata or None,
-    )
+    try:
+        await run_manager.notify_durable_steer(active_run.run_id, queued.id)
+    except Exception:
+        logger.exception(
+            "Durable steer %s committed but run %s wake-up failed",
+            queued.id,
+            active_run.run_id,
+        )
+    await session.refresh(queued)
     return {
-        "status": dispatch_status,
+        "status": _durable_steer_status(queued.state),
         "run_id": active_run.run_id,
         "steer_id": body.steer_id,
     }

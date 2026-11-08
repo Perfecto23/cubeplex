@@ -36,6 +36,7 @@ from cubeloop.agent.types import (
     MessageEndEvent,
     MessageUpdateEvent,
     ToolExecutionEndEvent,
+    ToolExecutionUpdateEvent,
 )
 from cubeloop.hitl.types import ApproveAnswer
 from cubeloop.providers.base import (
@@ -394,6 +395,19 @@ class StreamConverter:
             return [{"type": "text_delta", "delta": evt.delta or ""}]
         if t == "thinking_delta":
             return [{"type": "reasoning", "delta": evt.delta or ""}]
+        if t == "toolcall_start":
+            block = self._block_for(evt)
+            if block is None or block.name == _DEFERRED_DISPATCH_TOOL_NAME:
+                return []
+            return [
+                {
+                    "type": "tool_call_delta",
+                    "delta": "",
+                    "index": evt.content_index,
+                    "id": block.id,
+                    "name": block.name,
+                }
+            ]
         if t == "toolcall_delta":
             return self._on_toolcall_delta(evt)
         if t == "toolcall_end":
@@ -521,6 +535,18 @@ class StreamConverter:
 
 def _convert_terminal_agent_event(evt: AgentEvent) -> list[dict[str, Any]]:
     """Translation for AgentEvents that don't carry streaming state."""
+    if isinstance(evt, ToolExecutionUpdateEvent):
+        text, details = _stringify_tool_result(evt.partial_result)
+        return [
+            {
+                "type": "tool_result",
+                "tool_call_id": evt.tool_call_id,
+                "name": evt.tool_name,
+                "result": text,
+                "details": details,
+                "is_error": False,
+            }
+        ]
     if isinstance(evt, ToolExecutionEndEvent):
         text, details = _stringify_tool_result(evt.result)
         out: list[dict[str, Any]] = [
@@ -556,9 +582,26 @@ def _convert_terminal_agent_event(evt: AgentEvent) -> list[dict[str, Any]]:
 
     if isinstance(evt, MessageEndEvent) and isinstance(evt.message, UserMessage):
         meta = evt.message.metadata
+        text = "".join(c.text for c in evt.message.content if isinstance(c, TextContent))
+        if meta.get("source") == "background_task":
+            # The checkpoint row is model input. The client draws a result card
+            # from this event instead of a user bubble.
+            notice_id = meta.get("notice_id")
+            if not isinstance(notice_id, str) or not notice_id:
+                return []
+            injected_notice: dict[str, Any] = {
+                "type": "injected_message",
+                "content": text,
+                "steer_id": notice_id,
+                "source": "background_task",
+                "notice_id": notice_id,
+            }
+            generation = meta.get("execution_generation")
+            if isinstance(generation, int):
+                injected_notice["execution_generation"] = generation
+            return [injected_notice]
         steer_id = meta.get("steer_id")
         if steer_id:
-            text = "".join(c.text for c in evt.message.content if isinstance(c, TextContent))
             injected: dict[str, Any] = {
                 "type": "injected_message",
                 "content": text,

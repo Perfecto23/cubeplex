@@ -8,13 +8,18 @@ message pair directly to the checkpointer — the agent loop is skipped.
 import httpx
 import pytest
 from redis.asyncio import Redis
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import col
 
-from tests.e2e.conftest import DEFAULT_WS_ID
+from cubeplex.models import ConversationExecutionAdmission
+from tests.e2e.conftest import DEFAULT_WS_ID, web_message_request
 
 
 @pytest.mark.asyncio
 async def test_user_message_install_command_installs_skill_and_replaces_message(
     member_client: tuple[httpx.AsyncClient, str],
+    db_session: AsyncSession,
 ) -> None:
     client, ws_id = member_client
 
@@ -26,18 +31,46 @@ async def test_user_message_install_command_installs_skill_and_replaces_message(
     assert convo_resp.status_code == 201
     cid = convo_resp.json()["id"]
 
-    # Send the install command.
+    # Send the install command, then replay the exact request as if the first
+    # response had been lost after the side effect committed.
+    body = web_message_request(content="install deep-research")
     resp = await client.post(
         f"/api/v1/ws/{ws_id}/conversations/{cid}/messages",
-        json={"content": "install deep-research"},
+        json=body,
     )
     assert resp.status_code in (200, 201)
+
+    admission = await db_session.scalar(
+        select(ConversationExecutionAdmission).where(
+            col(ConversationExecutionAdmission.workspace_id) == ws_id,
+            col(ConversationExecutionAdmission.source_id) == f"web:{body['client_message_id']}",
+        )
+    )
+    assert admission is not None
+    assert admission.direct_result is not None
+    admission.checkpoint_committed_at = None
+    await db_session.commit()
+
+    retry = await client.post(
+        f"/api/v1/ws/{ws_id}/conversations/{cid}/messages",
+        json=body,
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.text == resp.text
+
+    conflict = await client.post(
+        f"/api/v1/ws/{ws_id}/conversations/{cid}/messages",
+        json={**body, "content": "install another-skill"},
+    )
+    assert conflict.status_code == 409, conflict.text
 
     # Fetch conversation messages — the checkpointer now holds a user + assistant pair.
     msgs_resp = await client.get(f"/api/v1/ws/{ws_id}/conversations/{cid}/messages")
     assert msgs_resp.status_code == 200
     data = msgs_resp.json()
     messages = data["messages"]
+    assert len(messages) == 2, messages
+    assert messages[0]["metadata"]["client_message_id"] == body["client_message_id"]
 
     # The assistant message should contain the install-result note.
     def _extract_text(msg: dict) -> str:
@@ -77,7 +110,7 @@ async def test_install_command_unknown_skill_returns_note_not_agent_run(
 
     resp = await client.post(
         f"/api/v1/ws/{ws_id}/conversations/{cid}/messages",
-        json={"content": "install nonexistent-skill-xyz"},
+        json=web_message_request(content="install nonexistent-skill-xyz"),
     )
     assert resp.status_code in (200, 201)
     # Chat-fallback returns a one-shot SSE response (not the usual JSON+run_id pair)
@@ -134,7 +167,7 @@ async def test_install_command_409s_when_a_run_is_already_active(
     try:
         resp = await memory_client.post(
             f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{cid}/messages",
-            json={"content": "install deep-research"},
+            json=web_message_request(content="install deep-research"),
         )
         assert resp.status_code == 409, resp.text
 

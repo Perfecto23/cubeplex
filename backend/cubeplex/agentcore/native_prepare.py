@@ -28,7 +28,11 @@ async def prepare_native_request(
     async with async_session_maker() as session:
         snapshot = await load_llm_snapshot(session, ctx.org_id, app.state.encryption_backend)
         raw_key = request.get("model_key")
-        preset = resolve_model_preset(snapshot, raw_key if isinstance(raw_key, str) else None)
+        preset = (
+            ctx.execution.execution.model_preset()
+            if getattr(ctx, "execution", None) is not None
+            else resolve_model_preset(snapshot, raw_key if isinstance(raw_key, str) else None)
+        )
         if len(preset.chain) != 1:
             raise ValueError("native_model_fallback_not_supported")
         provider_id, model_id = parse_model_ref(preset.chain[0])

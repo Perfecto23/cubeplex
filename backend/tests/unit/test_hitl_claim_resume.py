@@ -17,17 +17,26 @@ paused (or stale, or TTL-expired) HITL conversation. The CAS must:
 
 from __future__ import annotations
 
+import time
+
 import fakeredis.aioredis
 import pytest
 
 from cubeplex.streams.hitl_resume import (
     ClaimResumeOutcome,
+    begin_resume_finalization,
     claim_resume,
+    finalize_run_meta_if_claim_matches,
+    resume_claim_matches,
+    stale_answered_pending,
 )
 from cubeplex.streams.run_events import (
+    clear_active_run,
     create_run,
     get_active_run,
     get_run_meta,
+    mark_run_stale,
+    run_claim_matches,
     update_run_meta,
 )
 
@@ -175,7 +184,7 @@ async def test_claim_rebuild_when_meta_expired(redis):
 
 
 async def test_claim_conflict_on_terminal_status(redis):
-    """The CAS must refuse to resurrect a completed/cancelled/errored run."""
+    """The CAS must refuse to resurrect a terminal run."""
     prefix = "test_claim_conflict_terminal"
     created = await create_run(
         redis,
@@ -206,3 +215,302 @@ async def test_claim_conflict_on_terminal_status(redis):
     raw = await redis.hgetall(f"{prefix}:run_meta:v2:r1")
     assert raw["status"] == "completed"
     assert "claim_token" not in raw
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled", "errored", "failed"])
+async def test_only_cleanup_can_claim_a_terminal_run_without_resurrecting_it(status: str) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    prefix = "terminal-cleanup"
+    started_at = "2026-09-22T00:00:00+00:00"
+    try:
+        assert await create_run(
+            redis,
+            prefix=prefix,
+            run_id="old",
+            conversation_id="conversation",
+            status=status,
+            started_at=started_at,
+            ttl_seconds=60,
+        )
+        kwargs = {
+            "prefix": prefix,
+            "conversation_id": "conversation",
+            "expected_run_id": "old",
+            "started_at": started_at,
+            "ttl_seconds": 60,
+        }
+        assert (await claim_resume(redis, **kwargs)).outcome == ClaimResumeOutcome.CONFLICT
+        owner = await claim_resume(redis, **kwargs, cleanup_only=True)
+        assert owner.outcome == ClaimResumeOutcome.OK and owner.claim_token is not None
+        finalization = {
+            "prefix": prefix,
+            "conversation_id": "conversation",
+            "run_id": "old",
+            "claim_token": owner.claim_token,
+            "ttl_seconds": 60,
+            "lease_seconds": 60,
+        }
+        assert not await begin_resume_finalization(redis, **finalization)
+        assert await begin_resume_finalization(redis, **finalization, cleanup_only=True)
+        assert (
+            await claim_resume(redis, **kwargs, cleanup_only=True)
+        ).outcome == ClaimResumeOutcome.ALREADY_RUNNING
+        assert not await create_run(
+            redis,
+            prefix=prefix,
+            run_id="new",
+            conversation_id="conversation",
+            status="running",
+            started_at=started_at,
+            ttl_seconds=60,
+        )
+        meta = await get_run_meta(redis, prefix=prefix, run_id="old")
+        assert meta is not None and meta.status == status
+        assert await redis.hget(f"{prefix}:run_meta:v2:old", "claim_token") == owner.claim_token
+    finally:
+        await redis.aclose()
+
+
+async def test_released_terminal_cleanup_never_gets_model_authority_or_reclaims_the_slot() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    prefix = "released-cleanup"
+    started_at = "2026-09-22T00:00:00+00:00"
+    try:
+        assert await create_run(
+            redis,
+            prefix=prefix,
+            run_id="old",
+            conversation_id="conversation",
+            status="completed",
+            started_at=started_at,
+            ttl_seconds=60,
+        )
+        await clear_active_run(redis, prefix=prefix, conversation_id="conversation", run_id="old")
+        owner = await claim_resume(
+            redis,
+            prefix=prefix,
+            conversation_id="conversation",
+            expected_run_id="old",
+            started_at=started_at,
+            ttl_seconds=60,
+            cleanup_only=True,
+        )
+        assert owner.outcome == ClaimResumeOutcome.OK and owner.claim_token is not None
+        kwargs = {
+            "prefix": prefix,
+            "conversation_id": "conversation",
+            "run_id": "old",
+            "claim_token": owner.claim_token,
+        }
+        assert await get_active_run(redis, prefix=prefix, conversation_id="conversation") is None
+        assert not await run_claim_matches(redis, **kwargs)
+        assert await run_claim_matches(redis, **kwargs, cleanup_only=True)
+        assert await begin_resume_finalization(
+            redis, **kwargs, ttl_seconds=60, lease_seconds=60, cleanup_only=True
+        )
+        assert await create_run(
+            redis,
+            prefix=prefix,
+            run_id="new",
+            conversation_id="conversation",
+            status="running",
+            started_at=started_at,
+            ttl_seconds=60,
+        )
+        assert not await run_claim_matches(redis, **kwargs, cleanup_only=True)
+    finally:
+        await redis.aclose()
+
+
+async def test_resume_claim_matches_only_current_owner(redis):
+    prefix = "test_claim_owner"
+    created = await create_run(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        conversation_id="c1",
+        status="running",
+        started_at="2026-06-02T00:00:00+00:00",
+        user_message="hi",
+        ttl_seconds=60,
+    )
+    assert created is not None
+    await redis.hset(f"{prefix}:run_meta:v2:r1", "claim_token", "current-token")
+
+    assert await resume_claim_matches(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        claim_token="current-token",
+    )
+    assert not await resume_claim_matches(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        claim_token="replaced-token",
+    )
+
+
+async def test_begin_finalization_reserves_claim_against_stale_recovery(redis):
+    prefix = "test_begin_finalizing"
+    created = await create_run(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        conversation_id="c1",
+        status="running",
+        started_at="2026-06-02T00:00:00+00:00",
+        user_message="hi",
+        ttl_seconds=60,
+    )
+    assert created is not None
+    meta_key = f"{prefix}:run_meta:v2:r1"
+    await redis.hset(meta_key, "claim_token", "current-token")
+
+    reserved = await begin_resume_finalization(
+        redis,
+        prefix=prefix,
+        conversation_id="c1",
+        run_id="r1",
+        claim_token="current-token",
+        ttl_seconds=60,
+        lease_seconds=30,
+    )
+
+    assert reserved is True
+    assert (await redis.hgetall(meta_key))["resume_finalizing_token"] == "current-token"
+    marked = await mark_run_stale(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        conversation_id="c1",
+        observed_last_event_at="2026-06-02T00:00:00+00:00",
+    )
+    assert marked is False
+
+
+async def test_claim_rejects_stale_run_while_resume_finalization_is_reserved(redis):
+    """A stale detector cannot reopen a resume while its DB cleanup is in flight."""
+    prefix = "test_claim_finalizing"
+    created = await create_run(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        conversation_id="c1",
+        status="running",
+        started_at="2026-06-02T00:00:00+00:00",
+        user_message="hi",
+        ttl_seconds=60,
+    )
+    assert created is not None
+    meta_key = f"{prefix}:run_meta:v2:r1"
+    await redis.hset(
+        meta_key,
+        mapping={
+            "claim_token": "current-token",
+            "resume_finalizing_token": "current-token",
+            "resume_finalizing_until": str(int(time.time()) + 30),
+            "status": "stale",
+        },
+    )
+
+    result = await claim_resume(
+        redis,
+        prefix=prefix,
+        conversation_id="c1",
+        expected_run_id="r1",
+        started_at="2026-06-02T00:00:00+00:00",
+        ttl_seconds=60,
+    )
+
+    assert result.outcome == ClaimResumeOutcome.ALREADY_RUNNING
+    assert result.claim_token is None
+    assert (await redis.hgetall(meta_key))["claim_token"] == "current-token"
+
+
+async def test_expired_finalization_reservation_allows_stale_recovery(redis):
+    prefix = "test_expired_finalizing"
+    created = await create_run(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        conversation_id="c1",
+        status="running",
+        started_at="2026-06-02T00:00:00+00:00",
+        user_message="hi",
+        ttl_seconds=60,
+    )
+    assert created is not None
+    meta_key = f"{prefix}:run_meta:v2:r1"
+    await redis.hset(
+        meta_key,
+        mapping={
+            "claim_token": "abandoned-token",
+            "resume_finalizing_token": "abandoned-token",
+            "resume_finalizing_until": "0",
+        },
+    )
+
+    marked = await mark_run_stale(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        conversation_id="c1",
+        observed_last_event_at="2026-06-02T00:00:00+00:00",
+    )
+    assert marked is True
+    assert not await redis.hexists(meta_key, "claim_token")
+
+    finalized = await finalize_run_meta_if_claim_matches(
+        redis,
+        prefix=prefix,
+        run_id="r1",
+        claim_token="abandoned-token",
+        status="completed",
+    )
+    assert finalized is False
+    assert (await redis.hgetall(meta_key))["status"] == "stale"
+
+    result = await claim_resume(
+        redis,
+        prefix=prefix,
+        conversation_id="c1",
+        expected_run_id="r1",
+        started_at="2026-06-02T00:00:00+00:00",
+        ttl_seconds=60,
+    )
+    assert result.outcome == ClaimResumeOutcome.OK
+    assert result.claim_token != "abandoned-token"
+
+
+def test_stale_answered_pending_rejects_replacement_follow_up() -> None:
+    answered = type("Pending", (), {"question_id": "q-answered"})()
+    follow_up = type("Pending", (), {"question_id": "q-follow-up"})()
+
+    assert (
+        stale_answered_pending(
+            final_status="completed",
+            loaded_pending=(answered, "run-1"),
+            answered_question_id="q-answered",
+            answered_run_id="run-1",
+        )
+        is answered
+    )
+    assert (
+        stale_answered_pending(
+            final_status="completed",
+            loaded_pending=(follow_up, "run-1"),
+            answered_question_id="q-answered",
+            answered_run_id="run-1",
+        )
+        is None
+    )
+    assert (
+        stale_answered_pending(
+            final_status="completed",
+            loaded_pending=(answered, "run-replacement"),
+            answered_question_id="q-answered",
+            answered_run_id="run-1",
+        )
+        is None
+    )

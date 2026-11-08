@@ -16,6 +16,7 @@ meta field updates.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
@@ -37,7 +38,19 @@ from redis.asyncio import Redis
 #   transitions into on its way out.
 # - ``stale``: set by inline stale-run detection when a worker disappeared
 #   mid-run without transitioning the status itself.
-RUN_STATUSES = ("running", "paused_hitl", "completed", "cancelled", "errored", "stale")
+RUN_STATUSES = (
+    "running",
+    "paused_hitl",
+    "completed",
+    "cancelled",
+    "errored",
+    "failed",
+    "stale",
+)
+
+
+class RunClaimLost(asyncio.CancelledError):
+    """The original worker can no longer write or execute for this run."""
 
 
 @dataclass(slots=True)
@@ -122,6 +135,15 @@ if current ~= ARGV[1] then
   return 0
 end
 if redis.call('EXISTS', KEYS[3]) == 1 then
+  local finalizing = redis.call('HGET', KEYS[3], 'resume_finalizing_token')
+  if finalizing then
+    local lease_until = tonumber(redis.call('HGET', KEYS[3], 'resume_finalizing_until'))
+    local now = tonumber(redis.call('TIME')[1])
+    if lease_until and now < lease_until then
+      return 0
+    end
+    redis.call('HDEL', KEYS[3], 'resume_finalizing_token', 'resume_finalizing_until')
+  end
   local status = redis.call('HGET', KEYS[3], 'status')
   if status == 'running' or status == 'paused_hitl' then
     return 0
@@ -138,9 +160,14 @@ return 1
 """
 
 # CAS-DEL: only delete the active-run key if it still points at run_id.
-# KEYS[1] = active_key, ARGV[1] = expected run_id
+# KEYS[1] = active_key, KEYS[2] = meta_key
+# ARGV[1] = expected run_id, ARGV[2] = optional expected claim token
 _CLEAR_ACTIVE_IF_MATCHES_LUA = """
+if ARGV[2] ~= '' and redis.call('HGET', KEYS[2], 'claim_token') ~= ARGV[2] then
+  return -1
+end
 if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('HDEL', KEYS[2], 'resume_finalizing_token', 'resume_finalizing_until')
   return redis.call('DEL', KEYS[1])
 end
 return 0
@@ -150,10 +177,15 @@ return 0
 # KEYS[1] = stream_key, KEYS[2] = meta_key, KEYS[3] = active_key
 # ARGV[1] = payload_json, ARGV[2] = ttl_seconds, ARGV[3] = maxlen,
 # ARGV[4] = run_id, ARGV[5] = last_event_at (ISO-8601 wall-clock heartbeat)
+# ARGV[6] = optional expected claim token; when present, a lost slot rejects the append.
 # The active-run TTL is refreshed only if it still points at this run_id, so a
 # late-arriving append from an already-superseded run can't keep a zombie lock
 # alive.
 _APPEND_EVENT_LUA = """
+if ARGV[6] ~= '' and (redis.call('GET', KEYS[3]) ~= ARGV[4]
+    or redis.call('HGET', KEYS[2], 'claim_token') ~= ARGV[6]) then
+  return false
+end
 local eid = redis.call(
   'XADD', KEYS[1], 'MAXLEN', '~', tonumber(ARGV[3]), '*', 'payload', ARGV[1]
 )
@@ -165,6 +197,38 @@ if redis.call('GET', KEYS[3]) == ARGV[4] then
   redis.call('EXPIRE', KEYS[3], tonumber(ARGV[2]))
 end
 return eid
+"""
+
+_CLAIM_MATCHES_LUA = """
+local active = redis.call('GET', KEYS[1])
+local status = redis.call('HGET', KEYS[2], 'status')
+local terminal = status == 'completed' or status == 'cancelled'
+  or status == 'errored' or status == 'failed'
+local released_cleanup = ARGV[3] == '1' and terminal and not active
+if (active ~= ARGV[1] and not released_cleanup)
+    or redis.call('HGET', KEYS[2], 'claim_token') ~= ARGV[2] then
+  return 0
+end
+return 1
+"""
+
+_UPDATE_OWNED_META_LUA = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1]
+    or redis.call('HGET', KEYS[2], 'claim_token') ~= ARGV[2] then
+  return 0
+end
+-- Terminal status is visible before the durable finish receipt. Keep its lease
+-- until clear_active_run; HITL pauses must instead allow an immediate answer.
+local fields = {}
+for i = 4, #ARGV do fields[#fields + 1] = ARGV[i] end
+if #fields > 0 then redis.call('HSET', KEYS[2], unpack(fields)) end
+for i = 1, #fields, 2 do
+  if fields[i] == 'status' and fields[i + 1] == 'paused_hitl' then
+    redis.call('HDEL', KEYS[2], 'resume_finalizing_token', 'resume_finalizing_until')
+  end
+end
+if ARGV[3] ~= '' then redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3])) end
+return 1
 """
 
 # Conditional status transition: only HSET status if current status is 'running'.
@@ -189,6 +253,14 @@ return 1
 # ARGV[2] = observed last_event_at/started_at used for the stale decision
 #           (empty = no timestamp CAS; used by startup recovery)
 _MARK_STALE_LUA = """
+local finalizing = redis.call('HGET', KEYS[1], 'resume_finalizing_token')
+if finalizing then
+  local lease_until = tonumber(redis.call('HGET', KEYS[1], 'resume_finalizing_until'))
+  local now = tonumber(redis.call('TIME')[1])
+  if lease_until and now < lease_until then
+    return 0
+  end
+end
 if redis.call('HGET', KEYS[1], 'status') ~= 'running' then
   return 0
 end
@@ -202,6 +274,10 @@ if ARGV[2] ~= '' then
   end
 end
 redis.call('HSET', KEYS[1], 'status', 'stale')
+redis.call(
+  'HDEL', KEYS[1],
+  'claim_token', 'resume_finalizing_token', 'resume_finalizing_until'
+)
 if redis.call('GET', KEYS[2]) == ARGV[1] then
   redis.call('DEL', KEYS[2])
 end
@@ -249,6 +325,7 @@ async def create_run(
     user_message: str | None = None,
     ttl_seconds: int,
     trigger: str | None = None,
+    claim_token: str | None = None,
 ) -> RunMeta | None:
     """Atomically claim the active-run slot for a conversation.
 
@@ -264,6 +341,10 @@ async def create_run(
         trigger=trigger,
     )
     pairs = _meta_hash_pairs(meta)
+    if claim_token is not None:
+        if not claim_token:
+            raise ValueError("run claim token must not be empty")
+        pairs.extend(("claim_token", claim_token))
 
     active_key = _active_run_key(prefix, conversation_id)
     meta_key = _run_meta_key(prefix, run_id)
@@ -329,6 +410,42 @@ async def get_active_run(redis: Redis, *, prefix: str, conversation_id: str) -> 
     return await get_run_meta(redis, prefix=prefix, run_id=run_id)
 
 
+async def run_claim_matches(
+    redis: Redis,
+    *,
+    prefix: str,
+    conversation_id: str,
+    run_id: str,
+    claim_token: str,
+    cleanup_only: bool = False,
+) -> bool:
+    return bool(
+        await redis.eval(  # type: ignore[misc]
+            _CLAIM_MATCHES_LUA,
+            2,
+            _active_run_key(prefix, conversation_id),
+            _run_meta_key(prefix, run_id),
+            run_id,
+            claim_token,
+            "1" if cleanup_only else "0",
+        )
+    )
+
+
+async def completed_run_claim_matches(
+    redis: Redis, *, prefix: str, conversation_id: str, run_id: str, claim_token: str
+) -> bool:
+    """Prove successful owner teardown without keeping the active-run slot occupied."""
+    raw = await redis.hgetall(_run_meta_key(prefix, run_id))  # type: ignore[misc]
+    return bool(
+        claim_token
+        and raw.get("run_id") == run_id
+        and raw.get("conversation_id") == conversation_id
+        and raw.get("claim_token") == claim_token
+        and raw.get("status") == "completed"
+    )
+
+
 async def update_run_meta(
     redis: Redis,
     *,
@@ -341,6 +458,8 @@ async def update_run_meta(
     error_code: str | None = None,
     error_params: str | None = None,
     error_message: str | None = None,
+    conversation_id: str | None = None,
+    claim_token: str | None = None,
 ) -> RunMeta | None:
     """Patch run metadata fields without read-modify-write races.
 
@@ -348,9 +467,37 @@ async def update_run_meta(
     is ``running``. If a worker tries to flip the status to a terminal state
     after stale detection has already marked the run ``stale``, the CAS fails
     and the existing ``stale`` value is preserved. Other fields are written
-    unconditionally because they are append-driven and don't conflict.
+    unconditionally on the legacy path. With ``claim_token``, all fields and
+    TTL changes instead use one ownership-checked write against the active slot.
     """
     meta_key = _run_meta_key(prefix, run_id)
+    if claim_token is not None:
+        if conversation_id is None or not claim_token:
+            raise ValueError("fenced run updates require a conversation and claim token")
+        fields: list[str] = []
+        for key, value in (
+            ("status", status),
+            ("first_event_id", first_event_id),
+            ("last_event_id", last_event_id),
+            ("error_code", error_code),
+            ("error_params", error_params),
+            ("error_message", error_message),
+        ):
+            if value is not None:
+                fields.extend((key, value))
+        wrote = await redis.eval(  # type: ignore[misc]
+            _UPDATE_OWNED_META_LUA,
+            2,
+            _active_run_key(prefix, conversation_id),
+            meta_key,
+            run_id,
+            claim_token,
+            str(ttl_seconds) if ttl_seconds is not None else "",
+            *fields,
+        )
+        if not wrote:
+            raise RunClaimLost("run metadata belongs to another attempt")
+        return await get_run_meta(redis, prefix=prefix, run_id=run_id)
     if status is not None:
         wrote = await redis.eval(  # type: ignore[misc]
             _TRANSITION_STATUS_FROM_RUNNING_LUA,
@@ -386,8 +533,13 @@ async def update_run_meta(
 
 
 # KEYS[1] = meta_key, KEYS[2] = active_key
-# ARGV[1] = last_event_at, ARGV[2] = ttl_seconds, ARGV[3] = run_id
+# ARGV[1] = last_event_at, ARGV[2] = ttl_seconds, ARGV[3] = run_id,
+# ARGV[4] = optional expected claim token
 _TOUCH_RUN_HEARTBEAT_LUA = """
+if ARGV[4] ~= '' and (redis.call('GET', KEYS[2]) ~= ARGV[3]
+    or redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[4]) then
+  return 0
+end
 if redis.call('HGET', KEYS[1], 'status') == 'running' then
   redis.call('HSET', KEYS[1], 'last_event_at', ARGV[1])
   redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
@@ -406,6 +558,7 @@ async def touch_run_heartbeat(
     run_id: str,
     conversation_id: str,
     ttl_seconds: int,
+    claim_token: str | None = None,
 ) -> None:
     """Refresh ``last_event_at`` without appending a user-visible event.
 
@@ -413,7 +566,7 @@ async def touch_run_heartbeat(
     Without this, bootstrap stale detection treats a live worker as dead.
     Also extends the active-run lock TTL so a long execute cannot drop it.
     """
-    await redis.eval(  # type: ignore[misc]
+    touched = await redis.eval(  # type: ignore[misc]
         _TOUCH_RUN_HEARTBEAT_LUA,
         2,
         _run_meta_key(prefix, run_id),
@@ -421,7 +574,10 @@ async def touch_run_heartbeat(
         datetime.now(UTC).isoformat(),
         str(ttl_seconds),
         run_id,
+        claim_token or "",
     )
+    if not touched:
+        raise RunClaimLost("run heartbeat belongs to another attempt")
 
 
 async def clear_active_run(
@@ -430,14 +586,18 @@ async def clear_active_run(
     prefix: str,
     conversation_id: str,
     run_id: str,
-) -> None:
-    """Clear the active-run pointer iff it still points to the given run."""
-    await redis.eval(  # type: ignore[misc]
+    claim_token: str | None = None,
+) -> bool:
+    """Release this run's slot; false means the attempt lost ownership, not released."""
+    result = await redis.eval(  # type: ignore[misc]
         _CLEAR_ACTIVE_IF_MATCHES_LUA,
-        1,
+        2,
         _active_run_key(prefix, conversation_id),
+        _run_meta_key(prefix, run_id),
         run_id,
+        claim_token or "",
     )
+    return int(result) >= 0
 
 
 async def append_run_event(
@@ -449,6 +609,7 @@ async def append_run_event(
     payload: dict[str, Any],
     ttl_seconds: int,
     maxlen: int,
+    claim_token: str | None = None,
 ) -> str:
     """Append an event payload and update event bounds in a single call.
 
@@ -458,21 +619,22 @@ async def append_run_event(
     mid-execution.
     """
     last_event_at = datetime.now(UTC).isoformat()
-    return cast(
-        str,
-        await redis.eval(  # type: ignore[misc]
-            _APPEND_EVENT_LUA,
-            3,
-            _run_events_key(prefix, run_id),
-            _run_meta_key(prefix, run_id),
-            _active_run_key(prefix, conversation_id),
-            json.dumps(payload),
-            str(ttl_seconds),
-            str(maxlen),
-            run_id,
-            last_event_at,
-        ),
+    event_id = await redis.eval(  # type: ignore[misc]
+        _APPEND_EVENT_LUA,
+        3,
+        _run_events_key(prefix, run_id),
+        _run_meta_key(prefix, run_id),
+        _active_run_key(prefix, conversation_id),
+        json.dumps(payload),
+        str(ttl_seconds),
+        str(maxlen),
+        run_id,
+        last_event_at,
+        claim_token or "",
     )
+    if not event_id:
+        raise RunClaimLost("run event belongs to another attempt")
+    return cast(str, event_id)
 
 
 def _decode_stream_entries(entries: list[tuple[str, dict[str, str]]]) -> list[RunEvent]:
@@ -571,12 +733,26 @@ async def expire_run_data(
     prefix: str,
     run_id: str,
     ttl_seconds: int,
-) -> None:
-    """Expire run metadata and event log."""
+    claim_token: str | None = None,
+) -> bool:
+    """Expire run data, returning false if the attempt lost metadata ownership."""
+    if claim_token is not None:
+        applied = await redis.eval(  # type: ignore[misc]
+            "if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[1] then return 0 end "
+            "redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2])) "
+            "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2])) return 1",
+            2,
+            _run_meta_key(prefix, run_id),
+            _run_events_key(prefix, run_id),
+            claim_token,
+            str(ttl_seconds),
+        )
+        return bool(applied)
     pipe = redis.pipeline()
     pipe.expire(_run_meta_key(prefix, run_id), ttl_seconds)
     pipe.expire(_run_events_key(prefix, run_id), ttl_seconds)
     await pipe.execute()
+    return True
 
 
 async def mark_run_stale(
@@ -621,6 +797,7 @@ async def set_conversation_last_error(
     error_params: str,
     error_message: str,
     ttl_seconds: int,
+    claim_token: str | None = None,
 ) -> None:
     """Stash a pointer to the most recent failed run for a conversation.
 
@@ -639,7 +816,24 @@ async def set_conversation_last_error(
         },
         ensure_ascii=False,
     )
-    await redis.set(key, payload, ex=ttl_seconds)
+    if claim_token is not None:
+        wrote = await redis.eval(  # type: ignore[misc]
+            "if redis.call('GET', KEYS[1]) ~= ARGV[1] "
+            "or redis.call('HGET', KEYS[2], 'claim_token') ~= ARGV[2] then return 0 end "
+            "redis.call('SET', KEYS[3], ARGV[3], 'EX', tonumber(ARGV[4])) return 1",
+            3,
+            _active_run_key(prefix, conversation_id),
+            _run_meta_key(prefix, run_id),
+            key,
+            run_id,
+            claim_token,
+            payload,
+            str(ttl_seconds),
+        )
+        if not wrote:
+            raise RunClaimLost("conversation error belongs to another attempt")
+    else:
+        await redis.set(key, payload, ex=ttl_seconds)
 
 
 async def get_conversation_last_error(
@@ -663,13 +857,30 @@ async def clear_conversation_last_error(
     *,
     prefix: str,
     conversation_id: str,
+    run_id: str | None = None,
+    claim_token: str | None = None,
 ) -> None:
     """Clear the last-error pointer (e.g. when a new run starts successfully).
 
     Currently only called on a new run-start; the TTL handles the long-tail
     case.
     """
-    await redis.delete(_last_error_key(prefix, conversation_id))
+    if claim_token is not None:
+        if run_id is None:
+            raise ValueError("fenced error cleanup requires its run identity")
+        await redis.eval(  # type: ignore[misc]
+            "if redis.call('GET', KEYS[1]) ~= ARGV[1] "
+            "or redis.call('HGET', KEYS[2], 'claim_token') ~= ARGV[2] then return 0 end "
+            "return redis.call('DEL', KEYS[3])",
+            3,
+            _active_run_key(prefix, conversation_id),
+            _run_meta_key(prefix, run_id),
+            _last_error_key(prefix, conversation_id),
+            run_id,
+            claim_token,
+        )
+    else:
+        await redis.delete(_last_error_key(prefix, conversation_id))
 
 
 def is_stale_meta(

@@ -1,11 +1,18 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { Brain, Check, Loader2, Pencil, RotateCw, TriangleAlert, Trash2, X } from 'lucide-react'
-import { testModel, type ApiClient, type Model } from '@cubeplex/core'
+import {
+  enableTestedModels,
+  parseTestStream,
+  startTestStream,
+  type ApiClient,
+  type Model,
+} from '@cubeplex/core'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { configuredPrice } from '@/lib/models/configured-price'
 import { cn } from '@/lib/utils'
 import { formatProbeDetail } from '@/lib/probeDetail'
 import { ReadinessBadge } from './ReadinessBadge'
@@ -17,6 +24,7 @@ interface ModelRowProps {
   onEdit: (model: Model) => void
   onDelete: (model: Model) => void
   onRetested?: () => void
+  hasCustomCapability?: boolean
 }
 
 function formatCost(cost: number): string {
@@ -42,7 +50,7 @@ function testIssues(summary: Record<string, unknown> | undefined): TestIssue[] {
       return {
         name: String(s.name ?? ''),
         status: String(s.status ?? ''),
-        detail: formatProbeDetail(String(s.detail ?? error?.message ?? '')),
+        detail: formatProbeDetail(String(error?.message || s.detail || '')),
       }
     })
 }
@@ -54,18 +62,36 @@ export function ModelRow({
   onEdit,
   onDelete,
   onRetested,
+  hasCustomCapability = false,
 }: ModelRowProps) {
   const tExtra = useTranslations('adminModelsExtra')
   const t = useTranslations('adminModels')
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [retesting, setRetesting] = useState(false)
+  const controller = useRef<AbortController | null>(null)
+  useEffect(() => () => controller.current?.abort(), [])
   const issues = testIssues(model.last_test_summary)
+  const canEnable =
+    ['ready', 'degraded'].includes(model.readiness ?? '') &&
+    model.last_test_summary?.required_checks_passed === true
 
   async function handleRetest() {
+    controller.current?.abort()
+    controller.current = new AbortController()
     setRetesting(true)
+    setError(null)
     try {
-      await testModel(client, providerId, model.id)
+      const stream = await startTestStream(
+        client,
+        providerId,
+        [model.id],
+        controller.current.signal,
+      )
+      for await (const event of parseTestStream(stream)) void event
       onRetested?.()
+    } catch (e) {
+      setError((e as Error).message)
     } finally {
       setRetesting(false)
     }
@@ -87,6 +113,15 @@ export function ModelRow({
           {model.reasoning && (
             <Brain className="size-3.5 shrink-0 text-info-fg" aria-label="reasoning" />
           )}
+          {hasCustomCapability && (
+            <Badge
+              variant="outline"
+              className="px-1.5 py-0 text-[10px]"
+              data-testid={`model-row-${model.model_id}-custom-capability`}
+            >
+              {t('capabilityCustomBadge')}
+            </Badge>
+          )}
           {model.is_system && (
             <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
               {t('systemBadge')}
@@ -95,6 +130,11 @@ export function ModelRow({
         </div>
         {model.display_name && model.display_name !== model.model_id && (
           <span className="mt-0.5 block truncate text-muted-foreground">{model.display_name}</span>
+        )}
+        {error && (
+          <p role="alert" className="text-xs text-danger-fg">
+            {error}
+          </p>
         )}
         {issues.length > 0 && (
           <ul className="mt-1 flex flex-col gap-0.5">
@@ -138,9 +178,12 @@ export function ModelRow({
         className="hidden min-w-[100px] shrink-0 text-right text-muted-foreground lg:block"
         title={t('costPerMillion')}
       >
-        {model.cost_input > 0 || model.cost_output > 0
-          ? `$${formatCost(model.cost_input)}/$${formatCost(model.cost_output)}`
-          : '-'}
+        {(['cost_input', 'cost_output'] as const)
+          .map((field) => {
+            const price = configuredPrice(model, field)
+            return price === null ? t('priceUnknown') : `$${formatCost(price)}`
+          })
+          .join(' / ')}
       </span>
 
       <div className="hidden shrink-0 items-center md:flex">
@@ -148,6 +191,31 @@ export function ModelRow({
       </div>
 
       <div className="flex shrink-0 items-center gap-1">
+        {!model.enabled && !model.is_system && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={retesting || !canEnable}
+            title={canEnable ? undefined : t('verificationRequired')}
+            onClick={async () => {
+              setRetesting(true)
+              setError(null)
+              try {
+                const result = await enableTestedModels(client, providerId, [model.id])
+                if (result.results[0]?.status === 'blocked') {
+                  setError(result.results[0].reason ?? t('verificationRequired'))
+                } else onRetested?.()
+              } catch (e) {
+                setError((e as Error).message)
+              } finally {
+                setRetesting(false)
+              }
+            }}
+          >
+            {t('enableVerified')}
+          </Button>
+        )}
+
         {!confirmOpen && (
           <Button
             variant="ghost"

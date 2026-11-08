@@ -19,7 +19,9 @@ from cubeplex.agentcore.native_service import (
     canonical,
     load_native_dispatch,
     payload_hash,
+    require_native_execution,
 )
+from cubeplex.cache import RedisHandle
 from cubeplex.config import config
 from cubeplex.db.engine import async_session_maker
 from cubeplex.llm.resolver import parse_model_ref
@@ -159,9 +161,16 @@ async def _upstream(body: dict[str, Any], base_url: str, api_key: str) -> str:
 
 
 async def proxy_model(
-    dispatch_id: UUID, request_id: UUID, body: dict[str, Any], *, encryption_backend: Any
+    dispatch_id: UUID,
+    request_id: UUID,
+    body: dict[str, Any],
+    *,
+    encryption_backend: Any,
+    run_store: RedisHandle | None = None,
 ) -> str:
-    async with callback_transaction(dispatch_id, request_id, "model", body) as tx:
+    async with callback_transaction(
+        dispatch_id, request_id, "model", body, run_store=run_store
+    ) as tx:
         if tx.replay:
             result = tx.result or {}
             if "error_code" in result:
@@ -212,6 +221,7 @@ async def proxy_model(
             raise NativeTaskError("native_callback_outcome_unknown")
         if d.stop_requested or d.status != "claimed":
             raise NativeTaskError("native_task_stopped")
+        await require_native_execution(session, d, run_store=run_store)
         receipt.response, receipt.status = outcome, "done"
         receipt.completed_at = datetime.now(UTC)
         session.add(receipt)

@@ -11,7 +11,8 @@
 #   cp config/config.production.secrets.yaml.example config/config.production.secrets.yaml
 #   cp config/opensandbox.toml.example config/opensandbox.toml
 #   $EDITOR .env config/config.production.{local,secrets}.yaml config/opensandbox.toml
-#   docker compose up -d
+#   docker compose -f compose.yaml -f compose.tempo.yaml up -d
+#   # or: scripts/up.sh  (includes Tempo unless TEMPO_ENABLED=false)
 #
 # All services share the default network. Backend is reachable as
 # `backend:8000` from frontend; frontend serves the user on host port
@@ -106,7 +107,8 @@ services:
         echo "bucket $$BUCKET ready"
     restart: "no"
 
-  # Alembic migrate. Runs to completion before backend starts.
+  # Lock-guarded schema gate. Existing pre-cutover databases require the
+  # documented maintenance command after every old writer has stopped.
   backend-migrate:
     image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-cubeplexai}/cubeplex-backend:${BACKEND_TAG:?set BACKEND_TAG in .env}
     depends_on:
@@ -117,12 +119,16 @@ services:
     volumes:
       - ./config/config.production.local.yaml:/app/config.production.local.yaml:ro
       - ./config/config.production.secrets.yaml:/app/config.production.secrets.yaml:ro
-    command: ["alembic", "upgrade", "head"]
+    command: ["python", "-m", "cubeplex.scripts.lifecycle_upgrade"]
     restart: "no"
 
   backend:
     image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-cubeplexai}/cubeplex-backend:${BACKEND_TAG}
     <<: *restart-policy
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -154,7 +160,7 @@ services:
   # sandbox containers through the host Docker daemon and stays reachable only
   # through the private compose network.
   opensandbox-server:
-    image: ${OPENSANDBOX_IMAGE:-opensandbox/server:v0.2.2}
+    image: ${OPENSANDBOX_IMAGE:-opensandbox/server:release-1.1.1}
     <<: *restart-policy
     environment:
       SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml

@@ -16,6 +16,7 @@ from cubeplex.im.slack.renderer import SlackOpDispatcher
 from cubeplex.im.types import InboundEvent, RenderState
 from cubeplex.im.worker import process_one_queue_item
 from cubeplex.models.im_connector import IMRunQueueItem
+from tests.e2e.im_fixtures import im_test_execution_snapshot
 from tests.e2e.test_im_worker import _FakeRunManager
 from tests.e2e.test_im_worker import _seeded as _worker_seed_fixture
 
@@ -37,6 +38,31 @@ def event(key: str) -> InboundEvent:
         sender_open_id="U1",
         text="Read the repository",
     )
+
+
+async def test_pre_upgrade_reserved_run_restores_delivery_without_reexecution(_seeded: Any) -> None:
+    maker, account = _seeded
+    await ingest_inbound_event(event("legacy-reserved"), account=account, session_maker=maker)
+    async with maker() as session:
+        item = (
+            await session.execute(
+                select(IMRunQueueItem).where(IMRunQueueItem.account_id == account.id)
+            )
+        ).scalar_one()
+        item.run_id = "legacy-accepted-run"
+        await session.commit()
+    manager = _FakeRunManager()
+    callback = AsyncMock()
+    assert await process_one_queue_item(
+        session_maker=maker,
+        run_manager=manager,
+        on_run_started=callback,
+        lease_seconds=300,
+        load_execution_snapshot=im_test_execution_snapshot,
+    )
+    assert manager.calls == []
+    callback.assert_awaited_once()
+    assert callback.await_args.args[0] == "legacy-accepted-run"
 
 
 async def test_reclaim_after_dispatch_crash_reuses_persisted_run_id(
@@ -71,7 +97,11 @@ async def test_reclaim_after_dispatch_crash_reuses_persisted_run_id(
     callback = AsyncMock()
     with pytest.raises(RuntimeError, match="crash"):
         await process_one_queue_item(
-            session_maker=maker, run_manager=Runtime(), on_run_started=callback, lease_seconds=300
+            session_maker=maker,
+            run_manager=Runtime(),
+            on_run_started=callback,
+            lease_seconds=300,
+            load_execution_snapshot=im_test_execution_snapshot,
         )
     async with maker() as session:
         row = (
@@ -85,7 +115,11 @@ async def test_reclaim_after_dispatch_crash_reuses_persisted_run_id(
         await session.commit()
     monkeypatch.setattr(worker, "mark_queue_item_completed", complete)
     await process_one_queue_item(
-        session_maker=maker, run_manager=Runtime(), on_run_started=callback, lease_seconds=300
+        session_maker=maker,
+        run_manager=Runtime(),
+        on_run_started=callback,
+        lease_seconds=300,
+        load_execution_snapshot=im_test_execution_snapshot,
     )
     assert len(invoked) == 2
     assert len(accepted) == 1
@@ -100,6 +134,7 @@ async def test_completed_queue_restores_only_undelivered_tailer(_seeded: Any) ->
         run_manager=_FakeRunManager(),
         on_run_started=AsyncMock(side_effect=RuntimeError("tailer setup failed")),
         lease_seconds=300,
+        load_execution_snapshot=im_test_execution_snapshot,
     )
     callback = AsyncMock()
     platform = SlackPlatform()
@@ -180,7 +215,11 @@ async def test_concurrent_delivery_claims_make_only_one_slack_post(_seeded: Any)
     maker, account = _seeded
     await ingest_inbound_event(event("concurrent-post"), account=account, session_maker=maker)
     await process_one_queue_item(
-        session_maker=maker, run_manager=_FakeRunManager(), on_run_started=None, lease_seconds=300
+        session_maker=maker,
+        run_manager=_FakeRunManager(),
+        on_run_started=None,
+        lease_seconds=300,
+        load_execution_snapshot=im_test_execution_snapshot,
     )
     async with maker() as session:
         row = (

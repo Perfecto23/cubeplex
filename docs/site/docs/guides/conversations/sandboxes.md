@@ -5,7 +5,7 @@ title: Managing Sandboxes
 
 # Managing Sandboxes
 
-A sandbox is the isolated environment where the agent runs code for a conversation or topic. Each sandbox has its own files and installed packages, and CubePlex keeps it around across container restarts — so the working files from a conversation are still there the next time you open it. The **Sandboxes** tab in your workspace settings is where you see every sandbox that belongs to you in this workspace and take action on one when something goes wrong.
+A sandbox is the isolated environment where the agent runs code for a conversation or topic. Each sandbox has its own files and installed packages, and CubePlex keeps it around across container restarts — so the working files from a conversation are still there the next time you open it. While a command is running, its output appears in the chat as it is produced. The **Sandboxes** tab in your workspace settings is where you see every sandbox that belongs to you in this workspace and take action on one when something goes wrong.
 
 ![Workspace settings Sandboxes tab showing a running sandbox with Restart and Delete actions](/img/conversations/sandboxes-panel.png)
 
@@ -55,6 +55,30 @@ The badge on each row reflects the sandbox's runtime state:
 | **Stopping** | The container is being stopped after a Restart or Delete action. |
 | **Off** | The container is stopped, but the sandbox row and its files are still around. It starts again on next use. |
 | **Failed** | The last provisioning attempt failed. Use **Restart** to try again, or **Delete** to clear it. |
+
+## Background commands and recovery
+
+Main-agent commands stream output into the current reply while the agent waits. If a background-capable command is still running after 60 seconds, CubePlex records it as a background task, returns its task and command IDs, and lets the current reply finish. The task then runs independently of that reply. When its final result is ready, CubePlex delivers one internal task event to the conversation. Its raw delivery payload stays out of chat, including while the agent is responding, and does not repeatedly wake the agent.
+
+Subagent execute calls show command progress while waiting for the result or timeout, then return to the main agent. Very long output is shortened in progress updates and the returned result. Subagents cannot use CubePlex background tasks, command monitors, or task completion notices. The main agent can still start background tasks when needed.
+
+The agent can finish other steps while the command runs. If the remaining work depends on its result, the current reply may end with that work still unfinished. The result event brings the agent back to check whether the command succeeded and continue the request. An unfinished checklist item stays unfinished until that follow-up work is done; the end of the current reply does not mark the request complete.
+
+Execute tasks use the configured command deadline, which is one hour by default. Setting `notify_on_complete=false` suppresses the final conversation event but does not remove that deadline. A command that has exited can still show `result_pending` while its final log is being recovered.
+
+A monitor waits for one condition and produces at most one final result. Its script keeps checking until the condition is met, then exits with code 0; a nonzero exit reports failure. Output lines are logs, not notifications. A deadline reports timeout once before cleanup; persistent monitors remove that deadline but still report only once. Stopping a monitor does not stop a separate build or service that it observes.
+
+Result delivery is separate from process exit. The shared result state distinguishes pending output, a readable result, and output that is confirmed unavailable. CubePlex advances the provider log cursor only after the corresponding output has been written to the command log. A temporary read or write failure therefore leaves the result pending for recovery; failure to remove an already-written temporary chunk does not make that result unreadable. If a worker stops after writing output but before confirming its cursor, recovery may repeat that final chunk rather than risk silently losing it. Recovery retains the original result event instead of creating another notification; unavailable output is reported as incomplete. Foreground streaming and log collection do not depend on monitor notifications.
+
+Final task results are internal conversation events. They are delivered under the identity that started the task: a result may join that user's active run or start a new run when the conversation is idle, but waits while another participant owns the active run or while a confirmation is pending. An event is marked delivered only after its input is present in the durable checkpoint.
+
+Open **Background tasks** from the button after **Share** in the conversation header. Its badge counts unfinished tasks; the right panel shows active tasks and recent completed tasks. **Stop task** targets one item. **Stop all** stops the current response and every task in the current execution generation; an old retry cannot stop work created after that request. Accepted stops remain visible as **Stopping** until the execution provider confirms termination. Completed results also appear as compact rows in the timeline, using the same styling as tool calls. Click a result to inspect its execution record, request, and final output in the right preview panel. On mobile, the preview fills the screen. Details stay out of the conversation timeline, and switching conversations closes the result preview. The delivery label describes the result notification, not whether the command succeeded. Command requests show the shell command separately from execution options, with controls to copy the command or expand and copy the original request JSON. The same request view is available in execute tool details.
+
+### Local development limitation
+
+The local subprocess driver is for development only. Its process handles belong to the backend worker that started them; another worker cannot reconnect to them after a restart. An unavailable handle is an unknown process state, not confirmation that the command stopped. Repeated status checks or Stop requests preserve a command's observed exit code, including a command that finished before Stop arrived.
+
+Restart and Delete first block new work on the recorded sandbox instance and request its managed tasks to stop. A successful HTTP response means the request was accepted, not that the provider has confirmed termination. Unconfirmed cleanup remains visible as **Stopping** and can be retried. Delete hides the sandbox only after reliable provider evidence says the original instance is gone; a replacement instance never inherits the old stop request.
 
 ## Storage isolation
 

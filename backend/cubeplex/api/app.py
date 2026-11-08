@@ -54,7 +54,7 @@ def validate_auth_secrets() -> None:
 
 def validate_sandbox_config() -> None:
     """Require a complete OpenSandbox configuration before accepting requests."""
-    from cubeplex.config import config
+    from cubeplex.config import config, get_command_default_timeout_seconds
 
     if config.get("sandbox.enabled") is not True:
         raise RuntimeError("CUBEPLEX_SANDBOX__ENABLED must be true")
@@ -74,6 +74,8 @@ def validate_sandbox_config() -> None:
             or normalized_value in _SANDBOX_CONFIG_PLACEHOLDERS
         ):
             raise RuntimeError(f"{env_var} must not use a placeholder value")
+
+    get_command_default_timeout_seconds()
 
 
 def _build_encryption_backend() -> FernetBackend:
@@ -98,6 +100,32 @@ def _build_mcp_user_token_signer() -> Any:
     from cubeplex.mcp.dependencies import build_user_token_signer
 
     return build_user_token_signer()
+
+
+async def _stop_sandbox_background_tasks(
+    background_task_coordinator: Any | None,
+    delivery_task: asyncio.Task[None] | None,
+    cleanup_task: asyncio.Task[None] | None,
+) -> None:
+    """Stop lease renewal and cleanup together before draining agent runs."""
+    tasks = (
+        (delivery_task, "Background task delivery coordinator"),
+        (cleanup_task, "Sandbox cleanup loop"),
+    )
+    for task, _label in tasks:
+        if task is not None:
+            task.cancel()
+    for task, label in tasks:
+        if task is None:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("{} stopped", label)
+    if background_task_coordinator is not None:
+        await background_task_coordinator.stop()
+        logger.info("Background task coordinator stopped")
 
 
 @asynccontextmanager
@@ -192,6 +220,15 @@ async def lifespan(_app: FastAPI):  # type: ignore
             _app.include_router(_route_ext_router, prefix=f"/api/v1/_extensions/{_pkg}")
     logger.info("Mounted {} RouteExtension(s)", len(_reg.get_route_extensions()))
 
+    # No worker or queue consumer may start until every legacy lifecycle row
+    # has a public task/event identity. This is the single-writer cutover gate.
+    from cubeplex.db.engine import async_session_maker as _cutover_session_maker
+    from cubeplex.services.background_task_cutover import require_background_task_cutover
+
+    async with _cutover_session_maker() as _cutover_session:
+        await require_background_task_cutover(_cutover_session)
+    logger.info("Background task lifecycle cutover verified")
+
     # MCP tools are assembled per agent run from DB-backed catalog/installs;
     # the legacy global registry loader was removed in M2.
 
@@ -245,11 +282,18 @@ async def lifespan(_app: FastAPI):  # type: ignore
 
         _app.state.user_event_bus = UserEventBus()
         await run_manager.start_control_listeners()
+        from sqlalchemy.ext.asyncio import AsyncSession
+
         from cubeplex.config import config as _sched_cfg
+        from cubeplex.llm.snapshot import LLMSnapshot, load_llm_snapshot
         from cubeplex.schedules.poller import ScheduledTaskPoller
+
+        async def _load_schedule_snapshot(session: AsyncSession, org_id: str) -> LLMSnapshot:
+            return await load_llm_snapshot(session, org_id, _app.state.encryption_backend)
 
         poller = ScheduledTaskPoller(
             run_manager=run_manager,
+            load_execution_snapshot=_load_schedule_snapshot,
             poll_interval_seconds=float(
                 _sched_cfg.get("scheduled_tasks.poll_interval_seconds", 15.0)
             ),
@@ -263,6 +307,22 @@ async def lifespan(_app: FastAPI):  # type: ignore
         )
         poller.start()
         _app.state.scheduled_task_poller = poller
+
+        import cubeplex.db as _trigger_db
+        from cubeplex.triggers.pipeline import TriggerPipeline
+        from cubeplex.triggers.worker import TriggerEventWorker
+
+        _trigger_session_maker = _trigger_db.async_session_maker
+        trigger_worker = TriggerEventWorker(
+            session_maker=_trigger_session_maker,
+            pipeline=TriggerPipeline(
+                run_manager=run_manager,
+                session_maker=_trigger_session_maker,
+                load_execution_snapshot=_load_schedule_snapshot,
+            ),
+        )
+        trigger_worker.start()
+        _app.state.trigger_event_worker = trigger_worker
 
         # ---- IM connectors: queue worker + long-connection clients (#149) ----
         from cubeplex.im import runtime as _im_runtime
@@ -302,6 +362,51 @@ async def lifespan(_app: FastAPI):  # type: ignore
     cleanup_interval = config.get("sandbox.cleanup_interval", 60)
     cleanup_task = asyncio.create_task(sandbox_cleanup_loop(manager, interval=cleanup_interval))
     logger.info("Sandbox cleanup loop started")
+    from cubeplex.services.background_task_coordinator import (
+        BackgroundTaskCoordinator,
+        resolve_foreground_checkpoint,
+    )
+    from cubeplex.services.background_task_delivery import BackgroundTaskDeliveryCoordinator
+
+    assert run_manager is not None and redis_client is not None
+
+    async def _resolve_foreground(task: Any) -> Any:
+        return await resolve_foreground_checkpoint(
+            task,
+            redis=redis_client,
+            redis_key_prefix=_app.state.redis_key_prefix,
+        )
+
+    background_task_coordinator = BackgroundTaskCoordinator(
+        async_session_maker,
+        manager,
+        resolve_foreground=_resolve_foreground,
+    )
+
+    delivery_coordinator = BackgroundTaskDeliveryCoordinator(
+        async_session_maker,
+        run_manager=run_manager,
+        redis=redis_client,
+        redis_key_prefix=_app.state.redis_key_prefix,
+    )
+
+    async def _deliver_background_tasks() -> None:
+        from datetime import UTC, datetime, timedelta
+
+        while True:
+            try:
+                now = datetime.now(UTC)
+                await delivery_coordinator.deliver_once(
+                    now=now,
+                    lease_until=now + timedelta(seconds=15),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("background task delivery tick failed")
+            await asyncio.sleep(5)
+
+    delivery_task: asyncio.Task[None] | None = None
 
     # Seed preinstalled skills into the global catalog (idempotent, lock-guarded).
     try:
@@ -463,10 +568,36 @@ async def lifespan(_app: FastAPI):  # type: ignore
     except Exception as exc:
         logger.warning("Shared checkpointer warmup failed (will retry lazily): {}", exc)
 
+    background_task_coordinator.start()
+    logger.info("Background task coordinator started")
+    delivery_task = asyncio.create_task(
+        _deliver_background_tasks(),
+        name="background-task-delivery",
+    )
+    logger.info("Background task delivery coordinator started")
+
+    if run_manager is not None:
+        run_manager.start_stop_recovery()
+
     yield
 
     # ==================== Shutdown ====================
-    logger.info("Application shutting down")
+    active_runs = len(run_manager._tasks) if run_manager is not None else 0
+    logger.info(
+        "Shutdown phase 1/5: entering drain mode (active_runs={})",
+        active_runs,
+    )
+    if run_manager is not None:
+        _app.state.drain_state.enter_draining()
+
+    logger.info("Shutdown phase 2/5: stopping background services and connectors")
+    if run_manager is not None:
+        await run_manager.stop_stop_recovery()
+    await _stop_sandbox_background_tasks(
+        background_task_coordinator,
+        delivery_task,
+        cleanup_task,
+    )
     from cubeplex.services.conversation_search.startup import stop_search_subsystem
 
     await stop_search_subsystem(_app)
@@ -488,21 +619,31 @@ async def lifespan(_app: FastAPI):  # type: ignore
         )
         if _shutdown_poller is not None:
             await _shutdown_poller.stop()
+        from cubeplex.triggers.worker import TriggerEventWorker as _TriggerEventWorker
+
+        _trigger_worker: _TriggerEventWorker | None = getattr(
+            _app.state, "trigger_event_worker", None
+        )
+        if _trigger_worker is not None:
+            await _trigger_worker.stop()
         from cubeplex.im import runtime as _im_runtime_shutdown
 
         await _im_runtime_shutdown.stop(_app)
-        _app.state.drain_state.enter_draining()
         drain_timeout = _lifecycle_config.get("lifecycle.graceful_drain_timeout_seconds", 3600)
         logger.info(
-            "Starting run drain (timeout={}s, active_runs={})",
+            "Shutdown phase 3/5: draining agent runs (timeout={}s, active_runs={})",
             drain_timeout,
             len(run_manager._tasks),
         )
         await run_manager.drain(timeout_seconds=float(drain_timeout))
-        logger.info("Run drain completed")
+        logger.info(
+            "Shutdown phase 3/5 complete: agent run drain finished (active_runs={})",
+            len(run_manager._tasks),
+        )
         # Stop control listeners AFTER draining so in-flight runs can still be
         # cancelled/steered during graceful shutdown.
         await run_manager.stop_control_listeners()
+    logger.info("Shutdown phase 4/5: closing tracing and data connections")
     tracer = getattr(_app.state, "tracer", None)
     if tracer is not None:
         try:
@@ -520,13 +661,7 @@ async def lifespan(_app: FastAPI):  # type: ignore
     mcp_oauth_http_client = getattr(_app.state, "_mcp_oauth_http_client", None)
     if mcp_oauth_http_client is not None:
         await mcp_oauth_http_client.aclose()
-    if cleanup_task:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("Sandbox cleanup loop stopped")
+    logger.info("Shutdown phase 5/5: application shutdown complete")
     log.shutdown()
 
 
@@ -547,7 +682,7 @@ def create_app(
     app = FastAPI(
         title="CubePlex API",
         description="AI Agent System Backend",
-        version="0.7.2",
+        version="0.9.4",
         lifespan=lifespan,
     )
 
@@ -592,6 +727,11 @@ def create_app(
     if config.get("logging.access_log", True):
         app.add_middleware(AccessLogMiddleware)
 
+    from cubeplex.metrics import ConnectionMetricsMiddleware, instrumentator
+
+    instrumentator.instrument(app)
+    app.add_middleware(ConnectionMetricsMiddleware)
+
     # Wire slowapi limiter into app state + exception handler
     from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
@@ -620,6 +760,7 @@ def create_app(
         admin_traces,
         artifacts_router,
         attachments_router,
+        background_tasks_router,
         conversation_search_router,
         conversations_router,
         mcp_oauth,
@@ -668,6 +809,7 @@ def create_app(
     # would otherwise swallow the literal `search` segment as an ID and 404.
     app.include_router(conversation_search_router, prefix="/api/v1")
     app.include_router(conversations_router, prefix="/api/v1")
+    app.include_router(background_tasks_router, prefix="/api/v1")
     app.include_router(artifacts_router, prefix="/api/v1")
     app.include_router(ws_artifacts_router, prefix="/api/v1")
     app.include_router(public_artifacts.router, prefix="/api/v1")
@@ -748,5 +890,7 @@ def create_app(
     # port.
     if _egress_auth_config.get("mode", "mtls") == "dev":
         app.include_router(internal_egress.router, prefix="/api/v1")
+
+    instrumentator.expose(app, include_in_schema=False)
 
     return app

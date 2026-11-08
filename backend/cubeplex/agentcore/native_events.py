@@ -11,8 +11,15 @@ from cubeloop.agent.types import AgentEvent, AgentToolResult, ToolExecutionEndEv
 from pydantic import TypeAdapter, ValidationError
 from redis.asyncio import Redis
 
-from cubeplex.agentcore.native_service import NativeTaskError, load_native_dispatch, payload_hash
+from cubeplex.agentcore.native_service import (
+    NativeTaskError,
+    load_native_dispatch,
+    native_claim_token,
+    payload_hash,
+    require_native_execution,
+)
 from cubeplex.agents.stream import StreamConverter
+from cubeplex.cache import RedisHandle
 from cubeplex.db.engine import async_session_maker
 from cubeplex.streams.run_events import _active_run_key, _run_events_key, _run_meta_key
 
@@ -58,7 +65,10 @@ end
 redis.call('HSET', KEYS[2], 'last_event_at', ARGV[7])
 if token == 'terminal' then
   redis.call('HSET', KEYS[2], 'status', ARGV[8])
-  if ARGV[8] ~= 'paused_hitl' and redis.call('GET', KEYS[3]) == ARGV[6] then
+  if ARGV[8] == 'paused_hitl' then
+    redis.call('HDEL', KEYS[2], 'resume_finalizing_token', 'resume_finalizing_until')
+  end
+  if ARGV[11] == '1' and ARGV[8] ~= 'paused_hitl' and redis.call('GET', KEYS[3]) == ARGV[6] then
     redis.call('DEL', KEYS[3])
   end
 else
@@ -88,6 +98,7 @@ async def _emit(
     status: str = "",
     allow_write: bool = True,
     claim_token: str | None = None,
+    release_active: bool = True,
 ) -> dict[str, Any]:
     response = await redis.eval(  # type: ignore[misc]
         _EVENTS_LUA,
@@ -106,6 +117,7 @@ async def _emit(
         status,
         "1" if allow_write else "0",
         claim_token or "",
+        "1" if release_active else "0",
     )
     result: dict[str, Any] = json.loads(response)
     if "code" in result:
@@ -129,6 +141,7 @@ async def emit_native_terminal(
     ttl_seconds: int,
     maxlen: int,
     claim_token: str | None = None,
+    release_active: bool = True,
 ) -> dict[str, Any]:
     if status not in {"completed", "cancelled", "errored", "paused_hitl"}:
         raise ValueError("native_terminal_invalid")
@@ -154,6 +167,7 @@ async def emit_native_terminal(
             maxlen=maxlen,
             status=status,
             claim_token=claim_token,
+            release_active=release_active,
         )
     except NativeTaskError as exc:
         raise ValueError(exc.code) from exc
@@ -195,6 +209,9 @@ async def receive_event(
 
     async with async_session_maker() as session, session.begin():
         dispatch = await load_native_dispatch(session, dispatch_id, for_update=True)
+        replay = await redis.hexists(f"{prefix}:native_events:{dispatch_id}", str(seq))  # type: ignore[misc]
+        if not replay:
+            await require_native_execution(session, dispatch, run_store=RedisHandle(redis, prefix))
         events: list[dict[str, Any]] = []
         # All tools are directly registered in v1; no deferred converter state
         # spans requests. Completion belongs exclusively to /finish.
@@ -213,10 +230,8 @@ async def receive_event(
             events=events,
             ttl_seconds=ttl_seconds,
             maxlen=maxlen,
-            allow_write=dispatch.status == "claimed" and not dispatch.stop_requested,
-            claim_token=dispatch.request.get("claim_token")
-            if dispatch.operation == "respond"
-            else None,
+            allow_write=not replay and dispatch.status == "claimed" and not dispatch.stop_requested,
+            claim_token=native_claim_token(dispatch),
         )
         result["seq"] = seq
         return result

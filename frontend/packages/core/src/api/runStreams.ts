@@ -1,4 +1,10 @@
 import type { AgentEvent, Message, PendingHitl, TodoItem } from '../types'
+import type {
+  BackgroundTaskEventPage,
+  BackgroundTaskSummary,
+  RunControlStatus,
+  StopAllStatus,
+} from '../types/background-task'
 import { toApiError, type ApiClient } from './client'
 import { CSRF_COOKIE_NAME } from './cookieNames'
 
@@ -70,6 +76,11 @@ export interface ConversationBootstrap extends HistoryWindowPage {
     state: 'queued' | 'dispatched' | 'failed'
     created_at: string
   }>
+  execution_generation: number
+  stop_all: StopAllStatus | null
+  run_control: RunControlStatus | null
+  background_summary: BackgroundTaskSummary
+  background_events: BackgroundTaskEventPage
 }
 
 export interface StartRunResponse {
@@ -101,10 +112,19 @@ function readCookie(name: string): string {
 export async function getConversationBootstrap(
   client: ApiClient,
   conversationId: string,
-): Promise<ConversationBootstrap> {
-  const res = await client.get(`/api/v1/conversations/${conversationId}/bootstrap`)
+  etag?: string,
+): Promise<{ bootstrap: ConversationBootstrap | null; etag: string | null }> {
+  const res = await client.get(`/api/v1/conversations/${conversationId}/bootstrap`, {
+    // The store handles 304 itself; the browser must not substitute a cached body.
+    cache: 'no-store',
+    headers: etag ? { 'If-None-Match': etag } : {},
+  })
+  if (res.status === 304 && etag) return { bootstrap: null, etag }
   if (!res.ok) throw await toApiError(res)
-  return res.json() as Promise<ConversationBootstrap>
+  return {
+    bootstrap: (await res.json()) as ConversationBootstrap,
+    etag: res.headers.get('ETag'),
+  }
 }
 
 export async function getHistoryWindow(

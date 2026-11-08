@@ -24,6 +24,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cubeplex.agents.stream import unwrap_deferred_in_message_dicts
 
 
+def _is_internal_background_input(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("source") == "background_task":
+        return True
+    notice_id = metadata.get("notice_id")
+    return isinstance(notice_id, str) and notice_id.startswith(("bge-", "scmw-", "scmd-"))
+
+
 @dataclass(frozen=True)
 class HistoryWindow:
     """Result of a paginated history read.
@@ -46,12 +58,18 @@ async def load_history_window(
     *,
     before_seq: int | None = None,
     limit: int,
+    include_background_notices: bool = False,
 ) -> HistoryWindow:
     """Load up to ``limit`` messages ending at ``before_seq`` (exclusive).
 
     ``before_seq=None`` returns the most recent ``limit`` messages, which is
     what conversation bootstrap wants. A subsequent backscroll request passes
     the previous slice's ``oldest_seq`` as ``before_seq``.
+
+    Chat history passes ``include_background_notices`` so a delivered result
+    stays in checkpoint order and the client can draw it as a result card.
+    Other readers leave the flag off so that internal input is not treated as
+    something the user said.
     """
     if limit <= 0:
         return HistoryWindow(messages=[], oldest_seq=None, has_more=False)
@@ -85,6 +103,8 @@ async def load_history_window(
         decoded.append(data)
 
     messages = unwrap_deferred_in_message_dicts(decoded)
+    if not include_background_notices:
+        messages = [message for message in messages if not _is_internal_background_input(message)]
     oldest_seq = int(rows[-1][0]) if rows else None
     return HistoryWindow(messages=messages, oldest_seq=oldest_seq, has_more=has_more)
 

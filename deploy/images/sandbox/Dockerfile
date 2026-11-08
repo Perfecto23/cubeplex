@@ -1,7 +1,7 @@
 # Source of the Neko streaming runtime (server binary, HTML5 client, configs,
 # custom Xorg drivers).
 ARG BASE_IMAGE=ubuntu:24.04
-FROM ghcr.io/m1k1o/neko/chromium:latest AS neko
+FROM ghcr.io/m1k1o/neko/chromium:3.1.4 AS neko
 
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -73,6 +73,7 @@ RUN if [ -n "$APT_MIRROR_HOST" ]; then \
         wget \
         file \
         git \
+        openssh-client \
         ripgrep \
         unzip \
         zip \

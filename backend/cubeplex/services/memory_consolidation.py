@@ -10,11 +10,14 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Awaitable
-from typing import Any, cast
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 from redis.asyncio import Redis
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 _TTL_S = 7 * 24 * 3600  # keep gate keys ~a week of inactivity
 
@@ -183,31 +186,28 @@ async def apply_ops(
     """
     for op in ops:
         action = op["action"]
-        try:
-            if action == "extract":
-                await service.create(
-                    CreateMemoryInput(
-                        scope=MemoryScope(op["scope"]),
-                        type=MemoryType(op["type"]),
-                        content=op["content"].strip(),
-                        source_type=MemorySourceType.CONSOLIDATION,
-                        source_conversation_id=conversation_id,
-                        source_run_id=run_id,
-                    )
+        if action == "extract":
+            await service.create(
+                CreateMemoryInput(
+                    scope=MemoryScope(op["scope"]),
+                    type=MemoryType(op["type"]),
+                    content=op["content"].strip(),
+                    source_type=MemorySourceType.CONSOLIDATION,
+                    source_conversation_id=conversation_id,
+                    source_run_id=run_id,
                 )
-            elif action in ("merge", "archive"):
-                target = await service.repo.get(op["id"])
-                if target is None or target.scope not in (
-                    MemoryScope.PERSONAL,
-                    MemoryScope.WORKSPACE,
-                ):
-                    continue
-                if action == "merge":
-                    await service.update(op["id"], content=op["content"].strip())
-                else:
-                    await service.archive(op["id"])
-        except Exception:
-            logger.opt(exception=True).warning("consolidation op failed: {}", op)
+            )
+        elif action in ("merge", "archive"):
+            target = await service.repo.get(op["id"])
+            if target is None or target.scope not in (
+                MemoryScope.PERSONAL,
+                MemoryScope.WORKSPACE,
+            ):
+                continue
+            if action == "merge":
+                await service.update(op["id"], content=op["content"].strip())
+            else:
+                await service.archive(op["id"])
 
 
 DEFAULT_MIN_HOURS = 6.0
@@ -254,6 +254,41 @@ def _render_history(messages: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _is_background_input(message: Any) -> bool:
+    metadata = getattr(message, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("source") == "background_task":
+        return True
+    notice_id = metadata.get("notice_id")
+    return isinstance(notice_id, str) and notice_id.startswith(("bge-", "scmw-", "scmd-"))
+
+
+def _without_background_rounds(messages: list[Any]) -> list[Any]:
+    """Remove complete runs contaminated by internal task results."""
+    background_run_ids = {
+        run_id
+        for message in messages
+        if _is_background_input(message)
+        and isinstance((run_id := getattr(message, "metadata", {}).get("run_id")), str)
+    }
+    filtered: list[Any] = []
+    drop_segment = False
+    for message in messages:
+        metadata = getattr(message, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        role = getattr(message, "role", None)
+        if role == "user":
+            drop_segment = (
+                _is_background_input(message) or metadata.get("run_id") in background_run_ids
+            )
+        if metadata.get("run_id") in background_run_ids:
+            drop_segment = True
+        if not drop_segment:
+            filtered.append(message)
+    return filtered
+
+
 async def run_consolidation(
     *,
     redis: Redis,
@@ -267,6 +302,8 @@ async def run_consolidation(
     tracer: Any | None = None,
     min_hours: float = DEFAULT_MIN_HOURS,
     min_runs: int = DEFAULT_MIN_RUNS,
+    run_id: str | None = None,
+    authorize_transaction: Callable[[AsyncSession], Awaitable[None]] | None = None,
 ) -> None:
     """Best-effort per-conversation consolidation. Never raises into the caller.
 
@@ -293,9 +330,17 @@ async def run_consolidation(
                 redis, prefix, conversation_id, cutoff=cutoff, consumed=consumed
             )
             return
-        history_text = _render_history(data.messages[-HISTORY_MSG_CAP:])
+        memory_messages = _without_background_rounds(data.messages)
+        if not memory_messages:
+            await mark_consolidated(
+                redis, prefix, conversation_id, cutoff=cutoff, consumed=consumed
+            )
+            return
+        history_text = _render_history(memory_messages[-HISTORY_MSG_CAP:])
 
         async with session_maker() as s:
+            if authorize_transaction is not None:
+                await authorize_transaction(s)
             repo = MemoryRepository(s, user_id=user_id, org_id=org_id, workspace_id=workspace_id)
             personal = await repo.list(
                 scope=MemoryScope.PERSONAL,
@@ -329,6 +374,9 @@ async def run_consolidation(
         if org_id is not None:
             meta["org_id"] = org_id
 
+        if authorize_transaction is not None:
+            async with session_maker() as s:
+                await authorize_transaction(s)
         if tracer is not None:
             async with tracer.oneshot(
                 model=model,
@@ -362,15 +410,22 @@ async def run_consolidation(
                 conversation_id,
             )
             return
-        if ops:  # ops == [] is a valid "nothing worth saving" → advance below
+        if ops or authorize_transaction is not None:
             async with session_maker() as s:
+                if authorize_transaction is not None:
+                    await authorize_transaction(s)
                 repo = MemoryRepository(
-                    s, user_id=user_id, org_id=org_id, workspace_id=workspace_id
+                    s,
+                    user_id=user_id,
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    auto_commit=False,
                 )
                 service = MemoryService(
                     repo, user_id=user_id, org_id=org_id, workspace_id=workspace_id
                 )
-                await apply_ops(service, ops, conversation_id=conversation_id, run_id=None)
+                await apply_ops(service, ops, conversation_id=conversation_id, run_id=run_id)
+                await s.commit()
 
         await mark_consolidated(redis, prefix, conversation_id, cutoff=cutoff, consumed=consumed)
     except Exception:

@@ -69,7 +69,7 @@ class TestGroupChatMessaging:
 
         msg_resp = await member_c.post(
             f"/api/v1/ws/{ws_id}/conversations/{conv_id}/messages",
-            json={"content": "Hello from member"},
+            json={"client_message_id": "member-send", "content": "Hello from member"},
         )
         assert msg_resp.status_code != 404, msg_resp.text
 
@@ -90,13 +90,14 @@ class TestGroupChatMessaging:
 
         # Owner removes member.
         rm = await admin_c.delete(f"/api/v1/ws/{ws_id}/topics/{topic_id}/participants/{member_uid}")
-        assert rm.status_code == 204, rm.text
+        assert rm.status_code == 200, rm.text
+        assert rm.json() == {"removed": True, "cleanup_pending": False}
 
         # Member tries to send — must be 404 (not 403) so the response is
         # indistinguishable from "conversation doesn't exist".
         msg_resp = await member_c.post(
             f"/api/v1/ws/{ws_id}/conversations/{conv_id}/messages",
-            json={"content": "still here?"},
+            json={"client_message_id": "removed-member-send", "content": "still here?"},
         )
         assert msg_resp.status_code == 404, msg_resp.text
 
@@ -123,7 +124,8 @@ class TestGroupChatMessaging:
 
         # Owner archives the topic.
         delete_resp = await admin_c.delete(f"/api/v1/ws/{ws_id}/topics/{topic_id}")
-        assert delete_resp.status_code == 204, delete_resp.text
+        assert delete_resp.status_code == 200, delete_resp.text
+        assert delete_resp.json() == {"archived": True, "cleanup_pending": False}
 
         # Both lose access.
         get_admin = await admin_c.get(f"/api/v1/ws/{ws_id}/conversations/{conv_id}")

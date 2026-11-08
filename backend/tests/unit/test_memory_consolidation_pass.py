@@ -1,9 +1,92 @@
 import json
 
 import pytest
+from cubeloop.providers.base import AssistantMessage, TextContent, UserMessage
 
 from cubeplex.models.memory import MemoryScope, MemorySourceType
 from cubeplex.services import memory_consolidation as mc
+
+
+def test_background_runs_are_filtered_before_history_window() -> None:
+    pure_user = UserMessage(
+        content=[TextContent(text="remember pnpm")], metadata={"run_id": "run-user"}
+    )
+    pure_reply = AssistantMessage(
+        content=[TextContent(text="noted")], metadata={"run_id": "run-user"}
+    )
+    mixed_user = UserMessage(
+        content=[TextContent(text="continue")], metadata={"run_id": "run-mixed"}
+    )
+    notice = UserMessage(
+        content=[TextContent(text="secret log")],
+        metadata={
+            "run_id": "run-mixed",
+            "source": "background_task",
+            "notice_id": "bge-1",
+        },
+    )
+    mixed_reply = AssistantMessage(
+        content=[TextContent(text="log response")], metadata={"run_id": "run-mixed"}
+    )
+
+    filtered = mc._without_background_rounds(
+        [pure_user, pure_reply, mixed_user, notice, mixed_reply]
+    )
+
+    assert filtered == [pure_user, pure_reply]
+    assert "secret log" not in mc._render_history(filtered)
+
+
+@pytest.mark.asyncio
+async def test_all_background_history_advances_without_calling_model(monkeypatch) -> None:
+    import contextlib
+    from unittest.mock import AsyncMock, MagicMock
+
+    notice = UserMessage(
+        content=[TextContent(text="private task output")],
+        metadata={
+            "run_id": "run-background",
+            "source": "background_task",
+            "notice_id": "bge-1",
+        },
+    )
+    reply = AssistantMessage(
+        content=[TextContent(text="handled")],
+        metadata={"run_id": "run-background"},
+    )
+
+    @contextlib.asynccontextmanager
+    async def fake_checkpointer():
+        checkpointer = MagicMock()
+        checkpointer.load = AsyncMock(return_value=MagicMock(messages=[notice, reply]))
+        yield checkpointer
+
+    monkeypatch.setattr("cubeplex.agents.checkpointer.shared_checkpointer", fake_checkpointer)
+    monkeypatch.setattr(mc, "acquire_lock", AsyncMock(return_value="token"))
+    monkeypatch.setattr(mc, "_counter", AsyncMock(return_value=3))
+    mark_consolidated = AsyncMock()
+    release_lock = AsyncMock()
+    monkeypatch.setattr(mc, "mark_consolidated", mark_consolidated)
+    monkeypatch.setattr(mc, "release_lock", release_lock)
+    model = MagicMock()
+    model.provider.generate = AsyncMock()
+    session_maker = MagicMock()
+
+    await mc.run_consolidation(
+        redis=MagicMock(),
+        prefix="test",
+        conversation_id="conv-background",
+        user_id="usr-1",
+        org_id="org-1",
+        workspace_id="ws-1",
+        model=model,
+        session_maker=session_maker,
+    )
+
+    mark_consolidated.assert_awaited_once()
+    model.provider.generate.assert_not_awaited()
+    session_maker.assert_not_called()
+    release_lock.assert_awaited_once()
 
 
 class _Item:
@@ -41,6 +124,24 @@ def test_parse_ops_rejects_malformed():
     assert mc.parse_ops('{"ops": "x"}', max_ops=10) is None
     big = json.dumps({"ops": [{"action": "archive", "id": f"m{i}"} for i in range(11)]})
     assert mc.parse_ops(big, max_ops=10) is None
+
+
+@pytest.mark.asyncio
+async def test_apply_ops_propagates_a_write_failure_to_the_owning_transaction():
+    class FailingService(_FakeService):
+        async def create(self, inp):
+            if inp.content == "fail":
+                raise RuntimeError("write failed")
+            await super().create(inp)
+
+    service = FailingService()
+    ops = [
+        {"action": "extract", "scope": "personal", "type": "preference", "content": value}
+        for value in ("first", "fail", "must not run")
+    ]
+    with pytest.raises(RuntimeError, match="write failed"):
+        await mc.apply_ops(service, ops, conversation_id="conv", run_id="run")
+    assert [item.content for item in service.created] == ["first"]
 
 
 def test_parse_ops_filters_invalid_ops_keeps_valid():

@@ -186,8 +186,8 @@ wheels = [
 
 [[package]]
 name = "cubeloop"
-version = "0.14.1"
-source = { git = "https://github.com/cubeplexai/cubeloop.git?rev=bdf88a08855b1bf3626eaaccc371f965d8b62906#bdf88a08855b1bf3626eaaccc371f965d8b62906" }
+version = "0.16.1"
+source = { git = "https://github.com/cubeplexai/cubeloop.git?rev=bb2d6336e537f286ccac3dec072218bbec13405b#bb2d6336e537f286ccac3dec072218bbec13405b" }
 dependencies = [
     { name = "anthropic" },
     { name = "openai" },
@@ -223,7 +223,7 @@ requires-dist = [
     { name = "bedrock-agentcore", specifier = "==1.23.0" },
     { name = "boto3", specifier = "==1.43.75" },
     { name = "botocore", specifier = "==1.43.75" },
-    { name = "cubeloop", git = "https://github.com/cubeplexai/cubeloop.git?rev=bdf88a08855b1bf3626eaaccc371f965d8b62906" },
+    { name = "cubeloop", git = "https://github.com/cubeplexai/cubeloop.git?rev=bb2d6336e537f286ccac3dec072218bbec13405b" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "openai", specifier = "==2.40.0" },
     { name = "pydantic", specifier = "==2.13.4" },

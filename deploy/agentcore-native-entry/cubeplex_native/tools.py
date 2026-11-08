@@ -42,9 +42,15 @@ class NativeTools:
         workspace: Workspace | str | Path = "/workspace",
         *,
         present_callback: PresentFileCallback | None = None,
+        require_authority: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.workspace = workspace if isinstance(workspace, Workspace) else Workspace(workspace)
         self.present_callback = present_callback
+        self.require_authority = require_authority
+
+    async def _authorize(self) -> None:
+        if self.require_authority is not None:
+            await self.require_authority()
 
     async def execute(
         self,
@@ -56,6 +62,7 @@ class NativeTools:
     ) -> dict[str, Any]:
         """Run ``bash -c`` from the workspace root."""
 
+        await self._authorize()
         return await self.workspace.execute(
             command,
             timeout_seconds=timeout_seconds,
@@ -65,6 +72,7 @@ class NativeTools:
     async def read_file(self, path: str, max_bytes: int | None = None) -> dict[str, Any]:
         """Read a bounded UTF-8 file."""
 
+        await self._authorize()
         return self.workspace.read_file(path, max_bytes=max_bytes)
 
     async def write_file(
@@ -75,6 +83,7 @@ class NativeTools:
     ) -> dict[str, Any]:
         """Atomically write a bounded UTF-8 file."""
 
+        await self._authorize()
         return self.workspace.write_file(path, content, overwrite=overwrite)
 
     async def edit_file(
@@ -86,6 +95,7 @@ class NativeTools:
     ) -> dict[str, Any]:
         """Replace a unique text span in a bounded UTF-8 file."""
 
+        await self._authorize()
         return self.workspace.edit_file(
             path,
             old_string,
@@ -100,6 +110,7 @@ class NativeTools:
     ) -> Any:
         """Validate and pass one ordinary file to the supplied callback."""
 
+        await self._authorize()
         if self.present_callback is None:
             raise WorkspaceError("present_callback_required")
         relative, target = self.workspace._target(path, existing=True)

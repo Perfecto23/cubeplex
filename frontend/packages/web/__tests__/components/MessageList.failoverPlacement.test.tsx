@@ -46,6 +46,13 @@ const assistantMsg = {
   run_id: 'run-1',
 } as unknown as Message
 
+const laterUserMsg = {
+  id: 'msg-user-later',
+  role: 'user',
+  content: [{ type: 'text', text: 'message sent after background completion' }],
+  timestamp: Date.parse('2026-09-22T02:00:00Z') / 1000,
+} as unknown as Message
+
 function wrapper({ children }: { children: React.ReactNode }) {
   return (
     <NextIntlClientProvider locale="en" messages={en}>
@@ -78,6 +85,8 @@ describe('MessageList failover banner placement', () => {
       hasMoreByConv: {},
       loadingOlderByConv: {},
       oldestSeqByConv: {},
+      backgroundEvents: {},
+      backgroundEventsHasMore: {},
     } as never)
   })
 
@@ -112,5 +121,90 @@ describe('MessageList failover banner placement', () => {
 
     render(<MessageList conversationId={CONV} />, { wrapper })
     expectBannerAboveAnswer()
+  })
+
+  it('renders a delivered background result from its history message', () => {
+    const earlierUserMsg = {
+      ...userMsg,
+      timestamp: Date.parse('2026-09-22T00:00:00Z') / 1000,
+    } as unknown as Message
+    const notice = {
+      source: 'background_task',
+      notice_id: 'bge-1',
+      task_id: 'task-1',
+      task_kind: 'command',
+      originating_run_id: 'run-0',
+      execution_generation: 1,
+      reason: 'completion',
+      summary: 'background build completed',
+      result_ref: null,
+    }
+    const backgroundMsg = {
+      id: 'msg-bg',
+      role: 'user',
+      content: [{ type: 'text', text: `Background task result:\n${JSON.stringify(notice)}` }],
+      timestamp: Date.parse('2026-09-22T01:00:00Z') / 1000,
+      metadata: { source: 'background_task', notice_id: 'bge-1', execution_generation: 1 },
+    } as unknown as Message
+    useMessageStore.setState({
+      messages: { [CONV]: [earlierUserMsg, backgroundMsg, laterUserMsg] },
+      isStreaming: false,
+      streamingConversationId: null,
+      streamAgents: {},
+      backgroundEvents: {
+        [CONV]: [
+          {
+            id: 'event-pending',
+            task_id: 'task-2',
+            task_kind: 'command',
+            execution_generation: 1,
+            reason: 'completion',
+            summary: 'still waiting',
+            result_ref: null,
+            state: 'pending',
+            discard_reason: null,
+            revision: 1,
+            created_at: '2026-09-22T01:30:00Z',
+            updated_at: '2026-09-22T01:30:00Z',
+            delivered_at: null,
+          },
+        ],
+      },
+    } as never)
+
+    render(<MessageList conversationId={CONV} />, { wrapper })
+
+    const earlier = screen.getByText('hello')
+    const result = screen.getByText('Background result')
+    const later = screen.getByText('message sent after background completion')
+    expect(screen.getByText('Result delivered')).toBeTruthy()
+    expect(screen.queryByText('Result awaiting delivery')).toBeNull()
+    expect(screen.queryByText(/Background task result:/)).toBeNull()
+    expect(earlier.compareDocumentPosition(result) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(result.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('hides per-turn action row on historical checkpoints of the active streaming run', () => {
+    useMessageStore.setState({
+      messages: { [CONV]: [userMsg, assistantMsg] },
+      isStreaming: true,
+      streamingConversationId: CONV,
+      currentRunId: 'run-1',
+      streamAgents: {
+        main: {
+          text: 'more text coming...',
+          toolCalls: [],
+          toolResults: [],
+          thinking: '',
+          blocks: [{ type: 'text', text: 'more text coming...' }],
+          name: null,
+        },
+      },
+    } as never)
+
+    render(<MessageList conversationId={CONV} />, { wrapper })
+
+    // Fork button has aria-label 'Fork conversation'
+    expect(screen.queryByRole('button', { name: 'Fork conversation' })).toBeNull()
   })
 })

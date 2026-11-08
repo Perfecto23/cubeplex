@@ -16,18 +16,34 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { configuredPrice } from '@/lib/models/configured-price'
 import { cn } from '@/lib/utils'
+import { CapabilityEditor } from './wizard/CapabilityEditor'
 
 const MODALITIES = ['text', 'image', 'audio', 'video'] as const
+// Default arguments are evaluated on every call. A fresh object here makes the
+// open-effect reset forever when the caller omits the provider capability.
+const EMPTY_CAPABILITY: Record<string, unknown> = {}
 
 interface ModelFormDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   model: Model | null
   onSave: (body: ModelCreate | ModelUpdate) => Promise<void>
+  /** Provider default. Shown when this model has no override. */
+  providerCapability?: Record<string, unknown>
+  /** This model's stored override, or null when it inherits the provider. */
+  capabilityOverride?: Record<string, unknown> | null
 }
 
-export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelFormDialogProps) {
+export function ModelFormDialog({
+  open,
+  onOpenChange,
+  model,
+  onSave,
+  providerCapability = EMPTY_CAPABILITY,
+  capabilityOverride = null,
+}: ModelFormDialogProps) {
   const t = useTranslations('adminModels')
   const isEdit = model !== null
   const [saving, setSaving] = useState(false)
@@ -43,6 +59,10 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
   const [costCacheWrite, setCostCacheWrite] = useState('')
   const [contextWindow, setContextWindow] = useState('')
   const [maxTokens, setMaxTokens] = useState('')
+  const [inheritsCapability, setInheritsCapability] = useState(true)
+  const [capabilityDraft, setCapabilityDraft] = useState<Record<string, unknown>>({})
+  const [capabilityKey, setCapabilityKey] = useState(0)
+  const [capabilityValid, setCapabilityValid] = useState(true)
 
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect */
@@ -52,10 +72,10 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
         setDisplayName(model.display_name)
         setReasoning(model.reasoning)
         setInputModalities([...model.input_modalities])
-        setCostInput(model.cost_input.toString())
-        setCostOutput(model.cost_output.toString())
-        setCostCacheRead(model.cost_cache_read.toString())
-        setCostCacheWrite(model.cost_cache_write.toString())
+        setCostInput(configuredPrice(model, 'cost_input')?.toString() ?? '')
+        setCostOutput(configuredPrice(model, 'cost_output')?.toString() ?? '')
+        setCostCacheRead(configuredPrice(model, 'cost_cache_read')?.toString() ?? '')
+        setCostCacheWrite(configuredPrice(model, 'cost_cache_write')?.toString() ?? '')
         setContextWindow(model.context_window.toString())
         setMaxTokens(model.max_tokens.toString())
       } else {
@@ -70,11 +90,16 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
         setContextWindow('')
         setMaxTokens('')
       }
+      const hasOverride = capabilityOverride != null
+      setInheritsCapability(!hasOverride)
+      setCapabilityDraft(hasOverride ? capabilityOverride : providerCapability)
+      setCapabilityKey((key) => key + 1)
+      setCapabilityValid(true)
       setError(null)
       setSaving(false)
     }
     /* eslint-enable react-hooks/set-state-in-effect */
-  }, [open, model])
+  }, [open, model, capabilityOverride, providerCapability])
 
   function toggleModality(mod: string) {
     setInputModalities((prev) =>
@@ -87,21 +112,66 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
     return isNaN(n) ? 0 : n
   }
 
+  function capabilityChange(): Record<string, unknown> | null | undefined {
+    const providerJson = JSON.stringify(providerCapability)
+    const draftJson = JSON.stringify(capabilityDraft)
+    const initial = isEdit ? capabilityOverride : null
+    const inherits = inheritsCapability || draftJson === providerJson
+    if (inherits) return initial != null ? null : undefined
+    if (initial != null && draftJson === JSON.stringify(initial)) return undefined
+    return capabilityDraft
+  }
+
+  function useProviderCapability(): void {
+    setInheritsCapability(true)
+    setCapabilityDraft(providerCapability)
+    setCapabilityValid(true)
+    setCapabilityKey((key) => key + 1)
+  }
+
   async function handleSave(): Promise<void> {
     setSaving(true)
     setError(null)
     try {
       if (isEdit) {
         const body: ModelUpdate = {
+          expected_configuration_revision: model!.configuration_revision,
           display_name: displayName || null,
           reasoning,
           input_modalities: inputModalities.length > 0 ? inputModalities : null,
-          cost_input: costInput ? parseNumber(costInput) : null,
-          cost_output: costOutput ? parseNumber(costOutput) : null,
-          cost_cache_read: costCacheRead ? parseNumber(costCacheRead) : null,
-          cost_cache_write: costCacheWrite ? parseNumber(costCacheWrite) : null,
+          ...(costInput !== '' &&
+          (parseNumber(costInput) !== model!.cost_input ||
+            configuredPrice(model!, 'cost_input') === null)
+            ? { cost_input: parseNumber(costInput) }
+            : {}),
+          ...(costOutput !== '' &&
+          (parseNumber(costOutput) !== model!.cost_output ||
+            configuredPrice(model!, 'cost_output') === null)
+            ? { cost_output: parseNumber(costOutput) }
+            : {}),
+          ...(costCacheRead !== '' &&
+          (parseNumber(costCacheRead) !== model!.cost_cache_read ||
+            configuredPrice(model!, 'cost_cache_read') === null)
+            ? { cost_cache_read: parseNumber(costCacheRead) }
+            : {}),
+          ...(costCacheWrite !== '' &&
+          (parseNumber(costCacheWrite) !== model!.cost_cache_write ||
+            configuredPrice(model!, 'cost_cache_write') === null)
+            ? { cost_cache_write: parseNumber(costCacheWrite) }
+            : {}),
           context_window: contextWindow ? parseNumber(contextWindow) : null,
           max_tokens: maxTokens ? parseNumber(maxTokens) : null,
+        }
+        const capability = capabilityChange()
+        if (capability !== undefined) body.capability = capability
+        for (const field of [
+          'display_name',
+          'reasoning',
+          'input_modalities',
+          'context_window',
+          'max_tokens',
+        ] as const) {
+          if (JSON.stringify(body[field]) === JSON.stringify(model![field])) delete body[field]
         }
         await onSave(body)
       } else {
@@ -110,13 +180,15 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
           display_name: displayName,
           reasoning,
           input_modalities: inputModalities,
-          cost_input: parseNumber(costInput),
-          cost_output: parseNumber(costOutput),
-          cost_cache_read: parseNumber(costCacheRead),
-          cost_cache_write: parseNumber(costCacheWrite),
+          ...(costInput !== '' ? { cost_input: parseNumber(costInput) } : {}),
+          ...(costOutput !== '' ? { cost_output: parseNumber(costOutput) } : {}),
+          ...(costCacheRead !== '' ? { cost_cache_read: parseNumber(costCacheRead) } : {}),
+          ...(costCacheWrite !== '' ? { cost_cache_write: parseNumber(costCacheWrite) } : {}),
           context_window: parseNumber(contextWindow),
           max_tokens: parseNumber(maxTokens),
         }
+        const capability = capabilityChange()
+        if (capability) body.capability = capability
         await onSave(body)
       }
     } catch (e) {
@@ -210,6 +282,37 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
               </div>
             </div>
 
+            <div className="flex flex-col gap-1.5">
+              <Label>{t('modelCapability')}</Label>
+              <p className="text-xs text-muted-foreground">
+                {inheritsCapability ? t('capabilityInherited') : t('capabilityCustom')}
+              </p>
+              <CapabilityEditor
+                key={capabilityKey}
+                inputId="model-capability-json"
+                value={capabilityDraft}
+                onChange={(value) => {
+                  setCapabilityDraft(value)
+                  const sameAsProvider =
+                    JSON.stringify(value) === JSON.stringify(providerCapability)
+                  setInheritsCapability(sameAsProvider)
+                }}
+                onValidityChange={setCapabilityValid}
+                allowTemplate
+              />
+              {!inheritsCapability && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="self-start"
+                  onClick={useProviderCapability}
+                >
+                  {t('useProviderCapability')}
+                </Button>
+              )}
+            </div>
+
             <Accordion className="mt-1" multiple defaultValue={['costs', 'limits']}>
               <AccordionItem value="costs">
                 <AccordionTrigger className="text-xs text-muted-foreground">
@@ -227,7 +330,7 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
                         step="any"
                         value={costInput}
                         onChange={(e) => setCostInput(e.target.value)}
-                        placeholder="0"
+                        placeholder={t('priceUnknown')}
                       />
                     </div>
                     <div className="flex flex-col gap-1">
@@ -240,7 +343,7 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
                         step="any"
                         value={costOutput}
                         onChange={(e) => setCostOutput(e.target.value)}
-                        placeholder="0"
+                        placeholder={t('priceUnknown')}
                       />
                     </div>
                     <div className="flex flex-col gap-1">
@@ -253,7 +356,7 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
                         step="any"
                         value={costCacheRead}
                         onChange={(e) => setCostCacheRead(e.target.value)}
-                        placeholder="0"
+                        placeholder={t('priceUnknown')}
                       />
                     </div>
                     <div className="flex flex-col gap-1">
@@ -266,7 +369,7 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
                         step="any"
                         value={costCacheWrite}
                         onChange={(e) => setCostCacheWrite(e.target.value)}
-                        placeholder="0"
+                        placeholder={t('priceUnknown')}
                       />
                     </div>
                   </div>
@@ -328,7 +431,7 @@ export function ModelFormDialog({ open, onOpenChange, model, onSave }: ModelForm
               type="button"
               size="sm"
               onClick={() => void handleSave()}
-              disabled={saving || !modelId}
+              disabled={saving || !modelId || !capabilityValid}
             >
               {saving ? t('saving') : t('save')}
             </Button>

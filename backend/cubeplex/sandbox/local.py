@@ -1,11 +1,74 @@
 """Local sandbox using asyncio subprocesses — for dev/debug only."""
 
 import asyncio
+import inspect
 import os
+import signal
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from cubeplex.sandbox.base import BrowserEndpoint, ExecuteResult, Sandbox
+from loguru import logger
+
+from cubeplex.sandbox.base import (
+    BrowserEndpoint,
+    ExecuteResult,
+    ProcessHandle,
+    ProcessOutput,
+    ProcessSnapshot,
+    Sandbox,
+    SandboxError,
+)
+
+
+class _LocalBgProc:
+    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+        self.proc = proc
+        self.killed = False
+        self.pump_task: asyncio.Task[None] | None = None
+        self._buf = bytearray()
+        self._base_cursor = 0
+        self._lock = asyncio.Lock()
+
+    async def pump(self) -> None:
+        assert self.proc.stdout is not None
+        while True:
+            data = await self.proc.stdout.read(4096)
+            if not data:
+                break
+            async with self._lock:
+                self._buf.extend(data)
+
+    async def read_from(self, cursor: int) -> tuple[str, int]:
+        async with self._lock:
+            end_cursor = self._base_cursor + len(self._buf)
+            if cursor < self._base_cursor or cursor > end_cursor:
+                raise SandboxError("local process output cursor is invalid")
+            confirmed = cursor - self._base_cursor
+            if confirmed:
+                del self._buf[:confirmed]
+                self._base_cursor = cursor
+            text = bytes(self._buf).decode(errors="replace")
+            return text, self._base_cursor + len(self._buf)
+
+    async def acknowledge(self, cursor: int) -> None:
+        async with self._lock:
+            end_cursor = self._base_cursor + len(self._buf)
+            if cursor < self._base_cursor or cursor > end_cursor:
+                raise SandboxError("local process output cursor is invalid")
+            confirmed = cursor - self._base_cursor
+            if confirmed:
+                del self._buf[:confirmed]
+                self._base_cursor = cursor
+
+
+def _emit_chunk(on_chunk: Callable[[str], None] | None, text: str) -> None:
+    if on_chunk is None or not text:
+        return
+    try:
+        on_chunk(text)
+    except Exception:
+        logger.exception("LocalSandbox on_chunk failed")
 
 
 class LocalSandbox(Sandbox):
@@ -17,6 +80,7 @@ class LocalSandbox(Sandbox):
     def __init__(self, *, workdir: str | None = None) -> None:
         self._id = str(uuid.uuid4())
         self._workdir = workdir or os.getcwd()
+        self._bg: dict[str, _LocalBgProc] = {}
 
     @property
     def id(self) -> str:
@@ -33,6 +97,7 @@ class LocalSandbox(Sandbox):
         timeout: int | None = None,
         envs: dict[str, str] | None = None,
         as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> ExecuteResult:
         # envs/as_root accepted for interface compatibility but not applied:
         # LocalSandbox runs in the host process environment and is not used
@@ -44,17 +109,136 @@ class LocalSandbox(Sandbox):
             stderr=asyncio.subprocess.STDOUT,
             cwd=self._workdir,
         )
+        chunks: list[str] = []
+
+        async def _pump() -> None:
+            assert proc.stdout is not None
+            while True:
+                data = await proc.stdout.read(4096)
+                if not data:
+                    break
+                text = data.decode(errors="replace")
+                chunks.append(text)
+                _emit_chunk(on_chunk, text)
+
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            await asyncio.wait_for(_pump(), timeout=timeout)
+            await proc.wait()
         except TimeoutError:
             proc.kill()
-            await proc.communicate()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
             return ExecuteResult(output="[timeout]", exit_code=-1)
 
         return ExecuteResult(
-            output=stdout.decode(errors="replace"),
+            output="".join(chunks),
             exit_code=proc.returncode,
         )
+
+    def supports_background(self) -> bool:
+        return True
+
+    async def observe(self, handle: ProcessHandle) -> ProcessSnapshot:
+        rec = self._bg.get(handle.provider_ref)
+        if rec is None:
+            raise SandboxError("local process reference is not available on this worker")
+        code = rec.proc.returncode
+        if code is None:
+            return ProcessSnapshot(status="running")
+        return ProcessSnapshot(
+            status="killed" if rec.killed and code < 0 else "exited", exit_code=code
+        )
+
+    async def start(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        provider_timeout: bool = False,
+        envs: dict[str, str] | None = None,
+        as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
+    ) -> ProcessHandle:
+        del timeout, provider_timeout, envs, as_root, on_chunk
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=self._workdir,
+            start_new_session=True,
+        )
+        rec = _LocalBgProc(proc)
+        ref = str(id(rec))
+        self._bg[ref] = rec
+        rec.pump_task = asyncio.create_task(rec.pump())
+        if on_started is not None:
+            maybe = on_started(ref)
+            if inspect.isawaitable(maybe):
+                await maybe
+        return ProcessHandle(command_id="", provider_ref=ref)
+
+    async def poll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        status = await self.observe(handle)
+        output = await self.read_output(handle)
+        return ProcessSnapshot(
+            status=status.status,
+            exit_code=status.exit_code,
+            new_output=output.new_output,
+            log_cursor=output.log_cursor,
+        )
+
+    async def read_output(self, handle: ProcessHandle) -> ProcessOutput:
+        rec = self._bg.get(handle.provider_ref)
+        if rec is None:
+            raise SandboxError("local process reference is not available on this worker")
+        code = rec.proc.returncode
+        if code is not None and rec.pump_task is not None:
+            await rec.pump_task
+        try:
+            cursor = int(handle.log_cursor) if handle.log_cursor is not None else 0
+        except ValueError as exc:
+            raise SandboxError("local process output cursor is invalid") from exc
+        new_output, next_cursor = await rec.read_from(cursor)
+        return ProcessOutput(new_output=new_output, log_cursor=str(next_cursor))
+
+    async def acknowledge_output(self, handle: ProcessHandle, cursor: str) -> None:
+        rec = self._bg.get(handle.provider_ref)
+        if rec is None:
+            raise SandboxError("local process reference is not available on this worker")
+        try:
+            parsed_cursor = int(cursor)
+        except ValueError as exc:
+            raise SandboxError("local process output cursor is invalid") from exc
+        await rec.acknowledge(parsed_cursor)
+        handle.log_cursor = cursor
+
+    async def kill(self, handle: ProcessHandle) -> None:
+        rec = self._bg.get(handle.provider_ref)
+        if rec is None:
+            raise SandboxError("local process reference is not available on this worker")
+        if rec.proc.returncode is not None:
+            return
+        pid = rec.proc.pid
+        if pid is not None:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                rec.killed = True
+            except ProcessLookupError:
+                try:
+                    rec.proc.kill()
+                    rec.killed = True
+                except ProcessLookupError:
+                    pass
+        else:
+            try:
+                rec.proc.kill()
+                rec.killed = True
+            except ProcessLookupError:
+                pass
+        await rec.proc.wait()
 
     async def upload(self, files: list[tuple[str, bytes]]) -> None:
         for path, content in files:

@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import ClassVar
 
-from sqlalchemy import Column, DateTime, Index, String, Text
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Index, String, Text
 from sqlmodel import Field
 
 from cubeplex.models.mixins import CubeplexBase, OrgScopedMixin, org_scope_index
@@ -40,6 +40,12 @@ class SteeringMessage(CubeplexBase, OrgScopedMixin, table=True):
             "created_at",
             "id",
         ),
+        Index(
+            "uq_steering_messages_conversation_notice_id",
+            "conversation_id",
+            "notice_id",
+            unique=True,
+        ),
     )
 
     conversation_id: str = Field(
@@ -48,11 +54,28 @@ class SteeringMessage(CubeplexBase, OrgScopedMixin, table=True):
         ondelete="CASCADE",
     )
     run_id: str = Field(max_length=64)
+    source_kind: str = Field(
+        default="user_message", max_length=32, sa_column_kwargs={"server_default": "user_message"}
+    )
+    execution_generation: int = Field(
+        default=0, sa_column=Column(BigInteger, nullable=False, server_default="0")
+    )
+    notice_id: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(20),
+            ForeignKey(
+                "background_task_events.id",
+                name="steering_messages_notice_id_fkey",
+            ),
+            nullable=True,
+        ),
+    )
     client_steer_id: str = Field(max_length=64)
     content: str = Field(sa_column=Column(Text, nullable=False))
     sender_user_id: str = Field(foreign_key="users.id", max_length=20)
     sender_display_name: str | None = Field(default=None, max_length=255)
-    hitl_question_id: str = Field(max_length=128)
+    hitl_question_id: str | None = Field(default=None, max_length=128)
     state: SteeringMessageState = Field(
         default=SteeringMessageState.queued,
         sa_column=Column(

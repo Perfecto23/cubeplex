@@ -7,9 +7,11 @@ from cubeplex.models.api_key import ApiKey
 from cubeplex.models.artifact import Artifact
 from cubeplex.models.artifact_version import ArtifactVersion
 from cubeplex.models.attachment import Attachment
+from cubeplex.models.background_task import BackgroundTask, BackgroundTaskEvent
 from cubeplex.models.billing import BillingEvent, LlmBillingEvent
 from cubeplex.models.conversation import Conversation
 from cubeplex.models.conversation_chunk import ConversationChunk
+from cubeplex.models.conversation_execution import ConversationExecutionAdmission
 from cubeplex.models.conversation_participant import ConversationParticipant
 from cubeplex.models.conversation_share import ConversationShare, ShareScope
 from cubeplex.models.credential import Credential
@@ -46,6 +48,8 @@ from cubeplex.models.organization import Organization
 from cubeplex.models.organization_membership import OrganizationMembership, OrgRole
 from cubeplex.models.presented_file import PresentedFile
 from cubeplex.models.provider import Model, Provider
+from cubeplex.models.provider_creation_receipt import ProviderCreationReceipt
+from cubeplex.models.sandbox_command import SandboxCommand, SandboxCommandWake
 from cubeplex.models.sandbox_env import SandboxEnvVar  # noqa: F401
 from cubeplex.models.sandbox_policy import SandboxPolicy  # noqa: F401
 from cubeplex.models.scheduled_task import ScheduledTask, ScheduledTaskRun
@@ -76,9 +80,12 @@ __all__ = [
     "Artifact",
     "ArtifactVersion",
     "Attachment",
+    "BackgroundTask",
+    "BackgroundTaskEvent",
     "BillingEvent",
     "Conversation",
     "ConversationChunk",
+    "ConversationExecutionAdmission",
     "ConversationParticipant",
     "ConversationShare",
     "Credential",
@@ -114,9 +121,12 @@ __all__ = [
     "OrganizationMembership",
     "PresentedFile",
     "Provider",
+    "ProviderCreationReceipt",
     "Role",
     "EgressRef",
     "SandboxEnvVar",
+    "SandboxCommand",
+    "SandboxCommandWake",
     "SandboxPolicy",
     "ScheduledTask",
     "ScheduledTaskRun",

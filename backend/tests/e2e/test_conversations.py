@@ -17,6 +17,7 @@ from tests.e2e.conftest import (
     DEFAULT_TEST_EMAIL,
     DEFAULT_WS_ID,
     _ensure_default_user_and_membership,
+    web_message_request,
 )
 from tests.e2e.helpers import parse_sse_stream
 
@@ -102,7 +103,8 @@ class TestConversationsCRUD:
         conversation_id = create_resp.json()["id"]
 
         delete_resp = client.delete(f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}")
-        assert delete_resp.status_code == 204
+        assert delete_resp.status_code == 200
+        assert delete_resp.json() == {"deleted": True, "cleanup_pending": False}
 
         get_resp = client.get(f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}")
         assert get_resp.status_code == 404
@@ -155,7 +157,7 @@ class TestConversationsCRUD:
         event_id = asyncio.get_event_loop().run_until_complete(_seed_and_check())
 
         delete_resp = client.delete(f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}")
-        assert delete_resp.status_code == 204
+        assert delete_resp.status_code == 200
 
         # Conversation hidden from API
         assert (
@@ -217,7 +219,7 @@ class TestConversationsCRUD:
 
         # Soft-delete the parent
         del_resp = client.delete(f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}")
-        assert del_resp.status_code == 204
+        assert del_resp.status_code == 200
 
         # Every artifact endpoint now refuses the request
         for url in (
@@ -272,7 +274,7 @@ class TestSendMessage:
         async with async_client.stream(
             "POST",
             f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}/messages",
-            json={"content": "Say 'hello' in one word."},
+            json=web_message_request(content="Say 'hello' in one word."),
             headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
         ) as response:
             assert response.status_code == 200
@@ -296,7 +298,7 @@ class TestSendMessage:
         async with async_client.stream(
             "POST",
             f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}/messages",
-            json={"content": "What is 1+1?"},
+            json=web_message_request(content="What is 1+1?"),
             headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
         ) as response:
             assert response.status_code == 200
@@ -325,7 +327,7 @@ class TestSendMessage:
 
         response = await async_client.post(
             f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/{conversation_id}/messages",
-            json={"content": ""},
+            json=web_message_request(content=""),
         )
         assert response.status_code == 400
 
@@ -336,7 +338,7 @@ class TestSendMessage:
         """Sending to non-existent conversation returns 404."""
         response = await async_client.post(
             f"/api/v1/ws/{DEFAULT_WS_ID}/conversations/nonexistent-id/messages",
-            json={"content": "Hello"},
+            json=web_message_request(content="Hello"),
         )
         assert response.status_code == 404
 

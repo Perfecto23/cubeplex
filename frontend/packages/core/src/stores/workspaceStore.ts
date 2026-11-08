@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ApiClient } from '../api/client'
+import type { HardDeleteResult, LeaveWorkspaceResult } from '../api/execution'
 import {
   listWorkspaces,
   createWorkspace,
@@ -19,10 +20,10 @@ export interface WorkspaceStore {
   fetchList(client: ApiClient): Promise<void>
   create(client: ApiClient, name: string): Promise<Workspace>
   rename(client: ApiClient, wsId: string, name: string): Promise<void>
-  leave(client: ApiClient, wsId: string): Promise<void>
+  leave(client: ApiClient, wsId: string): Promise<LeaveWorkspaceResult>
   archive(client: ApiClient, wsId: string): Promise<void>
   unarchive(client: ApiClient, wsId: string): Promise<void>
-  deleteWs(client: ApiClient, wsId: string): Promise<void>
+  deleteWs(client: ApiClient, wsId: string): Promise<HardDeleteResult>
   reset(): void
 }
 
@@ -69,8 +70,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   async leave(client, wsId) {
-    await leaveWorkspace(client, wsId)
+    const result = await leaveWorkspace(client, wsId)
     set((s) => ({ workspaces: s.workspaces.filter((w) => w.id !== wsId) }))
+    return result
   },
 
   async archive(client, wsId) {
@@ -85,8 +87,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   async deleteWs(client, wsId) {
-    await deleteWorkspace(client, wsId)
-    set((s) => ({ workspaces: s.workspaces.filter((w) => w.id !== wsId) }))
+    const result = await deleteWorkspace(client, wsId)
+    if (result.deleted) {
+      set((s) => ({ workspaces: s.workspaces.filter((w) => w.id !== wsId) }))
+    }
+    return result
   },
 
   reset() {

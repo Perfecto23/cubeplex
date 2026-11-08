@@ -5,7 +5,7 @@ import { useTranslations } from 'next-intl'
 import { Loader2, Play, RotateCw } from 'lucide-react'
 import {
   parseTestStream,
-  setModelEnabled,
+  enableTestedModels,
   startTestStream,
   type ApiClient,
   type ProbeResult,
@@ -36,53 +36,72 @@ export function TestStep({ client, providerId, modelDbIds, modelLabels, onFinish
   const [done, setDone] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const started = useRef(false)
+  const [activeIds, setActiveIds] = useState<string[]>([])
+  const controller = useRef<AbortController | null>(null)
 
-  const run = useCallback(async () => {
-    setRunning(true)
-    setDone(false)
-    setError(null)
-    setLiveness(null)
-    setCards([])
-    try {
-      const stream = await startTestStream(client, providerId, modelDbIds)
-      for await (const e of parseTestStream(stream)) {
-        if (e.event === 'liveness') {
-          setLiveness(e.data as ProbeStep)
-        } else if (e.event === 'model') {
-          const data = e.data as ModelEventData
-          setCards((prev) => {
-            const next: ModelTestState = {
-              ...data,
-              display_name:
-                data.display_name ?? modelLabels?.[data.model_db_id] ?? data.model_db_id,
-            }
-            const idx = prev.findIndex((c) => c.model_db_id === data.model_db_id)
-            if (idx === -1) return [...prev, next]
-            const copy = [...prev]
-            copy[idx] = next
-            return copy
-          })
-        } else if (e.event === 'done') {
+  const run = useCallback(
+    async (ids = modelDbIds) => {
+      controller.current?.abort()
+      const attempt = new AbortController()
+      controller.current = attempt
+      setRunning(true)
+      setDone(false)
+      setError(null)
+      setLiveness(null)
+      setActiveIds(ids)
+      setCards((prev) => prev.filter((card) => !ids.includes(card.model_db_id)))
+      try {
+        const stream = await startTestStream(client, providerId, ids, attempt.signal)
+        for await (const e of parseTestStream(stream)) {
+          if (attempt.signal.aborted) break
+          if (e.event === 'liveness') {
+            setLiveness(e.data as ProbeStep)
+          } else if (e.event === 'model') {
+            const data = e.data as ModelEventData
+            setCards((prev) => {
+              const next: ModelTestState = {
+                ...data,
+                display_name:
+                  data.display_name ?? modelLabels?.[data.model_db_id] ?? data.model_db_id,
+              }
+              const idx = prev.findIndex((c) => c.model_db_id === data.model_db_id)
+              if (idx === -1) return [...prev, next]
+              const copy = [...prev]
+              copy[idx] = next
+              return copy
+            })
+          } else if (e.event === 'done') {
+            setDone(true)
+          }
+        }
+      } catch (err) {
+        if (!attempt.signal.aborted) setError((err as Error).message)
+      } finally {
+        if (controller.current === attempt) {
+          setRunning(false)
           setDone(true)
         }
       }
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setRunning(false)
-      setDone(true)
-    }
-  }, [client, providerId, modelDbIds, modelLabels])
+    },
+    [client, providerId, modelDbIds, modelLabels],
+  )
 
   useEffect(() => {
-    if (started.current) return
-    started.current = true
-    void run()
+    let disposed = false
+    queueMicrotask(() => {
+      if (!disposed) void run()
+    })
+    return () => {
+      disposed = true
+      controller.current?.abort()
+    }
   }, [run])
 
   const livenessOk = liveness?.status === 'pass' || liveness?.status === 'warn'
-  const usableModels = cards.filter((c) => c.overall === 'pass' || c.overall === 'warn')
+  const usableModels = cards.filter(
+    (c) =>
+      c.current !== false && !c.blocking_failed && (c.overall === 'pass' || c.overall === 'warn'),
+  )
   const canSave = livenessOk && usableModels.length > 0 && !running && !saving
 
   async function handleSave() {
@@ -90,8 +109,14 @@ export function TestStep({ client, providerId, modelDbIds, modelLabels, onFinish
     setSaving(true)
     setError(null)
     try {
-      for (const c of usableModels) {
-        await setModelEnabled(client, providerId, c.model_db_id, true)
+      for (let i = 0; i < usableModels.length; i += 100) {
+        const result = await enableTestedModels(
+          client,
+          providerId,
+          usableModels.slice(i, i + 100).map((c) => c.model_db_id),
+        )
+        const blocked = result.results.filter((r) => r.status === 'blocked')
+        if (blocked.length) throw new Error(blocked.map((r) => r.reason).join('; '))
       }
       onFinish()
     } catch (err) {
@@ -128,8 +153,28 @@ export function TestStep({ client, providerId, modelDbIds, modelLabels, onFinish
       <LivenessRow step={liveness} running={running} />
 
       <div className="flex flex-col gap-2">
+        {running &&
+          activeIds
+            .filter((id) => !cards.some((card) => card.model_db_id === id))
+            .map((id) => (
+              <div
+                key={id}
+                className="flex items-center gap-2 rounded-lg border border-border px-3 py-2.5"
+              >
+                <Loader2
+                  aria-hidden
+                  className="size-4 shrink-0 animate-spin text-muted-foreground"
+                />
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{modelLabels?.[id] ?? id}</p>
+                  <p role="status" className="text-xs text-muted-foreground">
+                    {livenessOk ? t('modelPending') : t('waitingLiveness')}
+                  </p>
+                </div>
+              </div>
+            ))}
         {cards.map((c) => (
-          <ModelTestCard key={c.model_db_id} state={c} onRetest={() => void run()} />
+          <ModelTestCard key={c.model_db_id} state={c} onRetest={() => void run([c.model_db_id])} />
         ))}
       </div>
 

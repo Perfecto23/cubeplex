@@ -213,7 +213,7 @@ async def test_invitee_can_see_and_send(
 
     msg_resp = await member_c.post(
         f"/api/v1/ws/{ws_id}/conversations/{conv_id}/messages",
-        json={"content": "hi from member"},
+        json={"client_message_id": "member-send", "content": "hi from member"},
     )
     assert msg_resp.status_code != 404, msg_resp.text
 
@@ -232,7 +232,7 @@ async def test_non_invitee_404s_on_send(
 
         msg_resp = await extra_c.post(
             f"/api/v1/ws/{ws_id}/conversations/{conv_id}/messages",
-            json={"content": "should fail"},
+            json={"client_message_id": "non-participant-send", "content": "should fail"},
         )
         assert msg_resp.status_code == 404, msg_resp.text
         assert extra_uid  # not part of the conv; silence unused warning
@@ -321,7 +321,7 @@ async def test_send_auto_joins_topic_participant(
 
         msg_resp = await member_c.post(
             f"/api/v1/ws/{ws_id}/conversations/{conv_id}/messages",
-            json={"content": "hi"},
+            json={"client_message_id": "removed-member-send", "content": "hi"},
         )
         assert msg_resp.status_code != 404, msg_resp.text
 
@@ -376,7 +376,7 @@ async def test_topic_participant_cannot_answer_hitl_until_they_send(
     assert isinstance(body.get("detail"), str), body
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_p_conv_can_answer_hitl_after_first_send(
     four_layer_admin_and_member: FourLayerFixture,
 ) -> None:
@@ -396,7 +396,7 @@ async def test_p_conv_can_answer_hitl_after_first_send(
     # First send -> auto-join.
     msg_resp = await member_c.post(
         f"/api/v1/ws/{ws_id}/conversations/{conv_id}/messages",
-        json={"content": "join via send"},
+        json={"client_message_id": "auto-join-send", "content": "join via send"},
     )
     assert msg_resp.status_code != 404, msg_resp.text
 
@@ -413,7 +413,7 @@ async def test_p_conv_can_answer_hitl_after_first_send(
     assert isinstance(detail, dict) and detail.get("code") == "no_pending", body
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_topic_participant_can_subscribe_sse_without_sending(
     four_layer_admin_and_member: FourLayerFixture,
 ) -> None:

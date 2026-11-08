@@ -1,8 +1,8 @@
 """Unit tests for the tools_cache fast path in cubeloop_runtime.
 
 The eager MCP loader now builds AgentTools from the install's persisted
-``tools_cache`` instead of a live ``initialize`` + ``tools/list`` round
-trip per send. These tests protect the two invariants that matter:
+``tools_cache`` instead of a live ``list_tools`` round trip per send.
+These tests protect the two invariants that matter:
 
 1. **Schema parity** — a cache-built tool must expose the same name,
    description, and parameter schema the live loader would produce from
@@ -61,7 +61,7 @@ def test_cache_built_tool_matches_live_loader_shape() -> None:
     """If the cache-built tool schema drifted from what the live loader
     produces for the same descriptor, the LLM tool payload (and the
     prompt-cache prefix) would differ between cache-hit and live sends."""
-    from cubeloop.mcp._adapter import make_mcp_agent_tool
+    from cubeloop.mcp import make_mcp_agent_tool
 
     entry = {
         "name": "get_weather",
@@ -160,32 +160,61 @@ def _unauthorized() -> BaseException:
 
 
 def _install_fake_session(monkeypatch: Any, opened_auth: list[str | None]) -> None:
-    """Fake cubeloop's ``_open_session``: 401 unless the fresh token is sent.
+    """Fake cubeloop's HTTP client: 401 unless the fresh token is sent.
 
-    Records the Authorization header of every session-open attempt.
+    Records the Authorization header of every client-open attempt.
     """
 
     @asynccontextmanager
-    async def fake_open_session(server_url: str, *, headers=None, timeout=None, transport=None):
+    async def fake_open_client(server_url: str, *, headers=None, timeout=None, transport=None):
         auth = (headers or {}).get("Authorization")
         opened_auth.append(auth)
         if auth != "Bearer fresh":
             raise _unauthorized()
 
-        class _Session:
-            async def initialize(self) -> None:
-                return None
-
+        class _Client:
             async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
                 return {"content": [{"type": "text", "text": "ok"}], "isError": False}
 
-        yield _Session(), lambda: None
+        yield _Client()
 
-    monkeypatch.setattr("cubeloop.mcp.http_loader._open_session", fake_open_session)
-    monkeypatch.setattr("cubeloop.mcp.http_loader._serialize_call_tool_response", lambda resp: resp)
+    monkeypatch.setattr("cubeplex.mcp.client.open_mcp_http_client", fake_open_client)
+    monkeypatch.setattr("cubeplex.mcp.client.serialize_mcp_call_tool_response", lambda resp: resp)
 
 
 _PING_CACHE = [{"name": "ping", "description": "", "input_schema": {"type": "object"}}]
+
+
+async def test_cache_tool_call_passes_headers_without_stamping_traceparent(
+    monkeypatch: Any,
+) -> None:
+    """cubeloop's opener stamps traceparent; CubePlex must not pre-inject it
+    (that would mutate the shared OAuth headers dict)."""
+    seen_headers: list[dict[str, str] | None] = []
+
+    @asynccontextmanager
+    async def fake_open_client(server_url: str, *, headers=None, timeout=None, transport=None):
+        del server_url, timeout, transport
+        seen_headers.append(headers)
+
+        class _Client:
+            async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+                del name, args
+                return {"content": [{"type": "text", "text": "ok"}], "isError": False}
+
+        yield _Client()
+
+    monkeypatch.setattr("cubeplex.mcp.client.open_mcp_http_client", fake_open_client)
+    monkeypatch.setattr("cubeplex.mcp.client.serialize_mcp_call_tool_response", lambda resp: resp)
+
+    headers = {"Authorization": "Bearer t"}
+    tools = _build_tools_from_cache(
+        spec=_make_spec(_PING_CACHE), headers=headers, server_url="https://mcp.example.com/mcp"
+    )
+    assert tools is not None
+    await tools[0].execute("tc-tp", {})
+    assert seen_headers == [{"Authorization": "Bearer t"}]
+    assert headers == {"Authorization": "Bearer t"}
 
 
 async def test_tool_call_401_refreshes_and_retries(monkeypatch: Any) -> None:

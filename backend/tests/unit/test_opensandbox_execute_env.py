@@ -13,8 +13,14 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.execd import RunCommandOpts
 
+from cubeplex.sandbox.base import (
+    ProcessHandle,
+    ProcessHandleNotFoundError,
+    SandboxInstanceGoneError,
+)
 from cubeplex.sandbox.opensandbox import OpenSandbox
 
 
@@ -37,6 +43,7 @@ def _make_backend(
         result.logs.stdout = []
         result.logs.stderr = []
         result.id = None
+        result.exit_code = 0
         return result
 
     raw.commands.run = fake_run
@@ -88,6 +95,46 @@ async def test_execute_forwards_timeout_to_run_opts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_forwards_timeout_to_provider() -> None:
+    backend, _ = _make_backend()
+
+    await backend.start("sleep 9", timeout=120, provider_timeout=True)
+
+    _, opts = backend._test_run_calls[0]  # type: ignore[attr-defined]
+    assert opts is not None
+    assert opts.background is True
+    assert opts.timeout is not None
+    assert opts.timeout.total_seconds() == 120
+
+
+@pytest.mark.asyncio
+async def test_start_keeps_main_agent_deadline_in_application() -> None:
+    backend, _ = _make_backend()
+
+    await backend.start("sleep 9", timeout=120)
+
+    _, opts = backend._test_run_calls[0]  # type: ignore[attr-defined]
+    assert opts is not None
+    assert opts.background is True
+    assert opts.timeout is None
+
+
+@pytest.mark.asyncio
+async def test_start_confirms_dead_sandbox_without_replaying_command() -> None:
+    backend, raw = _make_backend()
+    raw.commands.run = AsyncMock(
+        side_effect=SandboxApiException("sandbox unavailable", status_code=404)
+    )
+    raw.get_info = AsyncMock(return_value=MagicMock(status=MagicMock(state="Terminated")))
+
+    with pytest.raises(SandboxInstanceGoneError):
+        await backend.start("echo hello")
+
+    raw.commands.run.assert_awaited_once()
+    raw.get_info.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_execute_timeout_error_returns_marker() -> None:
     backend, raw = _make_backend()
 
@@ -114,6 +161,66 @@ async def test_execute_timeout_error_returns_marker() -> None:
     assert result.exit_code == -1
     raw.commands.interrupt.assert_awaited_once_with("cmd-timeout")
     raw.commands.get_command_status.assert_awaited_once_with("cmd-timeout")
+
+
+@pytest.mark.asyncio
+async def test_poll_prefers_persisted_handle_cursor_over_process_cache() -> None:
+    backend, raw = _make_backend()
+    raw.commands.get_command_status = AsyncMock(
+        return_value=MagicMock(running=True, exit_code=None)
+    )
+    raw.commands.get_background_command_logs = AsyncMock(
+        return_value=MagicMock(content="line", cursor=3)
+    )
+    backend._log_cursors["process-1"] = 9
+    handle = ProcessHandle(command_id="scmd-1", provider_ref="process-1", log_cursor="2")
+
+    snapshot = await backend.poll(handle)
+
+    assert snapshot.log_cursor == "3"
+    raw.commands.get_background_command_logs.assert_awaited_once_with("process-1", cursor=2)
+
+
+@pytest.mark.asyncio
+async def test_poll_preserves_provider_error_reason() -> None:
+    backend, raw = _make_backend()
+    raw.commands.get_command_status = AsyncMock(
+        return_value=MagicMock(running=False, exit_code=-9, error="command timed out")
+    )
+    raw.commands.get_background_command_logs = AsyncMock(
+        return_value=MagicMock(content="", cursor=0)
+    )
+
+    snapshot = await backend.poll(ProcessHandle(command_id="scmd-1", provider_ref="process-1"))
+
+    assert snapshot.status == "exited"
+    assert snapshot.error == "command timed out"
+
+
+@pytest.mark.asyncio
+async def test_poll_confirms_missing_sandbox_instance_after_provider_error() -> None:
+    backend, raw = _make_backend()
+    raw.commands.get_command_status = AsyncMock(
+        side_effect=SandboxApiException("process unavailable", status_code=404)
+    )
+    raw.get_info = AsyncMock(return_value=MagicMock(status=MagicMock(state="Terminated")))
+
+    with pytest.raises(SandboxInstanceGoneError):
+        await backend.poll(ProcessHandle(command_id="scmd-1", provider_ref="process-1"))
+
+    raw.get_info.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_poll_keeps_command_error_retryable_while_instance_runs() -> None:
+    backend, raw = _make_backend()
+    raw.commands.get_command_status = AsyncMock(
+        side_effect=SandboxApiException("process unavailable", status_code=404)
+    )
+    raw.get_info = AsyncMock(return_value=MagicMock(status=MagicMock(state="Running")))
+
+    with pytest.raises(ProcessHandleNotFoundError, match="process-1"):
+        await backend.poll(ProcessHandle(command_id="scmd-1", provider_ref="process-1"))
 
 
 @pytest.mark.asyncio
@@ -261,3 +368,81 @@ async def test_null_run_uid_skips_privilege_drop() -> None:
     assert opts is not None
     assert opts.uid is None
     assert opts.gid is None
+
+
+@pytest.mark.asyncio
+async def test_execute_foreground_returns_output_and_exit_code() -> None:
+    backend, raw = _make_backend()
+
+    async def fake_run_foreground(
+        command: str, *, opts: RunCommandOpts | None = None, handlers: object = None, **_: object
+    ) -> MagicMock:
+        backend._test_run_calls.append((command, opts))  # type: ignore[attr-defined]
+        if handlers is not None and hasattr(handlers, "on_stdout") and handlers.on_stdout:
+            await handlers.on_stdout(MagicMock(text="hello output\n"))
+        result = MagicMock()
+        result.id = "cmd-123"
+        result.exit_code = 0
+        return result
+
+    raw.commands.run = fake_run_foreground
+
+    res = await backend.execute("echo test")
+    assert res.output == "hello output\n"
+    assert res.exit_code == 0
+    _, opts = backend._test_run_calls[0]  # type: ignore[attr-defined]
+    assert opts is not None
+    assert opts.background is not True
+
+
+@pytest.mark.asyncio
+async def test_fast_aiter_sse_events_stops_on_execution_complete() -> None:
+    import httpx
+
+    from cubeplex.sandbox.opensandbox import _fast_aiter_sse_events
+
+    body = (
+        b'data: {"type": "init", "text": "cmd-1", "timestamp": 1}\n\n'
+        b'data: {"type": "stdout", "text": "line 1", "timestamp": 2}\n\n'
+        b'data: {"type": "execution_complete", "execution_time_in_millis": 5, "timestamp": 3}\n\n'
+        b'data: {"type": "stdout", "text": "should not be reached", "timestamp": 4}\n\n'
+    )
+
+    class AsyncStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield body
+
+    req = httpx.Request("POST", "http://test/command")
+    resp = httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, stream=AsyncStream(), request=req
+    )
+
+    collected = [e async for e in _fast_aiter_sse_events(resp)]
+    assert len(collected) == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_streams_chunks_via_handlers() -> None:
+    backend, raw = _make_backend()
+
+    chunks: list[str] = []
+
+    async def fake_run_stream(
+        command: str, *, opts: RunCommandOpts | None = None, handlers: object = None, **_: object
+    ) -> MagicMock:
+        backend._test_run_calls.append((command, opts))  # type: ignore[attr-defined]
+        if handlers is not None and hasattr(handlers, "on_stdout") and handlers.on_stdout:
+            msg = MagicMock(text="chunk 1")
+            await handlers.on_stdout(msg)
+            msg2 = MagicMock(text="chunk 2")
+            await handlers.on_stdout(msg2)
+        result = MagicMock()
+        result.id = "cmd-stream"
+        result.exit_code = 0
+        return result
+
+    raw.commands.run = fake_run_stream
+    res = await backend.execute("echo test", on_chunk=chunks.append)
+    assert res.output == "chunk 1chunk 2"
+    assert res.exit_code == 0
+    assert chunks == ["chunk 1", "chunk 2"]

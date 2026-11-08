@@ -12,14 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from loguru import logger
 
-from cubeplex.sandbox.base import ExecuteResult, Sandbox, SandboxError
+from cubeplex.sandbox.base import (
+    ExecuteResult,
+    ProcessHandle,
+    ProcessSnapshot,
+    Sandbox,
+    SandboxError,
+    SandboxInstanceGoneError,
+)
 from cubeplex.sandbox.sync_events import UserSandboxSyncEventService
 from cubeplex.sandbox.sync_result import SyncResult
 from cubeplex.skills.sandbox_paths import SKILLS_ROOT, safe_skill_name
@@ -244,6 +251,14 @@ class LazySandbox(Sandbox):
         """Whether the underlying sandbox has been created."""
         return self._sandbox is not None
 
+    @property
+    def user_sandbox_id(self) -> str | None:
+        return self._user_sandbox_id
+
+    async def ensure_created(self) -> None:
+        """Create/connect the underlying sandbox so ``user_sandbox_id`` is set."""
+        await self._ensure_with_retry()
+
     # ------------------------------------------------------------------
     # Internal: ensure a live sandbox exists
     # ------------------------------------------------------------------
@@ -452,11 +467,18 @@ class LazySandbox(Sandbox):
         timeout: int | None = None,
         envs: dict[str, str] | None = None,
         as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> ExecuteResult:
         sandbox = await self._ensure_with_retry()
         try:
             return await self._run_with_keepalive(
-                sandbox.execute(command, timeout=timeout, envs=envs, as_root=as_root),
+                sandbox.execute(
+                    command,
+                    timeout=timeout,
+                    envs=envs,
+                    as_root=as_root,
+                    on_chunk=on_chunk,
+                ),
             )
         except Exception:
             # Sandbox may have died — invalidate and retry once
@@ -468,8 +490,72 @@ class LazySandbox(Sandbox):
             sandbox = await self._ensure()
             await self._ensure_skills_synced(sandbox)
             return await self._run_with_keepalive(
-                sandbox.execute(command, timeout=timeout, envs=envs, as_root=as_root),
+                sandbox.execute(
+                    command,
+                    timeout=timeout,
+                    envs=envs,
+                    as_root=as_root,
+                    on_chunk=on_chunk,
+                ),
             )
+
+    def supports_background(self) -> bool:
+        # Concrete drivers used in production implement start/poll/kill.
+        # Do not return False before _ensure — the first background execute
+        # would be rejected on a fresh LazySandbox.
+        if self._sandbox is not None:
+            return self._sandbox.supports_background()
+        return True
+
+    async def run_with_backend(self, operation: Callable[[Sandbox], Awaitable[T]]) -> T:
+        sandbox = await self._ensure_with_retry()
+        try:
+            return await self._run_with_keepalive(operation(sandbox))
+        except SandboxInstanceGoneError:
+            async with self._lock:
+                if self._sandbox is sandbox:
+                    self._sandbox = None
+                    self._invalidate_skills_sync()
+                    self._user_sandbox_id = None
+            raise
+
+    async def observe(self, handle: ProcessHandle) -> ProcessSnapshot:
+        sandbox = await self._ensure_with_retry()
+        return await sandbox.observe(handle)
+
+    async def start(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        provider_timeout: bool = False,
+        envs: dict[str, str] | None = None,
+        as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
+    ) -> ProcessHandle:
+        sandbox = await self._ensure_with_retry()
+        return await sandbox.start(
+            command,
+            timeout=timeout,
+            provider_timeout=provider_timeout,
+            envs=envs,
+            as_root=as_root,
+            on_chunk=on_chunk,
+            on_started=on_started,
+        )
+
+    async def poll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        sandbox = await self._ensure_with_retry()
+        return await sandbox.poll(handle)
+
+    async def acknowledge_output(self, handle: ProcessHandle, cursor: str) -> None:
+        sandbox = await self._ensure_with_retry()
+        await sandbox.acknowledge_output(handle, cursor)
+
+    async def kill(self, handle: ProcessHandle) -> None:
+        sandbox = await self._ensure_with_retry()
+        await sandbox.kill(handle)
 
     async def upload(self, files: list[tuple[str, bytes]]) -> None:
         sandbox = await self._ensure_with_retry()
