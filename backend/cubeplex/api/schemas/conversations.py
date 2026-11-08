@@ -8,7 +8,44 @@ dict that conforms to :data:`PendingHitl`.
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class StopRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, max_length=64, pattern=r"^\S+$")
+
+
+class StopAllRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    execution_generation: int = Field(strict=True, ge=0)
+
+
+class ExecutionGenerationResponse(BaseModel):
+    execution_generation: int
+
+
+class AdmittedRunResponse(BaseModel):
+    run_id: str | None
+
+
+class StopRunResponse(BaseModel):
+    run_id: str
+    accepted: bool
+    cleanup_pending: bool
+
+
+class StopAllResponse(BaseModel):
+    execution_generation: int
+    accepted: bool
+    cleanup_pending: bool
+
+
+class DeleteConversationResponse(BaseModel):
+    deleted: bool
+    cleanup_pending: bool
 
 
 class InviteToGroupRequest(BaseModel):
@@ -28,6 +65,7 @@ class ConversationParticipantOut(BaseModel):
     email: str | None = None
     avatar_url: str | None = None
     avatar_seed: str | None = None
+    avatar_style: str | None = None
 
 
 class ListConversationParticipantsResponse(BaseModel):

@@ -34,7 +34,8 @@ message tail** (after the cache breakpoint), not the system prompt.
 ### Loaded skill instructions stay in tool history
 
 `load_skill` returns the full `SKILL.md` as its tool result. Do not copy loaded
-skill bodies into the system prompt or persistent agent extra state. The tool
+skill bodies into the system prompt or persistent agent extra state.
+`ToolResultLimitMiddleware` excludes `load_skill` so that body is not truncated. The tool
 result is replayed with conversation history while it remains in context, which
 preserves the earlier cacheable prefix instead of changing the system prompt at
 the load boundary. Compaction replaces an old skill body with only its canonical
@@ -54,6 +55,13 @@ On replay, `MemoryMiddleware` reads each historical user message's
 metadata and prepends the rendered snapshot text during
 `transform_context` — so the byte stream of past turns is reproduced
 exactly across subsequent requests.
+
+The run host restores checkpoint messages and extra together through
+`ExecutionSession.load_checkpoint` before prompt or respond execution. It then
+late-binds middleware to the Session's live `state_context`, not to the detached
+checkpoint copy. This preserves compaction, todo, deferred-tool, and pinned-memory
+writes across a resumed turn without reconstructing or reordering the prompt
+prefix. Do not restore messages and extra through separate private Agent fields.
 
 **Do not:**
 

@@ -94,7 +94,7 @@ def parse_invocation_payload(payload: Mapping[str, object]) -> AgentCoreInvocati
 
 def _context_payload(ctx: Any) -> dict[str, object]:
     """Serialize only the trusted RunContext fields needed by the worker."""
-    return {
+    payload: dict[str, object] = {
         "user_id": str(ctx.user_id),
         "org_id": str(ctx.org_id),
         "workspace_id": str(ctx.workspace_id),
@@ -107,6 +107,15 @@ def _context_payload(ctx: Any) -> dict[str, object]:
         "topic_creator_user_id": ctx.topic_creator_user_id,
         "conversation_creator_user_id": ctx.conversation_creator_user_id,
     }
+    execution = getattr(ctx, "execution", None)
+    if execution is not None:
+        payload["execution"] = {
+            "admission_id": execution.admission_id,
+            "generation": execution.execution_generation,
+            "start_token": execution.start_token,
+            "attempt_id": execution.attempt_id,
+        }
+    return payload
 
 
 def build_prompt_request(
@@ -194,6 +203,27 @@ async def create_dispatch(
     )
     dispatch.session_id = agentcore_session_id(dispatch.id)
     async with session_maker() as session:
+        context = request.get("context")
+        binding = context.get("execution") if isinstance(context, dict) else None
+        if isinstance(binding, dict):
+            from cubeplex.models.conversation_execution import ConversationExecutionAdmission
+
+            admission = await session.get(
+                ConversationExecutionAdmission, binding.get("admission_id"), with_for_update=True
+            )
+            if (
+                admission is None
+                or (admission.org_id, admission.workspace_id, admission.conversation_id)
+                != (scope.org_id, scope.workspace_id, scope.conversation_id)
+                or admission.actor_user_id != scope.user_id
+                or admission.run_id != scope.run_id
+                or admission.run_start_token != binding.get("start_token")
+                or admission.execution_generation != binding.get("generation")
+                or admission.run_finished_at is not None
+                or admission.run_stop_requested_at is not None
+                or admission.revoked_at is not None
+            ):
+                raise DispatchValidationError("agentcore_execution_admission_revoked")
         session.add(dispatch)
         try:
             await session.commit()

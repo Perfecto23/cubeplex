@@ -30,7 +30,10 @@ ENV PNPM_HOME=/pnpm \
 
 WORKDIR /app
 
-RUN corepack enable && corepack prepare pnpm@10.23.0 --activate \
+COPY frontend/package.json ./
+
+RUN corepack enable \
+    && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate \
     && if [ -n "${NPM_REGISTRY}" ]; then \
         npm config set registry "${NPM_REGISTRY}"; \
         pnpm config set registry "${NPM_REGISTRY}"; \
@@ -45,7 +48,7 @@ RUN pnpm install --frozen-lockfile
 COPY frontend/packages ./packages
 COPY frontend/scripts ./scripts
 
-RUN pnpm --filter @cubeplex/core build || true
+RUN pnpm --filter @cubeplex/core build
 RUN pnpm --filter web build
 
 

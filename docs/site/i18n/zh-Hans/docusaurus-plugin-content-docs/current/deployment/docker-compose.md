@@ -5,9 +5,11 @@ title: Docker Compose
 
 # 用 Docker Compose 部署 CubePlex
 
-`docker compose up -d` 在单台主机上部署 CubePlex（backend + frontend +
-Postgres + Redis + rustfs S3 存储 + OpenSandbox）。它使用和 Kubernetes 部署模式完全相同
-的容器镜像，只是编排方式不同。
+`docker compose -f compose.yaml -f compose.tempo.yaml up -d` 在单台主机上
+部署 CubePlex（backend + frontend + Postgres + Redis + rustfs S3 存储 +
+OpenSandbox + Tempo）。它使用和 Kubernetes 部署模式完全相同的容器镜像，只是
+编排方式不同。`scripts/up.sh` 会带上这两个文件，除非 `.env` 里
+`TEMPO_ENABLED=false`。
 
 ## 1. 前置依赖
 
@@ -29,7 +31,8 @@ Host
   └─ port :8000 → backend  (FastAPI / uvicorn) ◄────────────┘
                     ├─ 依赖 → postgres   (named volume)
                     ├─ 依赖 → redis      (named volume)
-                    └─ 依赖 → rustfs     (S3 存储, named volume)
+                    ├─ 依赖 → rustfs     (S3 存储, named volume)
+                    └─ tempo 在内部 `tracing` 网络（无 host 端口）
 
 启动引导服务（跑完即结束）：
   backend-migrate  alembic upgrade head（backend 启动前置条件）
@@ -38,7 +41,8 @@ Host
 
 所有服务间通信都走 Docker DNS（例如 backend 通过 `postgres:5432` 访问
 Postgres）。主机只暴露 frontend 端口（以及可选的 backend 端口，用于直接
-访问 API）。
+访问 API）。Tempo 不发布到主机；只有 backend 能在内部 `tracing` 网络访问
+`:3200` / `:4318`。
 
 ## 3. 选择镜像
 
@@ -50,7 +54,7 @@ ghcr.io/cubeplexai/cubeplex-frontend:<version>
 ```
 
 从[发布页](https://github.com/cubeplexai/cubeplex/releases)选一个版本 tag——
-backend 和 frontend 共用同一个应用版本，例如 `v0.7.2`——在下一步设为
+backend 和 frontend 共用同一个应用版本，例如 `v0.9.4`——在下一步设为
 `BACKEND_TAG` / `FRONTEND_TAG`。`IMAGE_REGISTRY` / `IMAGE_REPO` 已默认为
 `ghcr.io` / `cubeplexai`，标准安装无需改动。GHCR 发布镜像是公开的，无需
 `docker login`。
@@ -96,8 +100,8 @@ $EDITOR .env
 ```dotenv
 IMAGE_REGISTRY=ghcr.io
 IMAGE_REPO=cubeplexai
-BACKEND_TAG=v0.7.2        # 发布页上的一个版本 tag
-FRONTEND_TAG=v0.7.2
+BACKEND_TAG=v0.9.4        # 发布页上的一个版本 tag
+FRONTEND_TAG=v0.9.4
 
 # openssl rand -hex 16
 POSTGRES_PASSWORD=<...>
@@ -172,23 +176,49 @@ production:
 ## 5. 启动 / 停止 / 日志
 
 ```bash
-# 启动（同时会拉取最新的 tag）
+# 启动（同时会拉取最新的 tag；除非 TEMPO_ENABLED=false，否则包含 Tempo）
 deploy/docker-compose/scripts/up.sh
 
+# 等价的原始 compose（默认安装始终传两个文件）
+docker compose -f deploy/docker-compose/compose.yaml \
+  -f deploy/docker-compose/compose.tempo.yaml up -d
+
 # 查看日志
-docker compose -f deploy/docker-compose/compose.yaml logs -f backend
+docker compose -f deploy/docker-compose/compose.yaml \
+  -f deploy/docker-compose/compose.tempo.yaml logs -f backend
 
 # 停止并移除容器（保留数据卷）
-docker compose -f deploy/docker-compose/compose.yaml down
+docker compose -f deploy/docker-compose/compose.yaml \
+  -f deploy/docker-compose/compose.tempo.yaml down
 ```
 
 :::warning
-`docker compose -f deploy/docker-compose/compose.yaml down -v` 会停止并
-**删除数据卷**（Postgres 数据、rustfs 数据、Redis 数据）——这是破坏性操作，
-只在确实要清空部署时使用。
+`docker compose … down -v` 会停止并**删除数据卷**（Postgres 数据、rustfs
+数据、Redis 数据、Tempo 数据）——这是破坏性操作，只在确实要清空部署时使用。
 :::
 
 如果缺少 `.env`、任一 YAML 配置文件或 `config/opensandbox.toml`，`up.sh` 会拒绝启动。
+
+### 升级任务生命周期切换前的数据库 {#upgrading-a-database-from-before-the-task-lifecycle-cutover}
+
+正常启动的 `backend-migrate` 容器会拒绝直接迁移尚未完成任务生命周期切换的已有数据库。迁移期间必须停止所有旧版后端，避免它们继续创建命令或通知：
+
+```bash
+# 先设置新版 BACKEND_TAG，再停止此部署中的所有旧 API/worker。
+docker compose -f deploy/docker-compose/compose.yaml \
+  -f deploy/docker-compose/compose.tempo.yaml stop backend frontend
+
+# 同一进程持有数据库迁移锁，回填并验证数据，再应用最终约束。
+# 失败后可安全重试同一命令。
+docker compose -f deploy/docker-compose/compose.yaml \
+  -f deploy/docker-compose/compose.tempo.yaml run --rm backend-migrate \
+  python -m cubeplex.scripts.lifecycle_upgrade --maintenance
+
+# 正常启动会检查切换结果，再启动后端。
+deploy/docker-compose/scripts/up.sh
+```
+
+旧版后端仍在运行时，不得执行 `--maintenance`。如果迁移器报告仍在运行的旧版 run-lifetime 命令或 monitor，需等待它结束或明确停止。对于未记录原 sandbox 实例或执行方进程句柄的活跃命令，也需先处理或停止，再重试。迁移器不会猜测进程已结束，也不会把旧命令关联到替换后的 sandbox。
 
 ## 6. 验证
 
@@ -213,6 +243,23 @@ PROMPT="Say the word hello and nothing else." \
 
 两个脚本默认针对 `localhost`；用 `HOST`、`BACKEND_PORT`、`FRONTEND_PORT`
 覆盖以针对远程主机运行。
+
+### Prometheus 指标 {#prometheus-metrics}
+
+后端在映射的 `BACKEND_PORT`（默认 8000）上提供 `/metrics`。
+Compose 服务带有用于 Docker 服务发现的 `prometheus.io/*` 标签；
+仅有标签不会配置 Prometheus 抓取任务。同一 Compose 网络中的 Prometheus 容器可使用：
+
+```yaml
+scrape_configs:
+  - job_name: cubeplex-backend
+    static_configs:
+      - targets: ["backend:8000"]
+```
+
+在宿主机上用 `curl http://localhost:${BACKEND_PORT:-8000}/metrics` 验证。
+由于后端端口映射到宿主机，如果指标端点应仅供内部访问，请限制该端口的访问。
+指标名称与统计规则见[指标列表](./overview.md#metrics)。
 
 ## 7. 常见故障排查
 
@@ -302,7 +349,7 @@ $EDITOR config/opensandbox.toml          # 设置 api_key、eip/host_ip、execd_
 $EDITOR config/config.production.secrets.yaml
 #   sandbox:
 #     domain:  "opensandbox-server:8090"   # 这个 overlay 里的 Docker DNS 名称
-#     image:   "ghcr.io/cubeplexai/cubeplex-sandbox:v0.7.2"
+#     image:   "ghcr.io/cubeplexai/cubeplex-sandbox:v0.9.4"
 #     api_key: "<与 opensandbox.toml 中 [server].api_key 相同>"
 
 # 3. backend 非密钥配置（示例已启用 sandbox）
@@ -310,8 +357,7 @@ $EDITOR config/config.production.local.yaml
 #   sandbox:
 #     enabled: true
 #     secure_access: false       # docker runtime 会拒绝 secureAccess=True
-#     use_server_proxy: false    # OpenSandbox v0.1.x 会丢失代理 URL 的端口号，
-#                                # 改用直连主机映射端口
+#     use_server_proxy: false    # compose 通过主机映射端口访问沙箱
 
 # 4. 启动完整栈
 docker compose up -d
@@ -330,7 +376,7 @@ docker compose up -d
 ### 兼容性——Docker 模式 OpenSandbox 下的 CubePlex 功能
 
 Docker runtime 模式相比 Kubernetes 模式的 OpenSandbox 有一些实际限制。
-下表基于 `opensandbox-server v0.1.14`。
+compose 镜像钉在 `opensandbox/server:release-1.1.1`。
 
 **secure-access 开关：** Docker runtime 会对 `secureAccess=True` 返回
 HTTP 400——secured endpoint 是 Kubernetes ingress-gateway 的特性。
@@ -347,7 +393,7 @@ CubePlex 会发送 `secureAccess: false`，Docker runtime 就会接受请求。
 | **交互式终端面板**（聊天界面） | 可以——通过后端的面板反向代理转发 | 需要把 `api.public_url` 设成用户浏览器可达、且能转发 WebSocket 的后端 URL |
 | **实时浏览器面板**（Neko，聊天界面） | 可以——与终端走同一条面板代理 | 同样需要 `api.public_url` |
 | 密钥注入 / env 替换（`cbxref_…` 占位符） | – | ❌ 不可用。它需要后端的 mTLS 凭证交换监听器 + egress CA/客户端证书，这些由 Kubernetes chart 部署（`gen-egress-certs.sh` + egress webhook）。compose overlay 不包含这些，`sandbox.egress_exchange_host` 保持为空，所以注入被禁用。 |
-| server-proxy 模式（`use_server_proxy: true`） | – | OpenSandbox v0.1.x 在代理端点 URL 中会丢失端口号。保持 `use_server_proxy: false`（示例默认值），overlay 通过 `extra_hosts` 在 backend 和 opensandbox-server 上都配置 `host.docker.internal`，让它们能访问沙箱容器在主机上映射的 bridge 端口。 |
+| server-proxy 模式（`use_server_proxy: true`） | Kubernetes 上的 release-1.1.1 会把目标端口留在代理 URL 的路径里（`/proxy/<port>`）。已在本地 1.1.1 server 上核对过。 | compose 仍然设置 `use_server_proxy: false`。overlay 通过主机映射的 bridge 端口访问沙箱：`extra_hosts` 在 backend 和 opensandbox-server 上都配置了 `host.docker.internal`。 |
 | `pvc.claimName` 数据卷 | 可以——但被当作 Docker 命名卷处理 | 没有 CSI 特性，不支持 ReadWriteMany |
 | 暂停 / 恢复（`POST /sandboxes/{id}/pause` 等） | 调用 Docker 的 `pause`/`unpause`（cgroup freezer） | 没有落盘的 checkpoint——主机 Docker 重启后暂停状态会丢失。因此 CubePlex 默认 `pause_on_idle: false`。 |
 
@@ -397,6 +443,43 @@ docker compose -f compose.yaml down
 
 MITM CA 以及 server 拉起的沙箱容器会保留在主机 Docker 引擎上——它们不属于
 本项目的 compose 网络。可以用 `docker ps --filter "name=sandbox-"` 查看。
+
+## Tempo tracing（默认开启）
+
+`scripts/up.sh` 会启动 Grafana Tempo 3.0.3，除非 `.env` 里
+`TEMPO_ENABLED=false`。直接跑 `docker compose` 时必须带上两个文件：
+
+```bash
+docker compose -f compose.yaml -f compose.tempo.yaml up -d
+```
+
+Tempo 只加入内部 `tracing` 网络（backend 也加入；frontend、postgres、
+OpenSandbox 不加入）。默认文件没有 host 端口。Tempo 的查询 API 没有鉴权——
+这张内部网络就是控制面，不是租户隔离。保留 7 天。`record_content` 为
+false。磁盘 JSONL 关闭（`CUBEPLEX_TRACING__JSONL__ENABLED=false`）。
+
+admin `/admin/traces` 在 Tempo 被关掉或 `query_endpoint` 仍为 null 时返回
+503。
+
+关闭：不带 `compose.tempo.yaml`，或给 `up.sh` 设 `TEMPO_ENABLED=false`。
+这样 Tempo 容器和 `CUBEPLEX_TRACING__*` 环境变量一起消失，本地 yaml 里的
+`tracing.enabled: false` 不会被覆盖。
+
+自带 Tempo：关掉 overlay，然后在 `config.production.local.yaml` 里设置
+`tracing.otlp.endpoint` 和 `tracing.tempo.query_endpoint`。
+
+仅调试用的本机端口——不要当作默认安装：
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.tempo.yaml \
+  -f compose.tempo.publish.yaml \
+  up -d
+```
+
+这会绑定 `127.0.0.1:3200`。不要在默认 compose 文件的 `ports:` 列表上做可选
+端口插值。
 
 ## 可选：文档解析（docling-serve）
 

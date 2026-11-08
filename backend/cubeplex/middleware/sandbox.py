@@ -18,12 +18,17 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import inspect
 import re
 import shlex
+import time
 import unicodedata
 from collections import deque
-from collections.abc import Awaitable, Callable
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from cubeloop.agent.types import (
     AgentContext,
@@ -34,19 +39,37 @@ from cubeloop.agent.types import (
 )
 from cubeloop.hitl import HitlCancelled, HitlChannel, HitlTimedOut
 from cubeloop.middleware.base import Middleware
-from cubeloop.providers.base import TextContent
+from cubeloop.providers.base import (
+    AssistantMessage,
+    TextContent,
+    ToolResultMessage,
+    UserMessage,
+)
 from cubeloop.types import StructuredValue
+from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
+from cubeplex.config import MAX_COMMAND_TIMEOUT_SECONDS, get_command_default_timeout_seconds
+from cubeplex.models.background_task import TaskStopReason
+from cubeplex.models.public_id import PREFIX_SANDBOX_COMMAND, generate_public_id
 from cubeplex.parsers import ParseOptions
 from cubeplex.prompts.sandbox import SANDBOX_PROMPT_TEMPLATE
-from cubeplex.sandbox.base import Sandbox
+from cubeplex.sandbox.base import (
+    ProcessHandle,
+    ProcessHandleNotFoundError,
+    ProcessSnapshot,
+    Sandbox,
+    SandboxInstanceGoneError,
+)
+from cubeplex.sandbox.log_io import AppendOutputResult, append_output
 from cubeplex.sandbox_policy.rules import evaluate_command
+from cubeplex.services.background_task_lifecycle import LogState
 from cubeplex.services.sandbox_runtime_config import POLICY_DENY_NUDGE
 from cubeplex.tools.builtin.sandbox_config import (
     SandboxConfigLoader,
     create_sandbox_config_tool,
 )
+from cubeplex.utils.time import utc_isoformat
 
 # ---------------------------------------------------------------------------
 # Per-(workspace_id, conversation_id) ring buffer of commands the sandbox
@@ -109,11 +132,103 @@ def reset_executed_commands() -> None:
 
 # Agent-facing default. Drivers must honor this so a hung `gh` / network
 # call becomes a tool result the model can retry from, not a silent stall.
-DEFAULT_EXECUTE_TIMEOUT_SECONDS = 120
-MAX_EXECUTE_TIMEOUT_SECONDS = 1800
+# Match ToolResultLimitMiddleware so we spill before that rewrite.
+EXECUTE_RESULT_SPILL_CHARS = 20_000
+_EXECUTE_UPDATE_INTERVAL_SECONDS = 0.1
+_BACKGROUND_POLL_INTERVAL_SECONDS = 1.0
+_MISSING_PROCESS_GRACE_SECONDS = 5.0
+MAX_LIVE_BACKGROUND_COMMANDS = 8
+_COMMAND_LEASE_SECONDS = 15
+_TASK_OWNER_LEASE_SECONDS = 45
+AUTO_BACKGROUND_SECONDS = 60
+_BARE_SLEEP_RE = re.compile(r"^sleep(\s+\S+)?\s*$")
 
 
-class _ExecuteArgs(BaseModel):
+class _AutoBackgroundUnavailable(Exception):
+    """The command must use the foreground path because background slots are full."""
+
+
+@dataclass(frozen=True)
+class _ReservedCommand:
+    command_id: str
+    task_id: str
+    start_allowed: bool = True
+    log_path: str | None = None
+    deadline_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class _TaskCommandBinding:
+    task_id: str
+    owner_token: str
+    sandbox_instance_id: str
+
+
+def _bounded_execute_excerpt(text: str, *, suffix: str = "") -> str:
+    """Head+tail excerpt that still fits in ToolResultLimitMiddleware.
+
+    ``suffix`` (spill path, truncated marker) is included in the 20k budget
+    so after_tool_call cannot strip the tail or the path.
+    """
+    budget = EXECUTE_RESULT_SPILL_CHARS - len(suffix)
+    if budget < 64:
+        budget = 64
+    if len(text) <= budget:
+        return text + suffix
+    omitted = len(text)
+    marker = f"\n\n[... {omitted} chars omitted ...]\n\n"
+    keep_total = budget - len(marker)
+    if keep_total < 2:
+        return (text[:budget] + suffix)[:EXECUTE_RESULT_SPILL_CHARS]
+    keep = keep_total // 2
+    omitted = len(text) - 2 * keep
+    marker = f"\n\n[... {omitted} chars omitted ...]\n\n"
+    body = f"{text[:keep]}{marker}{text[-keep:]}"
+    out = body + suffix
+    if len(out) > EXECUTE_RESULT_SPILL_CHARS:
+        return out[:EXECUTE_RESULT_SPILL_CHARS]
+    return out
+
+
+class _StreamingExcerpt:
+    """Keep a bounded command preview while the full output is written to a log."""
+
+    def __init__(self) -> None:
+        self._total = 0
+        self._full: str | None = ""
+        self._head = ""
+        self._tail = ""
+
+    def append(self, text: str) -> None:
+        self._total += len(text)
+        half = EXECUTE_RESULT_SPILL_CHARS // 2
+        self._head += text[: max(0, half - len(self._head))]
+        self._tail = (self._tail + text)[-half:]
+        if self._full is not None:
+            self._full = self._full + text if self._total <= EXECUTE_RESULT_SPILL_CHARS else None
+
+    @property
+    def truncated(self) -> bool:
+        return self._full is None
+
+    @property
+    def full_text(self) -> str | None:
+        return self._full
+
+    def render(self, *, suffix: str = "") -> str:
+        budget = EXECUTE_RESULT_SPILL_CHARS - len(suffix)
+        if self._full is not None:
+            return _bounded_execute_excerpt(self._full, suffix=suffix)
+        marker = f"\n\n[... {self._total} chars total ...]\n\n"
+        keep = max(0, (budget - len(marker)) // 2)
+        omitted = max(0, self._total - 2 * keep)
+        marker = f"\n\n[... {omitted} chars omitted ...]\n\n"
+        keep = max(0, (budget - len(marker)) // 2)
+        tail = self._tail[-keep:] if keep else ""
+        return self._head[:keep] + marker + tail + suffix
+
+
+class _ForegroundExecuteArgs(BaseModel):
     description: str = Field(
         description=(
             "Short, user-facing summary of what this command does (5-10 words). "
@@ -125,10 +240,28 @@ class _ExecuteArgs(BaseModel):
     timeout_seconds: int | None = Field(
         default=None,
         ge=1,
-        le=MAX_EXECUTE_TIMEOUT_SECONDS,
+        le=MAX_COMMAND_TIMEOUT_SECONDS,
         description=(
-            "Seconds before the command is killed. Default 120. "
-            "Raise this for installs, downloads, or builds (max 1800)."
+            "Seconds before the command is killed. The deployment default is one hour. "
+            "Raise or lower it when the task has a different execution deadline."
+        ),
+    )
+
+
+class _ExecuteArgs(_ForegroundExecuteArgs):
+    background: bool = Field(
+        default=False,
+        description=(
+            "If true, start the command and return a command_id immediately. "
+            "Even when false, a long command may move to a background task after "
+            "60 seconds. Bare sleep commands stay in the foreground. Do not use shell &."
+        ),
+    )
+    notify_on_complete: bool = Field(
+        default=True,
+        description=(
+            "Send one completion notice when an explicit or automatic background task "
+            "exits. Keep true for installs and builds; use false only for long-lived servers."
         ),
     )
 
@@ -221,9 +354,70 @@ def _is_timeout_result(output: str, exit_code: int | None) -> bool:
     return exit_code == -1 and output.strip().startswith("[timeout]")
 
 
-def _is_timeout_error(exc: BaseException) -> bool:
+def _is_timeout_error(exc: BaseException | str) -> bool:
     text = str(exc).lower()
     return "timeout" in text or "timed out" in text
+
+
+def _is_provider_timeout_status(error: str) -> bool:
+    text = error.lower()
+    return any(term in text for term in ("timeout", "timed out", "deadline", "time limit"))
+
+
+_SHELL_BG_RE = re.compile(r"(^|\s)(nohup|disown)(\s|$)|&\s*$")
+
+
+def _looks_like_shell_background(command: str) -> bool:
+    return _SHELL_BG_RE.search(command.strip()) is not None
+
+
+def _is_bare_sleep(command: str) -> bool:
+    """True for `sleep` / `sleep 30`, not `sleep 5 && make`."""
+    return _BARE_SLEEP_RE.match(command.strip()) is not None
+
+
+def _background_wait_guidance(task_id: str | None, notify_on_complete: bool) -> str:
+    if not notify_on_complete:
+        return ""
+    if task_id is None:
+        return " Completion notice pending; do not start polling commands."
+    return (
+        " Result pending. Continue independent work. When remaining work depends "
+        "on this task, use write_todos with "
+        f'wait_for_tasks=["{task_id}"] only if you already have unfinished todos '
+        "and write_todos is available. "
+        "Do not create a todo solely to wait. Otherwise report the pending task ID "
+        "to your caller or the user. End this turn normally when no independent "
+        "work remains; do not start polling commands."
+    )
+
+
+async def _maybe_await(result: Any) -> Any:
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _write_sandbox_log(sandbox: Sandbox, path: str, data: bytes) -> AppendOutputResult:
+    return await append_output(sandbox, path, data)
+
+
+async def _append_sandbox_log(sandbox: Sandbox, path: str, text: str) -> AppendOutputResult:
+    if not text:
+        return AppendOutputResult(data_written=True, cleanup_done=True)
+    return await append_output(sandbox, path, text)
+
+
+async def _append_snapshot_output(
+    sandbox: Sandbox,
+    path: str,
+    snapshot: ProcessSnapshot,
+) -> AppendOutputResult:
+    if snapshot.new_output:
+        return await _append_sandbox_log(sandbox, path, snapshot.new_output)
+    if snapshot.status != "running":
+        return await _write_sandbox_log(sandbox, path, b"")
+    return AppendOutputResult(data_written=True, cleanup_done=True)
 
 
 def _make_execute_tool(
@@ -231,6 +425,27 @@ def _make_execute_tool(
     *,
     workspace_id: str | None = None,
     conversation_id: str | None = None,
+    live: dict[str, tuple[ProcessHandle, bool]] | None = None,
+    live_lock: asyncio.Lock | None = None,
+    persist_reserve: Callable[..., Awaitable[bool | _ReservedCommand]] | None = None,
+    persist_running: Callable[[str, str], Awaitable[None]] | None = None,
+    persist_cursor: Callable[[str, str], Awaitable[None]] | None = None,
+    persist_killed: Callable[[str], Awaitable[None]] | None = None,
+    persist_start_failed: Callable[[str, str], Awaitable[None]] | None = None,
+    persist_exited: Callable[[str, int | None, bool], Awaitable[None]] | None = None,
+    persist_discard: Callable[[str], Awaitable[None]] | None = None,
+    persist_foreground: Callable[[str, ProcessSnapshot, bool], Awaitable[None]] | None = None,
+    persist_background_terminal: (
+        Callable[[str, ProcessSnapshot, bool, bool], Awaitable[None]] | None
+    ) = None,
+    persist_timed_out: (
+        Callable[[str, bool, ProcessSnapshot, bool], Awaitable[None]] | None
+    ) = None,
+    load_persisted_status: Callable[[str], Awaitable[str | None]] | None = None,
+    deadline_tasks: dict[str, asyncio.Task[None]] | None = None,
+    on_live: Callable[[], None] | None = None,
+    handoff: Callable[[str], Awaitable[bool]] | None = None,
+    auto_background: bool = True,
 ) -> AgentTool[_ExecuteArgs]:
     """Build the execute cubeloop.AgentTool backed by a sandbox instance.
 
@@ -238,6 +453,24 @@ def _make_execute_tool(
     ``SandboxMiddleware.before_tool_call`` — the tool body itself is a pure
     executor.
     """
+    live_commands = live if live is not None else {}
+    timeout_tasks = deadline_tasks if deadline_tasks is not None else {}
+    lock = live_lock if live_lock is not None else asyncio.Lock()
+
+    async def _ack_snapshot_output(
+        command_id: str,
+        handle: ProcessHandle,
+        log_path: str,
+        snapshot: ProcessSnapshot,
+    ) -> bool:
+        appended = await _append_snapshot_output(sandbox, log_path, snapshot)
+        if not appended.data_written:
+            return False
+        if snapshot.log_cursor is not None:
+            if persist_cursor is not None:
+                await persist_cursor(command_id, snapshot.log_cursor)
+            await sandbox.acknowledge_output(handle, snapshot.log_cursor)
+        return True
 
     async def _execute(
         tool_call_id: str,
@@ -246,39 +479,631 @@ def _make_execute_tool(
         signal: asyncio.Event | None = None,
         on_update: Callable[[StructuredValue], None] | None = None,
     ) -> AgentToolResult:
-        del tool_call_id, signal, on_update
+        del signal
 
-        timeout = (
-            args.timeout_seconds
-            if args.timeout_seconds is not None
-            else DEFAULT_EXECUTE_TIMEOUT_SECONDS
-        )
-        try:
-            result = await sandbox.execute(args.command, timeout=timeout)
-        except TimeoutError:
+        timeout = args.timeout_seconds or get_command_default_timeout_seconds()
+        background_timeout = timeout
+
+        def _schedule_deadline(
+            command_id: str,
+            handle: ProcessHandle,
+            log_path: str,
+            *,
+            kill_at: float,
+        ) -> None:
+            async def _enforce_deadline() -> None:
+                await asyncio.sleep(max(0.0, kill_at - time.monotonic()))
+                try:
+                    async with lock:
+                        current = live_commands.get(command_id)
+                        if current is None or current[0] is not handle:
+                            return
+                        deadline_snapshot = await sandbox.poll(handle)
+                        logs_confirmed = await _ack_snapshot_output(
+                            command_id,
+                            handle,
+                            log_path,
+                            deadline_snapshot,
+                        )
+                        if deadline_snapshot.status != "running":
+                            live_commands.pop(command_id, None)
+                            if persist_background_terminal is not None:
+                                await persist_background_terminal(
+                                    command_id,
+                                    deadline_snapshot,
+                                    logs_confirmed,
+                                    current[1],
+                                )
+                            elif (
+                                deadline_snapshot.status == "killed" and persist_killed is not None
+                            ):
+                                await persist_killed(command_id)
+                            elif persist_exited is not None:
+                                await persist_exited(
+                                    command_id,
+                                    deadline_snapshot.exit_code,
+                                    current[1],
+                                )
+                            return
+                        await sandbox.kill(handle)
+                        confirmed = await sandbox.poll(handle)
+                        logs_confirmed = await _ack_snapshot_output(
+                            command_id,
+                            handle,
+                            log_path,
+                            confirmed,
+                        )
+                        if confirmed.status == "running":
+                            logger.warning(
+                                "sandbox command {} still running after deadline interrupt",
+                                command_id,
+                            )
+                            return
+                        if persist_timed_out is not None:
+                            await persist_timed_out(
+                                command_id,
+                                current[1],
+                                confirmed,
+                                logs_confirmed,
+                            )
+                except Exception:
+                    logger.exception(
+                        "failed to enforce sandbox command deadline {}",
+                        command_id,
+                    )
+
+            task = asyncio.create_task(_enforce_deadline())
+            timeout_tasks[command_id] = task
+            task.add_done_callback(lambda _task: timeout_tasks.pop(command_id, None))
+
+        if _looks_like_shell_background(args.command):
             return AgentToolResult(
-                content=[TextContent(text=_timeout_tool_message(timeout))],
+                content=[
+                    TextContent(
+                        text=(
+                            "Do not background with shell &, nohup, or disown. "
+                            "Pass background=true instead."
+                        )
+                    )
+                ],
                 is_error=True,
             )
-        except Exception as exc:
-            if _is_timeout_error(exc):
+        if args.background:
+            if not sandbox.supports_background():
+                return AgentToolResult(
+                    content=[TextContent(text="This sandbox cannot run background commands.")],
+                    is_error=True,
+                )
+            command_id = generate_public_id(PREFIX_SANDBOX_COMMAND)
+            log_path = f"{sandbox.workdir.rstrip('/')}/.cubeplex/execute-{command_id}.log"
+            deadline_at = cast(
+                datetime | None,
+                datetime.now(UTC) + timedelta(seconds=background_timeout)
+                if background_timeout is not None
+                else None,
+            )
+            explicit_reservation: bool | _ReservedCommand = False
+            explicit_task_id: str | None = None
+            async with lock:
+                if persist_reserve is not None:
+                    try:
+                        explicit_reservation = await persist_reserve(
+                            command_id=command_id,
+                            tool_call_id=tool_call_id,
+                            command=args.command,
+                            description=args.description,
+                            notify_on_complete=args.notify_on_complete,
+                            log_path=log_path,
+                            timeout_seconds=background_timeout,
+                            monitor_deadline_at=deadline_at,
+                        )
+                    except Exception as exc:
+                        from cubeplex.repositories.sandbox_command import (
+                            SandboxCommandCapError,
+                        )
+
+                        if isinstance(exc, SandboxCommandCapError):
+                            return AgentToolResult(
+                                content=[TextContent(text=str(exc))],
+                                is_error=True,
+                            )
+                        logger.exception("sandbox command reserve failed")
+                        return AgentToolResult(
+                            content=[TextContent(text="failed to reserve background command")],
+                            is_error=True,
+                        )
+                if isinstance(explicit_reservation, _ReservedCommand):
+                    command_id = explicit_reservation.command_id
+                    explicit_task_id = explicit_reservation.task_id
+                    log_path = explicit_reservation.log_path or log_path
+                    deadline_at = explicit_reservation.deadline_at
+                    if not explicit_reservation.start_allowed:
+                        return AgentToolResult(
+                            content=[
+                                TextContent(
+                                    text=(
+                                        f"Command is already managed in background as {command_id}."
+                                    )
+                                )
+                            ],
+                            details={
+                                "status": "running",
+                                "task_id": explicit_task_id,
+                                "command_id": command_id,
+                                "log_path": log_path,
+                                "deadline_at": (
+                                    utc_isoformat(deadline_at) if deadline_at is not None else None
+                                ),
+                                "notification": ("once" if args.notify_on_complete else "none"),
+                                "result_pending": True,
+                            },
+                        )
+                if not explicit_reservation and len(live_commands) >= MAX_LIVE_BACKGROUND_COMMANDS:
+                    return AgentToolResult(
+                        content=[TextContent(text="at most 8 running commands per sandbox")],
+                        is_error=True,
+                    )
+                persist_error: BaseException | None = None
+
+                async def _on_started(ref: str) -> None:
+                    nonlocal persist_error
+                    if persist_running is None:
+                        return
+                    try:
+                        await persist_running(command_id, ref)
+                    except Exception as exc:
+                        persist_error = exc
+                        logger.exception("sandbox command mark_running failed")
+
+                try:
+                    handle = await sandbox.start(
+                        args.command,
+                        timeout=background_timeout,
+                        on_started=_on_started,
+                    )
+                except Exception:
+                    if explicit_reservation and persist_start_failed is not None:
+                        await persist_start_failed(command_id, "provider start failed")
+                    elif explicit_reservation and persist_killed is not None:
+                        await persist_killed(command_id)
+                    raise
+                handle.command_id = command_id
+                handle.deadline_at = deadline_at
+                if persist_error is not None:
+                    await sandbox.kill(handle)
+                    if persist_start_failed is not None:
+                        await persist_start_failed(
+                            command_id,
+                            "provider start receipt persistence failed",
+                        )
+                    elif persist_killed is not None:
+                        await persist_killed(command_id)
+                    return AgentToolResult(
+                        content=[TextContent(text="failed to persist background command")],
+                        is_error=True,
+                    )
+                live_commands[command_id] = (handle, args.notify_on_complete)
+            await _write_sandbox_log(sandbox, log_path, b"")
+            handed_off = handoff is not None and await handoff(command_id)
+            if not handed_off and on_live is not None:
+                on_live()
+            if not handed_off and background_timeout is not None:
+                _schedule_deadline(
+                    command_id,
+                    handle,
+                    log_path,
+                    kill_at=time.monotonic() + background_timeout,
+                )
+            notice = (
+                (
+                    f"Task {explicit_task_id} is running as command {command_id}."
+                    if explicit_task_id is not None
+                    else f"Command running in background as {command_id}."
+                )
+                if args.notify_on_complete
+                else f"Command {command_id} is running without a completion notice."
+            )
+            notice += _background_wait_guidance(explicit_task_id, args.notify_on_complete)
+            return AgentToolResult(
+                content=[TextContent(text=notice)],
+                details={
+                    "status": "running",
+                    **({"task_id": explicit_task_id} if explicit_task_id is not None else {}),
+                    "command_id": command_id,
+                    "log_path": log_path,
+                    "deadline_at": (
+                        utc_isoformat(deadline_at) if deadline_at is not None else None
+                    ),
+                    "notification": "once" if args.notify_on_complete else "none",
+                    "result_pending": True,
+                },
+            )
+        pieces: list[str] = []
+        displayed_unconfirmed_output = ""
+        pending: list[asyncio.Task[None]] = []
+        last_emit = 0.0
+        trail_task: asyncio.Task[None] | None = None
+
+        def _schedule_update(text: str) -> None:
+            if on_update is None:
+                return
+            payload = AgentToolResult(
+                content=[TextContent(text=text)],
+                details={"status": "running"},
+            )
+            try:
+                maybe = on_update(payload)
+            except Exception:
+                logger.exception("execute on_update failed")
+                return
+            if inspect.isawaitable(maybe):
+
+                async def _await_update(aw: Awaitable[object] = maybe) -> None:
+                    await asyncio.shield(aw)
+
+                pending.append(asyncio.create_task(_await_update()))
+
+        def _emit_snapshot() -> None:
+            _schedule_update(_bounded_execute_excerpt("".join(pieces)))
+
+        def _cancel_trail() -> None:
+            nonlocal trail_task
+            if trail_task is not None and not trail_task.done():
+                trail_task.cancel()
+            trail_task = None
+
+        def _on_chunk(text: str) -> None:
+            nonlocal last_emit, trail_task
+            if not text:
+                return
+            pieces.append(text)
+            now = time.monotonic()
+            remaining = _EXECUTE_UPDATE_INTERVAL_SECONDS - (now - last_emit)
+            if remaining > 0:
+
+                async def _trail() -> None:
+                    nonlocal last_emit
+                    await asyncio.sleep(remaining)
+                    last_emit = time.monotonic()
+                    _emit_snapshot()
+
+                if trail_task is None or trail_task.done():
+                    trail_task = asyncio.create_task(_trail())
+                return
+            _cancel_trail()
+            last_emit = now
+            _emit_snapshot()
+
+        def _on_snapshot_output(snapshot: ProcessSnapshot) -> None:
+            nonlocal displayed_unconfirmed_output
+            output = snapshot.new_output
+            if not output:
+                return
+            unseen = output
+            if displayed_unconfirmed_output and output.startswith(displayed_unconfirmed_output):
+                unseen = output[len(displayed_unconfirmed_output) :]
+            displayed_unconfirmed_output = output
+            _on_chunk(unseen)
+
+        async def _drain_updates() -> None:
+            _cancel_trail()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+                pending.clear()
+
+        try:
+            try:
+                if (
+                    auto_background
+                    and not _is_bare_sleep(args.command)
+                    and sandbox.supports_background() is True
+                ):
+                    command_id = generate_public_id(PREFIX_SANDBOX_COMMAND)
+                    log_path = f"{sandbox.workdir.rstrip('/')}/.cubeplex/execute-{command_id}.log"
+                    deadline_at = cast(
+                        datetime | None,
+                        datetime.now(UTC) + timedelta(seconds=background_timeout)
+                        if background_timeout is not None
+                        else None,
+                    )
+                    auto_reservation: bool | _ReservedCommand = False
+                    auto_task_id: str | None = None
+                    auto_persist_error: BaseException | None = None
+
+                    async def _on_started_auto(ref: str) -> None:
+                        nonlocal auto_persist_error
+                        if persist_running is None:
+                            return
+                        try:
+                            await persist_running(command_id, ref)
+                        except Exception as exc:
+                            auto_persist_error = exc
+
+                    async with lock:
+                        if persist_reserve is not None:
+                            try:
+                                auto_reservation = await persist_reserve(
+                                    command_id=command_id,
+                                    tool_call_id=tool_call_id,
+                                    command=args.command,
+                                    description=args.description,
+                                    notify_on_complete=args.notify_on_complete,
+                                    log_path=log_path,
+                                    timeout_seconds=background_timeout,
+                                    monitor_deadline_at=deadline_at,
+                                )
+                            except Exception as exc:
+                                from cubeplex.repositories.sandbox_command import (
+                                    SandboxCommandCapError,
+                                )
+
+                                if isinstance(exc, SandboxCommandCapError):
+                                    raise _AutoBackgroundUnavailable from exc
+                                logger.exception("sandbox command reserve failed")
+                                return AgentToolResult(
+                                    content=[
+                                        TextContent(text="failed to reserve background command")
+                                    ],
+                                    is_error=True,
+                                )
+                        if isinstance(auto_reservation, _ReservedCommand):
+                            command_id = auto_reservation.command_id
+                            auto_task_id = auto_reservation.task_id
+                            log_path = auto_reservation.log_path or log_path
+                            deadline_at = auto_reservation.deadline_at
+                            if not auto_reservation.start_allowed:
+                                return AgentToolResult(
+                                    content=[
+                                        TextContent(
+                                            text=(
+                                                f"Command is already managed in background as "
+                                                f"{command_id}."
+                                            )
+                                        )
+                                    ],
+                                    details={
+                                        "status": "running",
+                                        "task_id": auto_task_id,
+                                        "command_id": command_id,
+                                        "log_path": log_path,
+                                        "deadline_at": (
+                                            utc_isoformat(deadline_at)
+                                            if deadline_at is not None
+                                            else None
+                                        ),
+                                        "notification": (
+                                            "once" if args.notify_on_complete else "none"
+                                        ),
+                                        "result_pending": True,
+                                    },
+                                )
+                        if (
+                            not auto_reservation
+                            and len(live_commands) >= MAX_LIVE_BACKGROUND_COMMANDS
+                        ):
+                            raise _AutoBackgroundUnavailable
+                        try:
+                            handle = await sandbox.start(
+                                args.command,
+                                timeout=background_timeout,
+                                on_started=_on_started_auto,
+                            )
+                        except Exception:
+                            if auto_reservation and persist_start_failed is not None:
+                                await persist_start_failed(command_id, "provider start failed")
+                            elif auto_reservation and persist_killed is not None:
+                                await persist_killed(command_id)
+                            raise
+                        handle.command_id = command_id
+                        handle.deadline_at = deadline_at
+                        if auto_persist_error is not None:
+                            await sandbox.kill(handle)
+                            if persist_start_failed is not None:
+                                await persist_start_failed(
+                                    command_id,
+                                    "provider start receipt persistence failed",
+                                )
+                            elif persist_killed is not None:
+                                await persist_killed(command_id)
+                            return AgentToolResult(
+                                content=[TextContent(text="failed to persist background command")],
+                                is_error=True,
+                            )
+                        live_commands[command_id] = (handle, args.notify_on_complete)
+                    if on_live is not None:
+                        on_live()
+                    bg_deadline = time.monotonic() + AUTO_BACKGROUND_SECONDS
+                    kill_at = (
+                        time.monotonic() + background_timeout
+                        if background_timeout is not None
+                        else None
+                    )
+                    while True:
+                        snap = await sandbox.poll(handle)
+                        _on_snapshot_output(snap)
+                        logs_confirmed = await _ack_snapshot_output(
+                            command_id,
+                            handle,
+                            log_path,
+                            snap,
+                        )
+                        if logs_confirmed:
+                            displayed_unconfirmed_output = ""
+                        if snap.status != "running":
+                            durable_status = (
+                                await load_persisted_status(command_id)
+                                if load_persisted_status is not None
+                                else None
+                            )
+                            if durable_status == "killed":
+                                snap.status = "killed"
+                            live_commands.pop(command_id, None)
+                            if snap.status == "killed" and persist_killed is not None:
+                                await persist_killed(command_id)
+                            elif persist_foreground is not None:
+                                await persist_foreground(command_id, snap, logs_confirmed)
+                            elif persist_discard is not None:
+                                await persist_discard(command_id)
+                            if snap.status == "killed":
+                                output = "".join(pieces)
+                                suffix = "\n[killed by user]" if output else "[killed by user]"
+                                return AgentToolResult(
+                                    content=[TextContent(text=output + suffix)],
+                                    details={"status": "killed"},
+                                    is_error=True,
+                                )
+                            if snap.exit_code is not None and snap.exit_code != 0:
+                                pieces.append(
+                                    f"\n[exit code: {snap.exit_code}]"
+                                    if snap.exit_code not in (None, 0)
+                                    else ""
+                                )
+                            output = "".join(pieces)
+                            if len(output) > EXECUTE_RESULT_SPILL_CHARS:
+                                suffix = f"\n\n[truncated] full output written to {log_path}"
+                                output = _bounded_execute_excerpt(output, suffix=suffix)
+                            if workspace_id is not None and conversation_id is not None:
+                                if snap.exit_code == 0:
+                                    _record_executed(workspace_id, conversation_id, args.command)
+                            return AgentToolResult(
+                                content=[TextContent(text=output)],
+                                details={"status": "exited"},
+                            )
+                        now = time.monotonic()
+                        if kill_at is not None and now >= kill_at:
+                            await sandbox.kill(handle)
+                            confirmed = await sandbox.poll(handle)
+                            confirmed_logs = await _ack_snapshot_output(
+                                command_id,
+                                handle,
+                                log_path,
+                                confirmed,
+                            )
+                            if confirmed.status == "running":
+                                return AgentToolResult(
+                                    content=[
+                                        TextContent(
+                                            text=(
+                                                f"Command exceeded {timeout}s, but termination "
+                                                "could not be confirmed."
+                                            )
+                                        )
+                                    ],
+                                    details={"status": "running", "command_id": command_id},
+                                    is_error=True,
+                                )
+                            live_commands.pop(command_id, None)
+                            if persist_timed_out is not None:
+                                await persist_timed_out(
+                                    command_id,
+                                    args.notify_on_complete,
+                                    confirmed,
+                                    confirmed_logs,
+                                )
+                            elif persist_killed is not None:
+                                await persist_killed(command_id)
+                            return AgentToolResult(
+                                content=[TextContent(text=_timeout_tool_message(timeout))],
+                                is_error=True,
+                            )
+                        if now >= bg_deadline:
+                            handed_off = handoff is not None and await handoff(command_id)
+                            if handoff is not None and not handed_off:
+                                bg_deadline = now + _BACKGROUND_POLL_INTERVAL_SECONDS
+                                continue
+                            await _write_sandbox_log(sandbox, log_path, b"")
+                            if handoff is None and kill_at is not None:
+                                _schedule_deadline(
+                                    command_id,
+                                    handle,
+                                    log_path,
+                                    kill_at=kill_at,
+                                )
+                            notice = (
+                                f"Task {auto_task_id} is still running as command {command_id}."
+                                if auto_task_id is not None
+                                else (
+                                    f"Command still running; continuing in background as "
+                                    f"{command_id}."
+                                )
+                            )
+                            notice += _background_wait_guidance(
+                                auto_task_id, args.notify_on_complete
+                            )
+                            return AgentToolResult(
+                                content=[TextContent(text=notice)],
+                                details={
+                                    "status": "running",
+                                    **(
+                                        {"task_id": auto_task_id}
+                                        if auto_task_id is not None
+                                        else {}
+                                    ),
+                                    "command_id": command_id,
+                                    "log_path": log_path,
+                                    "deadline_at": (
+                                        utc_isoformat(deadline_at)
+                                        if deadline_at is not None
+                                        else None
+                                    ),
+                                    "notification": ("once" if args.notify_on_complete else "none"),
+                                    "result_pending": True,
+                                },
+                            )
+                        until_background = max(0.0, bg_deadline - now)
+                        until_timeout = (
+                            max(0.0, kill_at - now) if kill_at is not None else until_background
+                        )
+                        await asyncio.sleep(
+                            min(
+                                _BACKGROUND_POLL_INTERVAL_SECONDS,
+                                until_background,
+                                until_timeout,
+                            )
+                        )
+
+                result = await sandbox.execute(args.command, timeout=timeout, on_chunk=_on_chunk)
+            except _AutoBackgroundUnavailable:
+                result = await sandbox.execute(args.command, timeout=timeout, on_chunk=_on_chunk)
+            except TimeoutError:
                 return AgentToolResult(
                     content=[TextContent(text=_timeout_tool_message(timeout))],
                     is_error=True,
                 )
-            raise
+            except Exception as exc:
+                if _is_timeout_error(exc):
+                    return AgentToolResult(
+                        content=[TextContent(text=_timeout_tool_message(timeout))],
+                        is_error=True,
+                    )
+                raise
 
-        if _is_timeout_result(result.output, result.exit_code):
+            if _is_timeout_result(result.output, result.exit_code):
+                return AgentToolResult(
+                    content=[TextContent(text=_timeout_tool_message(timeout))],
+                    is_error=True,
+                )
+            if workspace_id is not None and conversation_id is not None and result.exit_code == 0:
+                _record_executed(workspace_id, conversation_id, args.command)
+            output = result.output
+            if result.exit_code is not None and result.exit_code != 0:
+                output += f"\n[exit code: {result.exit_code}]"
+            if len(output) > EXECUTE_RESULT_SPILL_CHARS:
+                safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", tool_call_id)[:80] or "tool"
+                spill_path = f"{sandbox.workdir.rstrip('/')}/.cubeplex/execute-{safe_id}.log"
+                try:
+                    await sandbox.upload([(spill_path, output.encode())])
+                    suffix = f"\n\n[truncated] full output written to {spill_path}"
+                except Exception:
+                    logger.exception("execute spill upload failed")
+                    suffix = "\n\n[truncated]"
+                output = _bounded_execute_excerpt(output, suffix=suffix)
             return AgentToolResult(
-                content=[TextContent(text=_timeout_tool_message(timeout))],
-                is_error=True,
+                content=[TextContent(text=output)],
+                details={"status": "exited"},
             )
-        if workspace_id is not None and conversation_id is not None and result.exit_code == 0:
-            _record_executed(workspace_id, conversation_id, args.command)
-        output = result.output
-        if result.exit_code is not None and result.exit_code != 0:
-            output += f"\n[exit code: {result.exit_code}]"
-        return AgentToolResult(content=[TextContent(text=output)])
+        finally:
+            await _drain_updates()
 
     return AgentTool(
         name="execute",
@@ -286,12 +1111,630 @@ def _make_execute_tool(
             "Execute a shell command in the sandbox environment. "
             "Always set description first (a 5-10 word user-facing summary) "
             "so the chat UI can show it while the command is still streaming. "
-            "Default timeout is 120 seconds. For installs, downloads, or "
-            "builds, pass timeout_seconds (max 1800). If you hit the limit, "
+            "After 60 seconds, a long command may continue in the background; "
+            "bare sleep stays in the foreground. "
+            "A running result with a task_id is pending. A handed-off task with "
+            "notification=once sends a completion notice with its final result. "
+            "The default execution deadline is one hour. For installs, downloads, or "
+            "builds, pass timeout_seconds when they need a different deadline. "
+            "If you hit the limit, "
             "raise timeout_seconds or split the work and retry."
         ),
         parameters=_ExecuteArgs,
         execute=_execute,
+    )
+
+
+def _make_foreground_execute_tool(
+    sandbox: Sandbox,
+    *,
+    workspace_id: str | None = None,
+    conversation_id: str | None = None,
+) -> AgentTool[_ForegroundExecuteArgs]:
+    direct = _make_execute_tool(
+        sandbox,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        auto_background=False,
+    )
+
+    async def _run_polled(
+        driver: Sandbox,
+        args: _ForegroundExecuteArgs,
+        on_update: Callable[[StructuredValue], None] | None,
+    ) -> AgentToolResult:
+        timeout = args.timeout_seconds or get_command_default_timeout_seconds()
+        command_id = generate_public_id(PREFIX_SANDBOX_COMMAND)
+        handle: ProcessHandle | None = None
+        started_ref: str | None = None
+
+        def on_started(ref: str) -> None:
+            nonlocal started_ref
+            started_ref = ref
+
+        async def stop_and_confirm() -> bool:
+            nonlocal handle
+            if handle is None and started_ref is not None:
+                handle = ProcessHandle(command_id=command_id, provider_ref=started_ref)
+            if handle is None:
+                return False
+            interrupted = False
+            try:
+                await asyncio.wait_for(driver.kill(handle), timeout=10)
+                interrupted = True
+            except Exception:
+                logger.exception("failed to stop foreground sandbox command {}", command_id)
+            try:
+                async with asyncio.timeout(3):
+                    while True:
+                        status = await driver.observe(handle)
+                        if status.status != "running":
+                            return True
+                        if not interrupted:
+                            return False
+                        await asyncio.sleep(0.25)
+            except Exception:
+                logger.exception("could not confirm foreground command stopped {}", command_id)
+            return False
+
+        excerpt = _StreamingExcerpt()
+        finished = False
+        stop_attempted = False
+
+        async def accept_snapshot(
+            snapshot: ProcessSnapshot, *, terminal_recheck: bool = False
+        ) -> None:
+            assert handle is not None
+            progress: str | None = None
+            if snapshot.new_output and (
+                snapshot.log_cursor is None or snapshot.log_cursor != handle.log_cursor
+            ):
+                excerpt.append(snapshot.new_output)
+                progress = excerpt.render()
+            if snapshot.log_cursor is not None and snapshot.log_cursor != handle.log_cursor:
+                handle.log_cursor = snapshot.log_cursor
+                if not terminal_recheck:
+                    await asyncio.wait_for(
+                        driver.acknowledge_output(handle, snapshot.log_cursor),
+                        timeout=remaining(),
+                    )
+            if progress is not None and on_update is not None:
+                try:
+                    maybe = on_update(
+                        AgentToolResult(
+                            content=[TextContent(text=progress)],
+                            details={"status": "running"},
+                        )
+                    )
+                    if inspect.isawaitable(maybe):
+                        await asyncio.wait_for(maybe, timeout=remaining())
+                except Exception:
+                    logger.exception("foreground execute on_update failed")
+
+        async def completed_result(snapshot: ProcessSnapshot) -> AgentToolResult:
+            nonlocal finished
+            finished = True
+            if snapshot.error and _is_provider_timeout_status(snapshot.error):
+                return AgentToolResult(
+                    content=[TextContent(text=_timeout_tool_message(timeout))],
+                    details={"status": "timed_out"},
+                    is_error=True,
+                )
+            error_suffix = ""
+            if snapshot.error:
+                error = snapshot.error[:1000]
+                if len(snapshot.error) > 1000:
+                    error += "..."
+                error_suffix = f"\n[provider error: {error}]"
+            if snapshot.status == "killed":
+                return AgentToolResult(
+                    content=[TextContent(text="[killed]" + error_suffix)],
+                    details={"status": "killed"},
+                    is_error=True,
+                )
+            if snapshot.exit_code == 0 and not snapshot.error and workspace_id and conversation_id:
+                _record_executed(workspace_id, conversation_id, args.command)
+            suffix = (
+                f"\n[exit code: {snapshot.exit_code}]"
+                if snapshot.exit_code not in (None, 0)
+                else ""
+            )
+            suffix += error_suffix
+            full = excerpt.full_text
+            if excerpt.truncated or len(full or "") + len(suffix) > EXECUTE_RESULT_SPILL_CHARS:
+                suffix += "\n\n[truncated] full output unavailable"
+            return AgentToolResult(
+                content=[TextContent(text=excerpt.render(suffix=suffix))],
+                details={"status": "exited"},
+                is_error=bool(snapshot.error),
+            )
+
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        try:
+            handle = await asyncio.wait_for(
+                driver.start(
+                    args.command,
+                    timeout=timeout,
+                    provider_timeout=True,
+                    on_started=on_started,
+                ),
+                timeout=remaining(),
+            )
+            handle.command_id = command_id
+            poll_failure_logged = False
+            missing_since: float | None = None
+            while True:
+                if remaining() <= 0:
+                    raise TimeoutError
+                try:
+                    snapshot = await asyncio.wait_for(driver.poll(handle), timeout=remaining())
+                except SandboxInstanceGoneError:
+                    raise
+                except ProcessHandleNotFoundError:
+                    now = time.monotonic()
+                    if missing_since is None:
+                        missing_since = now
+                    if now - missing_since >= _MISSING_PROCESS_GRACE_SECONDS:
+                        raise
+                    await asyncio.sleep(min(_BACKGROUND_POLL_INTERVAL_SECONDS, remaining()))
+                    continue
+                except Exception as exc:
+                    if remaining() <= 0:
+                        raise TimeoutError from exc
+                    if not poll_failure_logged:
+                        logger.warning(
+                            "retrying foreground sandbox command {} after poll failure: {}",
+                            command_id,
+                            exc,
+                        )
+                        poll_failure_logged = True
+                    await asyncio.sleep(min(_BACKGROUND_POLL_INTERVAL_SECONDS, remaining()))
+                    continue
+                poll_failure_logged = False
+                missing_since = None
+                await accept_snapshot(snapshot)
+                if snapshot.status != "running":
+                    return await completed_result(snapshot)
+                await asyncio.sleep(min(_BACKGROUND_POLL_INTERVAL_SECONDS, remaining()))
+        except TimeoutError:
+            if handle is not None:
+                try:
+                    snapshot = await asyncio.wait_for(driver.poll(handle), timeout=5)
+                    if snapshot.status != "running":
+                        await accept_snapshot(snapshot, terminal_recheck=True)
+                        return await completed_result(snapshot)
+                except Exception:
+                    logger.exception("could not recheck foreground command {}", command_id)
+            stop_attempted = True
+            if not await stop_and_confirm():
+                return AgentToolResult(
+                    content=[
+                        TextContent(
+                            text=(
+                                f"Command exceeded {timeout}s, but termination "
+                                "could not be confirmed."
+                            )
+                        )
+                    ],
+                    details={"status": "running", "command_id": command_id},
+                    is_error=True,
+                )
+            return AgentToolResult(
+                content=[TextContent(text=_timeout_tool_message(timeout))],
+                is_error=True,
+            )
+        finally:
+            if not finished and not stop_attempted:
+                await stop_and_confirm()
+
+    async def _execute(
+        tool_call_id: str,
+        args: _ForegroundExecuteArgs,
+        *,
+        signal: asyncio.Event | None = None,
+        on_update: Callable[[StructuredValue], None] | None = None,
+    ) -> AgentToolResult:
+        async def run() -> AgentToolResult:
+            if _looks_like_shell_background(args.command):
+                return AgentToolResult(
+                    content=[TextContent(text="Do not background shell commands.")],
+                    is_error=True,
+                )
+            if sandbox.supports_background() is True:
+                return await sandbox.run_with_backend(
+                    lambda driver: _run_polled(driver, args, on_update)
+                )
+            return await direct.execute(
+                tool_call_id,
+                _ExecuteArgs(
+                    description=args.description,
+                    command=args.command,
+                    timeout_seconds=args.timeout_seconds,
+                    background=False,
+                    notify_on_complete=False,
+                ),
+                signal=signal,
+                on_update=on_update,
+            )
+
+        if signal is None:
+            return await run()
+        if signal.is_set():
+            raise asyncio.CancelledError
+        execution = asyncio.create_task(run())
+        aborted = asyncio.create_task(signal.wait())
+        try:
+            await asyncio.wait({execution, aborted}, return_when=asyncio.FIRST_COMPLETED)
+            if aborted.done() and not execution.done():
+                execution.cancel()
+            return await execution
+        finally:
+            aborted.cancel()
+            if not execution.done():
+                execution.cancel()
+            await asyncio.gather(execution, aborted, return_exceptions=True)
+
+    return AgentTool(
+        name="execute",
+        description=(
+            "Execute a shell command in the sandbox and wait for its final result. "
+            "Always set description first (a 5-10 word user-facing summary). "
+            "The default deadline is one hour; set timeout_seconds when needed. "
+            "This tool cannot start background tasks."
+        ),
+        parameters=_ForegroundExecuteArgs,
+        execute=_execute,
+    )
+
+
+class _KillExecuteArgs(BaseModel):
+    command_id: str = Field(description="CubePlex command id returned by background execute.")
+
+
+class _MonitorArgs(BaseModel):
+    description: str = Field(description="Short summary of what this monitor watches.")
+    command: str
+    persistent: bool = Field(
+        default=False,
+        description=(
+            "If true, remove the monitor deadline. This does not enable repeated notices."
+        ),
+    )
+    timeout_seconds: int | None = Field(
+        default=3600,
+        ge=1,
+        le=36000,
+        description="Kill after this many seconds unless persistent. Default 3600.",
+    )
+
+
+def _make_monitor_tool(
+    sandbox: Sandbox,
+    *,
+    live: dict[str, tuple[ProcessHandle, bool]],
+    live_lock: asyncio.Lock | None = None,
+    persist_reserve: Callable[..., Awaitable[bool | _ReservedCommand]] | None = None,
+    persist_running: Callable[[str, str], Awaitable[None]] | None = None,
+    persist_cursor: Callable[[str, str], Awaitable[None]] | None = None,
+    persist_killed: Callable[[str], Awaitable[None]] | None = None,
+    persist_start_failed: Callable[[str, str], Awaitable[None]] | None = None,
+    persist_monitor_timed_out: Callable[[str], Awaitable[None]] | None = None,
+    persist_monitor_observation: (
+        Callable[[str, ProcessSnapshot, bool], Awaitable[None]] | None
+    ) = None,
+    persist_monitor_timeout: (
+        Callable[[str, bool, ProcessSnapshot, bool], Awaitable[None]] | None
+    ) = None,
+    deadline_tasks: dict[str, asyncio.Task[None]] | None = None,
+    on_live: Callable[[], None] | None = None,
+    handoff: Callable[[str], Awaitable[bool]] | None = None,
+) -> AgentTool[_MonitorArgs]:
+    lock = live_lock if live_lock is not None else asyncio.Lock()
+    timeout_tasks = deadline_tasks if deadline_tasks is not None else {}
+
+    async def _ack_snapshot_output(
+        command_id: str,
+        handle: ProcessHandle,
+        log_path: str,
+        snapshot: ProcessSnapshot,
+    ) -> bool:
+        appended = await _append_snapshot_output(sandbox, log_path, snapshot)
+        if not appended.data_written:
+            return False
+        if snapshot.log_cursor is not None:
+            if persist_cursor is not None:
+                await persist_cursor(command_id, snapshot.log_cursor)
+            await sandbox.acknowledge_output(handle, snapshot.log_cursor)
+        return True
+
+    async def _monitor(
+        tool_call_id: str,
+        args: _MonitorArgs,
+        *,
+        signal: asyncio.Event | None = None,
+        on_update: Callable[[StructuredValue], None] | None = None,
+    ) -> AgentToolResult:
+        del signal, on_update
+        if not sandbox.supports_background():
+            return AgentToolResult(
+                content=[TextContent(text="This sandbox cannot run background commands.")],
+                is_error=True,
+            )
+        if _looks_like_shell_background(args.command):
+            return AgentToolResult(
+                content=[
+                    TextContent(
+                        text=(
+                            "Do not background with shell &, nohup, or disown. "
+                            "The monitor tool manages the process lifetime."
+                        )
+                    )
+                ],
+                is_error=True,
+            )
+        command_id = generate_public_id(PREFIX_SANDBOX_COMMAND)
+        log_path = f"{sandbox.workdir.rstrip('/')}/.cubeplex/execute-{command_id}.log"
+        deadline = None
+        if not args.persistent:
+            seconds = args.timeout_seconds or 3600
+            deadline = datetime.now(UTC) + timedelta(seconds=seconds)
+        reserved: bool | _ReservedCommand = False
+        task_id: str | None = None
+        async with lock:
+            if persist_reserve is not None:
+                try:
+                    reserved = await persist_reserve(
+                        command_id=command_id,
+                        tool_call_id=tool_call_id,
+                        command=args.command,
+                        description=args.description,
+                        notify_on_complete=True,
+                        log_path=log_path,
+                        kind="monitor",
+                        lifetime="conversation",
+                        timeout_seconds=None,
+                        monitor_deadline_at=deadline,
+                    )
+                except Exception as exc:
+                    from cubeplex.repositories.sandbox_command import SandboxCommandCapError
+
+                    if isinstance(exc, SandboxCommandCapError):
+                        return AgentToolResult(
+                            content=[TextContent(text=str(exc))],
+                            is_error=True,
+                        )
+                    logger.exception("monitor reserve failed")
+                    return AgentToolResult(
+                        content=[TextContent(text="failed to reserve monitor")],
+                        is_error=True,
+                    )
+            if isinstance(reserved, _ReservedCommand):
+                command_id = reserved.command_id
+                task_id = reserved.task_id
+                log_path = reserved.log_path or log_path
+                deadline = reserved.deadline_at
+                if not reserved.start_allowed:
+                    return AgentToolResult(
+                        content=[TextContent(text=f"Monitor already managed as {command_id}.")],
+                        details={
+                            "status": "running",
+                            "task_id": task_id,
+                            "command_id": command_id,
+                            "log_path": log_path,
+                            "deadline_at": (
+                                utc_isoformat(deadline) if deadline is not None else None
+                            ),
+                            "notification": "once",
+                            "result_pending": True,
+                        },
+                    )
+            if not reserved and len(live) >= MAX_LIVE_BACKGROUND_COMMANDS:
+                return AgentToolResult(
+                    content=[TextContent(text="at most 8 running commands per sandbox")],
+                    is_error=True,
+                )
+            persist_error: BaseException | None = None
+
+            async def _on_started(ref: str) -> None:
+                nonlocal persist_error
+                if persist_running is None:
+                    return
+                try:
+                    await persist_running(command_id, ref)
+                except Exception as exc:
+                    persist_error = exc
+
+            try:
+                handle = await sandbox.start(args.command, on_started=_on_started)
+            except Exception:
+                if reserved and persist_start_failed is not None:
+                    await persist_start_failed(command_id, "provider start failed")
+                elif reserved and persist_killed is not None:
+                    await persist_killed(command_id)
+                raise
+            handle.command_id = command_id
+            handle.deadline_at = deadline
+            if persist_error is not None:
+                await sandbox.kill(handle)
+                if persist_start_failed is not None:
+                    await persist_start_failed(
+                        command_id,
+                        "provider start receipt persistence failed",
+                    )
+                elif persist_killed is not None:
+                    await persist_killed(command_id)
+                return AgentToolResult(
+                    content=[TextContent(text="failed to persist monitor")],
+                    is_error=True,
+                )
+            live[command_id] = (handle, False)
+        if deadline is not None:
+
+            async def _enforce_monitor_deadline() -> None:
+                await asyncio.sleep(max(0.0, (deadline - datetime.now(UTC)).total_seconds()))
+                try:
+                    async with lock:
+                        current = live.get(command_id)
+                        if current is None or current[0] is not handle:
+                            return
+                        deadline_snapshot = await sandbox.poll(handle)
+                        logs_confirmed = await _ack_snapshot_output(
+                            command_id,
+                            handle,
+                            log_path,
+                            deadline_snapshot,
+                        )
+                        if deadline_snapshot.status != "running":
+                            live.pop(command_id, None)
+                            if persist_monitor_observation is not None:
+                                await persist_monitor_observation(
+                                    command_id,
+                                    deadline_snapshot,
+                                    logs_confirmed,
+                                )
+                            return
+                        if deadline_snapshot.status == "running":
+                            await sandbox.kill(handle)
+                            confirmed = await sandbox.poll(handle)
+                            confirmed_logs = await _ack_snapshot_output(
+                                command_id,
+                                handle,
+                                log_path,
+                                confirmed,
+                            )
+                            live.pop(command_id, None)
+                            if persist_monitor_timeout is not None:
+                                await persist_monitor_timeout(
+                                    command_id,
+                                    True,
+                                    confirmed,
+                                    confirmed_logs,
+                                )
+                            elif persist_monitor_timed_out is not None:
+                                await persist_monitor_timed_out(command_id)
+                except Exception:
+                    logger.exception("failed to enforce monitor deadline {}", command_id)
+
+            task = asyncio.create_task(_enforce_monitor_deadline())
+            timeout_tasks[command_id] = task
+            task.add_done_callback(lambda _task: timeout_tasks.pop(command_id, None))
+        await _write_sandbox_log(sandbox, log_path, b"")
+        handed_off = handoff is not None and await handoff(command_id)
+        if not handed_off and on_live is not None:
+            on_live()
+        return AgentToolResult(
+            content=[
+                TextContent(
+                    text=(
+                        f"Monitor task {task_id} is running as command {command_id}. "
+                        "It will send one final notice."
+                        if task_id is not None
+                        else f"Monitor running as {command_id}. Use kill_execute to stop."
+                    )
+                )
+            ],
+            details={
+                "status": "running",
+                **({"task_id": task_id} if task_id is not None else {}),
+                "command_id": command_id,
+                "log_path": log_path,
+                "deadline_at": utc_isoformat(deadline) if deadline is not None else None,
+                "notification": "once",
+                "result_pending": True,
+            },
+        )
+
+    return AgentTool(
+        name="monitor",
+        description=(
+            "Run one condition-waiting script in the background. The script must keep "
+            "checking by itself, exit 0 when the condition is satisfied, and exit nonzero "
+            "on failure. CubePlex sends exactly one final notice for success, failure, or "
+            "timeout; stdout is only a log and does not wake the agent repeatedly."
+        ),
+        parameters=_MonitorArgs,
+        execute=_monitor,
+    )
+
+
+def _make_kill_execute_tool(
+    sandbox: Sandbox,
+    live: dict[str, tuple[ProcessHandle, bool]],
+    *,
+    persist_killed: Callable[[str], Awaitable[None]] | None = None,
+    kill_persisted: Callable[[str], Awaitable[bool]] | None = None,
+    live_lock: asyncio.Lock | None = None,
+    deadline_tasks: dict[str, asyncio.Task[None]] | None = None,
+) -> AgentTool[_KillExecuteArgs]:
+    lock = live_lock if live_lock is not None else asyncio.Lock()
+
+    async def _kill(
+        tool_call_id: str,
+        args: _KillExecuteArgs,
+        *,
+        signal: asyncio.Event | None = None,
+        on_update: Callable[[StructuredValue], None] | None = None,
+    ) -> AgentToolResult:
+        del tool_call_id, signal, on_update
+        async with lock:
+            entry = live.get(args.command_id)
+        if entry is None:
+            if kill_persisted is not None:
+                try:
+                    if await kill_persisted(args.command_id):
+                        return AgentToolResult(
+                            content=[TextContent(text=f"stop requested for {args.command_id}")],
+                            details={"status": "stopping", "command_id": args.command_id},
+                        )
+                except Exception:
+                    logger.exception("durable kill_execute failed for {}", args.command_id)
+                    return AgentToolResult(
+                        content=[TextContent(text=f"failed to kill {args.command_id}")],
+                        is_error=True,
+                    )
+            return AgentToolResult(
+                content=[TextContent(text=f"command not found: {args.command_id}")],
+                is_error=True,
+            )
+        handle, _notify = entry
+        try:
+            await sandbox.kill(handle)
+            confirmed = await sandbox.poll(handle)
+        except Exception:
+            logger.exception("kill_execute failed for {}", args.command_id)
+            return AgentToolResult(
+                content=[TextContent(text=f"failed to kill {args.command_id}")],
+                is_error=True,
+            )
+        if confirmed.status == "running":
+            return AgentToolResult(
+                content=[TextContent(text=f"failed to confirm kill for {args.command_id}")],
+                is_error=True,
+            )
+        async with lock:
+            live.pop(args.command_id, None)
+        deadline_task = deadline_tasks.pop(args.command_id, None) if deadline_tasks else None
+        if deadline_task is not None:
+            deadline_task.cancel()
+        if persist_killed is not None:
+            try:
+                await persist_killed(args.command_id)
+            except Exception:
+                logger.exception("sandbox command kill persist failed")
+        return AgentToolResult(
+            content=[TextContent(text=f"killed {args.command_id}")],
+            details={"status": "killed", "command_id": args.command_id},
+        )
+
+    return AgentTool(
+        name="kill_execute",
+        description="Stop a background sandbox command started with execute(background=true).",
+        parameters=_KillExecuteArgs,
+        execute=_kill,
     )
 
 
@@ -786,6 +2229,12 @@ class SandboxMiddleware(Middleware):
         command_rules: list[dict[str, Any]] | None = None,
         channel: HitlChannel | None = None,
         config_loader: SandboxConfigLoader | Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        org_id: str | None = None,
+        user_id: str | None = None,
+        run_id: str | None = None,
+        admission_id: str | None = None,
+        owner_token: str | None = None,
+        session_factory: Any | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.conversation_id = conversation_id
@@ -793,12 +2242,66 @@ class SandboxMiddleware(Middleware):
         self.command_rules = command_rules or []
         self.channel = channel
         self.config_loader = config_loader
+        self.org_id = org_id
+        self.user_id = user_id
+        self.run_id = run_id
+        self.admission_id = admission_id
+        self._task_owner_token = owner_token
+        self._session_factory = session_factory
+        self._live_commands: dict[str, tuple[ProcessHandle, bool]] = {}
+        self._command_deadline_tasks: dict[str, asyncio.Task[None]] = {}
+        self._task_bindings: dict[str, _TaskCommandBinding] = {}
+        self._live_lock = asyncio.Lock()
+        self._owner_id = f"run:{run_id}" if run_id else "run:local"
+        self._lease_task: asyncio.Task[None] | None = None
 
         self._tools: list[AgentTool[Any]] = [
             _make_execute_tool(
                 sandbox,
                 workspace_id=workspace_id,
                 conversation_id=conversation_id,
+                live=self._live_commands,
+                live_lock=self._live_lock,
+                persist_reserve=self._persist_reserve,
+                persist_running=self._persist_running,
+                persist_cursor=self._persist_cursor,
+                persist_killed=self._persist_killed,
+                persist_start_failed=self._persist_start_failed,
+                persist_exited=self._persist_exited,
+                persist_discard=self._persist_discard,
+                persist_foreground=self._persist_foreground,
+                persist_background_terminal=self._persist_background_terminal,
+                persist_timed_out=self._persist_timed_out,
+                load_persisted_status=self._persisted_command_status,
+                deadline_tasks=self._command_deadline_tasks,
+                on_live=self._ensure_lease_task,
+                handoff=(
+                    self._handoff_conversation_command if session_factory is not None else None
+                ),
+            ),
+            _make_kill_execute_tool(
+                sandbox,
+                self._live_commands,
+                persist_killed=self._persist_killed,
+                kill_persisted=self._kill_persisted_command,
+                live_lock=self._live_lock,
+                deadline_tasks=self._command_deadline_tasks,
+            ),
+            _make_monitor_tool(
+                sandbox,
+                live=self._live_commands,
+                live_lock=self._live_lock,
+                persist_reserve=self._persist_reserve,
+                persist_running=self._persist_running,
+                persist_cursor=self._persist_cursor,
+                persist_killed=self._persist_killed,
+                persist_start_failed=self._persist_start_failed,
+                persist_monitor_timed_out=self._persist_monitor_timed_out,
+                persist_monitor_observation=self._persist_monitor_observation,
+                persist_monitor_timeout=self._persist_monitor_timeout,
+                deadline_tasks=self._command_deadline_tasks,
+                on_live=self._ensure_lease_task,
+                handoff=self._handoff_conversation_command,
             ),
             _make_write_file_tool(sandbox),
             _make_edit_file_tool(sandbox),
@@ -806,11 +2309,678 @@ class SandboxMiddleware(Middleware):
         ]
         if config_loader is not None:
             self._tools.append(create_sandbox_config_tool(config_loader))
+        self._subagent_tools: list[AgentTool[Any]] = [
+            _make_foreground_execute_tool(
+                sandbox,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+            ),
+            *(
+                tool
+                for tool in self._tools
+                if tool.name not in {"execute", "monitor", "kill_execute"}
+            ),
+        ]
 
     @property
     def tools(self) -> list[AgentTool[Any]]:
         """Return the cubeloop.AgentTool list for this middleware."""
         return list(self._tools)
+
+    @property
+    def subagent_tools(self) -> list[AgentTool[Any]]:
+        """Return sandbox tools without background task controls for subagents."""
+        return list(self._subagent_tools)
+
+    def _task_scope(self) -> tuple[str, str]:
+        if self.org_id is None or self.workspace_id is None:
+            raise RuntimeError("background task scope is unavailable")
+        return self.org_id, self.workspace_id
+
+    async def on_run_end(
+        self,
+        ctx: AgentContext,
+        *,
+        signal: asyncio.Event | None = None,
+    ) -> list[UserMessage | AssistantMessage | ToolResultMessage] | None:
+        """Hand off work once; task delivery starts a later run when needed."""
+        del ctx, signal
+        await self._release_managed_commands()
+        return None
+
+    async def _release_managed_commands(self) -> None:
+        """Transfer every durable command without extending the agent run."""
+        for command_id in list(self._live_commands):
+            try:
+                await self._handoff_conversation_command(command_id)
+            except Exception:
+                logger.exception("failed to hand off sandbox command {}", command_id)
+
+    async def _handoff_conversation_command(self, command_id: str) -> bool:
+        """Release one durable command so the coordinator can poll it immediately."""
+        binding = self._task_bindings.get(command_id)
+        if binding is not None and self._session_factory is not None:
+            from cubeplex.services.background_tasks import BackgroundTaskService
+
+            now = datetime.now(UTC)
+            org_id, workspace_id = self._task_scope()
+            async with self._session_factory() as session:
+                service = BackgroundTaskService(
+                    session,
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                )
+                handoff_error: ValueError | None = None
+                try:
+                    await service.handoff_task(
+                        task_id=binding.task_id,
+                        owner_token=binding.owner_token,
+                        now=now,
+                    )
+                except ValueError as exc:
+                    handoff_error = exc
+                await service.defer_owner(
+                    task_id=binding.task_id,
+                    owner_token=binding.owner_token,
+                    now=now,
+                    retry_at=now + timedelta(microseconds=1),
+                )
+                await session.commit()
+            async with self._live_lock:
+                self._live_commands.pop(command_id, None)
+                deadline_task = self._command_deadline_tasks.pop(command_id, None)
+                if deadline_task is not None:
+                    deadline_task.cancel()
+            if handoff_error is not None:
+                raise handoff_error
+            return True
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return False
+            await repo.release_owner([command_id], owner_id=self._owner_id)
+        async with self._live_lock:
+            self._live_commands.pop(command_id, None)
+            deadline_task = self._command_deadline_tasks.pop(command_id, None)
+            if deadline_task is not None:
+                deadline_task.cancel()
+        return True
+
+    async def finalize_run(self) -> None:
+        """Release durable work and stop only unreserved local work."""
+        lease_task = self._lease_task
+        self._lease_task = None
+        if lease_task is not None and lease_task is not asyncio.current_task():
+            lease_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lease_task
+
+        await self._release_managed_commands()
+
+        async with self._live_lock:
+            remaining = dict(self._live_commands)
+            self._live_commands.clear()
+            deadline_tasks = list(self._command_deadline_tasks.values())
+            self._command_deadline_tasks.clear()
+            for task in deadline_tasks:
+                task.cancel()
+        for command_id, (handle, _notify) in remaining.items():
+            if command_id in self._task_bindings:
+                continue
+            try:
+                await self.sandbox.kill(handle)
+            except Exception:
+                logger.exception("failed to stop sandbox command {} during run cleanup", command_id)
+                continue
+            await self._persist_killed(command_id)
+
+    async def _persist_reserve(
+        self,
+        *,
+        command_id: str,
+        tool_call_id: str,
+        command: str,
+        description: str,
+        notify_on_complete: bool,
+        log_path: str,
+        kind: str = "execute",
+        lifetime: str | None = None,
+        timeout_seconds: int | None = None,
+        monitor_deadline_at: datetime | None = None,
+    ) -> bool | _ReservedCommand:
+        if self._session_factory is None:
+            return False
+        if self.admission_id is None or self._task_owner_token is None:
+            raise RuntimeError("managed commands require a durable execution admission")
+        ensure = getattr(self.sandbox, "ensure_created", None)
+        if callable(ensure):
+            maybe = ensure()
+            if inspect.isawaitable(maybe):
+                await maybe
+        user_sandbox_id = self.sandbox.user_sandbox_id
+        if (
+            not isinstance(user_sandbox_id, str)
+            or self.conversation_id is None
+            or self.org_id is None
+            or self.workspace_id is None
+            or self.user_id is None
+        ):
+            return False
+        from cubeplex.models import UserSandbox
+        from cubeplex.models.sandbox_command import SandboxCommandKind
+        from cubeplex.services.background_tasks import (
+            BackgroundTaskService,
+            CommandExecutionDetails,
+            TaskSpec,
+        )
+
+        now = datetime.now(UTC)
+        async with self._session_factory() as session:
+            sandbox_row = await session.get(UserSandbox, user_sandbox_id)
+            if sandbox_row is None or sandbox_row.sandbox_id is None:
+                raise LookupError("sandbox attachment is unavailable")
+            service = BackgroundTaskService(
+                session,
+                org_id=self.org_id,
+                workspace_id=self.workspace_id,
+            )
+            reservation = await service.reserve_task(
+                admission_id=self.admission_id,
+                task_spec=TaskSpec(
+                    originating_run_id=self.run_id or "",
+                    tool_call_id=tool_call_id,
+                    description=description,
+                    notify_on_complete=notify_on_complete,
+                ),
+                execution_details=CommandExecutionDetails(
+                    user_sandbox_id=user_sandbox_id,
+                    sandbox_instance_id=sandbox_row.sandbox_id,
+                    provider=sandbox_row.provider,
+                    command=command,
+                    log_path=log_path,
+                    kind=SandboxCommandKind(kind),
+                    timeout_seconds=timeout_seconds,
+                    monitor_deadline_at=monitor_deadline_at,
+                ),
+                owner_token=self._task_owner_token,
+                owner_until=now + timedelta(seconds=_TASK_OWNER_LEASE_SECONDS),
+                now=now,
+            )
+            start_allowed = reservation.created and await service.begin_start(
+                task_id=reservation.task.id,
+                owner_token=self._task_owner_token,
+                now=now,
+            )
+            await session.commit()
+        self._task_bindings[reservation.command.id] = _TaskCommandBinding(
+            task_id=reservation.task.id,
+            owner_token=self._task_owner_token,
+            sandbox_instance_id=reservation.command.sandbox_instance_id or "",
+        )
+        return _ReservedCommand(
+            command_id=reservation.command.id,
+            task_id=reservation.task.id,
+            start_allowed=start_allowed,
+            log_path=reservation.command.log_path,
+            deadline_at=reservation.task.deadline_at,
+        )
+
+    async def _persist_running(self, command_id: str, provider_ref: str) -> None:
+        binding = self._task_bindings.get(command_id)
+        if binding is not None and self._session_factory is not None:
+            from cubeplex.services.background_tasks import BackgroundTaskService
+
+            org_id, workspace_id = self._task_scope()
+            async with self._session_factory() as session:
+                await BackgroundTaskService(
+                    session,
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                ).register_start_receipt(
+                    task_id=binding.task_id,
+                    start_token=binding.owner_token,
+                    sandbox_instance_id=binding.sandbox_instance_id,
+                    provider_ref=provider_ref,
+                    now=datetime.now(UTC),
+                )
+                await session.commit()
+            return
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return
+            ok = await repo.mark_running(
+                command_id, provider_ref=provider_ref, owner_id=self._owner_id
+            )
+            if not ok:
+                raise RuntimeError(f"mark_running cas missed for {command_id}")
+
+    async def _persist_cursor(self, command_id: str, log_cursor: str) -> None:
+        binding = self._task_bindings.get(command_id)
+        if binding is not None and self._session_factory is not None:
+            from cubeplex.models import SandboxCommand
+            from cubeplex.sandbox.base import ProcessSnapshot
+            from cubeplex.services.background_tasks import BackgroundTaskService
+
+            org_id, workspace_id = self._task_scope()
+            async with self._session_factory() as session:
+                command = await session.get(SandboxCommand, command_id)
+                if command is None:
+                    raise LookupError("task command not found")
+                await BackgroundTaskService(
+                    session,
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                ).record_observation(
+                    task_id=binding.task_id,
+                    owner_token=binding.owner_token,
+                    snapshot=ProcessSnapshot(status="running"),
+                    log_state="pending",
+                    expected_log_cursor=command.log_cursor,
+                    confirmed_log_cursor=log_cursor,
+                    now=datetime.now(UTC),
+                )
+                await session.commit()
+            return
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return
+            ok = await repo.update_log_cursor(
+                command_id,
+                log_cursor=log_cursor,
+                owner_id=self._owner_id,
+            )
+            if not ok:
+                raise RuntimeError(f"update_log_cursor cas missed for {command_id}")
+
+    async def _persist_killed(self, command_id: str) -> None:
+        await self._persist_terminal(
+            command_id,
+            status="killed",
+            exit_code=None,
+            notify=False,
+        )
+
+    async def _persist_start_failed(self, command_id: str, message: str) -> None:
+        binding = self._task_bindings.get(command_id)
+        if binding is None or self._session_factory is None:
+            await self._persist_killed(command_id)
+            return
+        from cubeplex.services.background_tasks import BackgroundTaskService
+
+        now = datetime.now(UTC)
+        org_id, workspace_id = self._task_scope()
+        async with self._session_factory() as session:
+            service = BackgroundTaskService(
+                session,
+                org_id=org_id,
+                workspace_id=workspace_id,
+            )
+            await service.record_observation_failure(
+                task_id=binding.task_id,
+                owner_token=binding.owner_token,
+                now=now,
+                message=message,
+            )
+            await service.defer_owner(
+                task_id=binding.task_id,
+                owner_token=binding.owner_token,
+                now=now,
+                retry_at=now + timedelta(seconds=1),
+            )
+            await session.commit()
+
+    async def _persist_exited(
+        self,
+        command_id: str,
+        exit_code: int | None,
+        notify: bool,
+    ) -> None:
+        await self._persist_terminal(
+            command_id,
+            status="exited",
+            exit_code=exit_code,
+            notify=notify,
+        )
+
+    async def _persist_timed_out(
+        self,
+        command_id: str,
+        notify: bool = True,
+        snapshot: ProcessSnapshot | None = None,
+        logs_confirmed: bool = True,
+    ) -> None:
+        terminal = snapshot or ProcessSnapshot(status="killed")
+        if await self._persist_task_observation(
+            command_id,
+            terminal,
+            log_state="complete" if logs_confirmed else "retrying",
+            stop_reason=TaskStopReason.deadline,
+            logs_confirmed=logs_confirmed,
+        ):
+            return
+        if not logs_confirmed:
+            return
+        await self._persist_terminal(
+            command_id,
+            status="killed",
+            exit_code=None,
+            notify=notify,
+        )
+
+    async def _persist_monitor_timed_out(self, command_id: str) -> None:
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return
+            row = await repo.get(command_id)
+            if row is None:
+                return
+            from cubeplex.sandbox.command_coordinator import _terminalize
+
+            await _terminalize(
+                repo.session,
+                row,
+                status="killed",
+                exit_code=None,
+                now=datetime.now(UTC),
+                sandbox=self.sandbox,
+                interrupt=False,
+                wake_text="monitor timeout reached",
+            )
+
+    async def _persist_monitor_observation(
+        self,
+        command_id: str,
+        snapshot: ProcessSnapshot,
+        logs_confirmed: bool,
+    ) -> None:
+        if await self._persist_task_observation(
+            command_id,
+            snapshot,
+            log_state="complete" if logs_confirmed else "retrying",
+            logs_confirmed=logs_confirmed,
+        ):
+            return
+        if not logs_confirmed:
+            return
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return
+            row = await repo.get(command_id)
+            if row is None:
+                return
+            from cubeplex.sandbox.command_coordinator import _terminalize
+
+            lines = [line for line in snapshot.new_output.splitlines() if line.strip()]
+
+            await _terminalize(
+                repo.session,
+                row,
+                status=snapshot.status,
+                exit_code=snapshot.exit_code,
+                now=datetime.now(UTC),
+                sandbox=None,
+                interrupt=False,
+                wake_text=lines[-1][-4000:] if lines else f"monitor {snapshot.status}",
+            )
+
+    async def _persist_monitor_timeout(
+        self,
+        command_id: str,
+        notify: bool,
+        snapshot: ProcessSnapshot,
+        logs_confirmed: bool,
+    ) -> None:
+        del notify
+        if await self._persist_task_observation(
+            command_id,
+            snapshot,
+            log_state="complete" if logs_confirmed else "retrying",
+            stop_reason=TaskStopReason.deadline,
+            logs_confirmed=logs_confirmed,
+        ):
+            return
+        if not logs_confirmed:
+            return
+        await self._persist_monitor_timed_out(command_id)
+
+    async def _persisted_command_status(self, command_id: str) -> str | None:
+        if command_id in self._task_bindings and self._session_factory is not None:
+            from cubeplex.models import SandboxCommand
+
+            async with self._session_factory() as session:
+                command = await session.get(SandboxCommand, command_id)
+                return command.status if command is not None else None
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return None
+            row = await repo.get(command_id)
+            return row.status if row is not None else None
+
+    async def _persist_discard(self, command_id: str) -> None:
+        del command_id
+
+    async def _persist_task_observation(
+        self,
+        command_id: str,
+        snapshot: ProcessSnapshot,
+        *,
+        log_state: LogState,
+        stop_reason: TaskStopReason | None = None,
+        logs_confirmed: bool = True,
+    ) -> bool:
+        binding = self._task_bindings.get(command_id)
+        if binding is None or self._session_factory is None:
+            return False
+        from cubeplex.models import SandboxCommand
+        from cubeplex.services.background_tasks import BackgroundTaskService
+
+        now = datetime.now(UTC)
+        org_id, workspace_id = self._task_scope()
+        async with self._session_factory() as session:
+            command = await session.get(SandboxCommand, command_id)
+            if command is None:
+                raise LookupError("task command not found")
+            service = BackgroundTaskService(
+                session,
+                org_id=org_id,
+                workspace_id=workspace_id,
+            )
+            if stop_reason is not None:
+                await service.request_task_stop(
+                    task_id=binding.task_id,
+                    reason=stop_reason,
+                    now=now,
+                )
+            await service.record_observation(
+                task_id=binding.task_id,
+                owner_token=binding.owner_token,
+                snapshot=snapshot,
+                log_state=log_state,
+                expected_log_cursor=command.log_cursor,
+                confirmed_log_cursor=snapshot.log_cursor if logs_confirmed else None,
+                now=now,
+            )
+            await service.defer_owner(
+                task_id=binding.task_id,
+                owner_token=binding.owner_token,
+                now=now,
+                retry_at=now + timedelta(seconds=1),
+            )
+            await session.commit()
+        return True
+
+    async def _persist_foreground(
+        self,
+        command_id: str,
+        snapshot: ProcessSnapshot,
+        logs_confirmed: bool,
+    ) -> None:
+        if await self._persist_task_observation(
+            command_id,
+            snapshot,
+            log_state="complete" if logs_confirmed else "retrying",
+            logs_confirmed=logs_confirmed,
+        ):
+            return
+        await self._persist_discard(command_id)
+
+    async def _persist_background_terminal(
+        self,
+        command_id: str,
+        snapshot: ProcessSnapshot,
+        logs_confirmed: bool,
+        notify: bool,
+    ) -> None:
+        if await self._persist_task_observation(
+            command_id,
+            snapshot,
+            log_state="complete" if logs_confirmed else "retrying",
+            logs_confirmed=logs_confirmed,
+        ):
+            return
+        if not logs_confirmed:
+            return
+        await self._persist_terminal(
+            command_id,
+            status=snapshot.status,
+            exit_code=snapshot.exit_code,
+            notify=notify and snapshot.status != "killed",
+        )
+
+    async def _kill_persisted_command(self, command_id: str) -> bool:
+        if self.conversation_id is None:
+            return False
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return False
+            row = await repo.get(command_id)
+            if row is None or row.conversation_id != self.conversation_id:
+                return False
+            from cubeplex.models import UserSandbox
+            from cubeplex.models.sandbox_command import SandboxCommandStatus
+            from cubeplex.sandbox.command_coordinator import kill_command
+
+            sandbox_row = await repo.session.get(UserSandbox, row.user_sandbox_id)
+            if sandbox_row is None or sandbox_row.sandbox_id != self.sandbox.id:
+                return False
+            if row.status not in (
+                SandboxCommandStatus.starting.value,
+                SandboxCommandStatus.running.value,
+            ):
+                return False
+            if row.task_id is not None:
+                from cubeplex.models.background_task import TaskStopReason
+                from cubeplex.services.background_tasks import BackgroundTaskService
+
+                org_id, workspace_id = self._task_scope()
+                await BackgroundTaskService(
+                    repo.session,
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                ).request_task_stop(
+                    task_id=row.task_id,
+                    reason=TaskStopReason.user_stop,
+                    now=datetime.now(UTC),
+                )
+                await repo.session.commit()
+                return True
+
+            async def _current_sandbox(_row: object) -> Sandbox:
+                return self.sandbox
+
+            return await kill_command(repo.session, row, get_sandbox=_current_sandbox)
+
+    async def _persist_terminal(
+        self,
+        command_id: str,
+        *,
+        status: str,
+        exit_code: int | None,
+        notify: bool,
+        delivered: bool = False,
+    ) -> None:
+        if await self._persist_task_observation(
+            command_id,
+            ProcessSnapshot(
+                status="killed" if status == "killed" else "exited",
+                exit_code=exit_code,
+            ),
+            log_state="complete",
+        ):
+            return
+        from cubeplex.models.sandbox_command import SandboxCommandNoticeState
+
+        if delivered:
+            notice = SandboxCommandNoticeState.delivered.value
+        elif notify:
+            notice = SandboxCommandNoticeState.pending.value
+        else:
+            notice = SandboxCommandNoticeState.none.value
+        async with self._command_repo_ctx() as repo:
+            if repo is None:
+                return
+            await repo.mark_terminal(
+                command_id,
+                status=status,
+                exit_code=exit_code,
+                finished_at=datetime.now(UTC),
+                notice_state=notice,
+            )
+
+    async def _renew_live_leases(self) -> None:
+        if not self._live_commands or self._session_factory is None:
+            return
+        from cubeplex.services.background_tasks import BackgroundTaskService
+
+        bindings = {
+            command_id: binding
+            for command_id, binding in self._task_bindings.items()
+            if command_id in self._live_commands
+        }
+        if not bindings:
+            return
+        now = datetime.now(UTC)
+        org_id, workspace_id = self._task_scope()
+        async with self._session_factory() as session:
+            service = BackgroundTaskService(
+                session,
+                org_id=org_id,
+                workspace_id=workspace_id,
+            )
+            for binding in bindings.values():
+                await service.renew_owner(
+                    task_id=binding.task_id,
+                    owner_token=binding.owner_token,
+                    now=now,
+                    owner_until=now + timedelta(seconds=_TASK_OWNER_LEASE_SECONDS),
+                )
+            await session.commit()
+
+    def _ensure_lease_task(self) -> None:
+        if self._lease_task is None or self._lease_task.done():
+            self._lease_task = asyncio.create_task(self._lease_loop())
+
+    async def _lease_loop(self) -> None:
+        try:
+            while self._live_commands:
+                await asyncio.sleep(_COMMAND_LEASE_SECONDS / 3)
+                try:
+                    await self._renew_live_leases()
+                except Exception:
+                    logger.exception("sandbox command lease renew failed")
+        except asyncio.CancelledError:
+            return
+
+    @asynccontextmanager
+    async def _command_repo_ctx(self) -> AsyncIterator[Any]:
+        from cubeplex.repositories.sandbox_command import SandboxCommandRepository
+
+        if self._session_factory is None or self.org_id is None or self.workspace_id is None:
+            yield None
+            return
+        async with self._session_factory() as session:
+            yield SandboxCommandRepository(
+                session, org_id=self.org_id, workspace_id=self.workspace_id
+            )
 
     async def before_tool_call(
         self,
@@ -818,20 +2988,22 @@ class SandboxMiddleware(Middleware):
         *,
         signal: asyncio.Event | None = None,
     ) -> BeforeToolCallResult | None:
-        """Enforce command rules before the execute tool runs.
+        """Enforce command rules before an execute or monitor tool runs.
 
-        v1: execute only. deny → block; confirm → pause on the HITL channel
+        Shell commands share one policy boundary. deny → block; confirm → pause
+        on the HITL channel
         (approve runs it, deny/timeout/cancel block it); edit is rejected.
         Because this runs before the tool body, a blocked command never reaches
         ``sandbox.execute`` — no sandbox side effects, TTL clock untouched.
         """
-        if getattr(ctx.tool_call, "name", None) != "execute":
+        tool_name = getattr(ctx.tool_call, "name", None)
+        if tool_name not in ("execute", "monitor"):
             return None
         if not self.command_rules:
             return None
 
         raw_args = ctx.args
-        if isinstance(raw_args, _ExecuteArgs):
+        if isinstance(raw_args, (_ExecuteArgs, _MonitorArgs)):
             command = raw_args.command
         elif isinstance(raw_args, dict):
             command_value = raw_args.get("command")
@@ -863,7 +3035,7 @@ class SandboxMiddleware(Middleware):
 
         try:
             answer = await self.channel.approve(
-                tool_name="execute",
+                tool_name=tool_name,
                 tool_call_id=ctx.tool_call.id,
                 args={"command": command},
                 details={"matched_pattern": pattern, "command": command},

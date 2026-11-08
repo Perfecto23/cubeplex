@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useTranslations } from 'next-intl'
 
@@ -22,10 +22,24 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
+import { DiscoveryPanel } from './DiscoveryPanel'
 import { ProviderLogo } from './ProviderLogo'
 import { ProviderFormDialog } from './ProviderFormDialog'
 import { ModelFormDialog } from './ModelFormDialog'
 import { ModelRow } from './ModelRow'
+
+const EMPTY_CAPABILITY: Record<string, unknown> = {}
+
+function capabilityOverrideFor(
+  provider: { model_capability_overrides?: Record<string, unknown> },
+  model: { model_id: string } | null,
+): Record<string, unknown> | null {
+  if (!model || !provider.model_capability_overrides) return null
+  if (!(model.model_id in provider.model_capability_overrides)) return null
+  const value = provider.model_capability_overrides[model.model_id]
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
 
 /**
  * Backend's ModelInUseByPresetError carries refs in two places:
@@ -134,10 +148,15 @@ export function ProviderDetail({
   const [testingAll, setTestingAll] = useState(false)
   const [testingConn, setTestingConn] = useState(false)
 
+  const testController = useRef<AbortController | null>(null)
+  useEffect(() => () => testController.current?.abort(), [])
+
   const isSystem = provider.is_system
 
   async function handleTestAll() {
     if (models.length === 0) return
+    testController.current?.abort()
+    testController.current = new AbortController()
     setTestingAll(true)
     setModelError(null)
     try {
@@ -145,6 +164,7 @@ export function ProviderDetail({
         client,
         provider.id,
         models.map((m) => m.id),
+        testController.current.signal,
       )
       // Drain the stream so the backend records each model result.
       for await (const _e of parseTestStream(stream)) {
@@ -196,6 +216,7 @@ export function ProviderDetail({
       await onCreateModel(client, provider.id, body)
       setModelFormOpen(false)
       setEditingModel(null)
+      if ('capability' in body) onRefresh?.()
     } catch (e) {
       setModelError((e as Error).message)
       throw e
@@ -209,6 +230,7 @@ export function ProviderDetail({
       await onUpdateModel(client, provider.id, editingModel.id, body)
       setModelFormOpen(false)
       setEditingModel(null)
+      if ('capability' in body) onRefresh?.()
     } catch (e) {
       setModelError((e as Error).message)
       throw e
@@ -343,6 +365,14 @@ export function ProviderDetail({
       )}
 
       <Separator />
+      {!isSystem && (
+        <DiscoveryPanel
+          key={`${provider.id}:${provider.configuration_revision}`}
+          client={client}
+          provider={provider}
+          onImported={() => onRefresh?.()}
+        />
+      )}
 
       <section>
         <div className="mb-3 flex items-center justify-between">
@@ -494,6 +524,7 @@ export function ProviderDetail({
                 }}
                 onDelete={(model) => void handleDeleteModel(model)}
                 onRetested={() => onRefresh?.()}
+                hasCustomCapability={capabilityOverrideFor(provider, m) != null}
               />
             ))}
           </div>
@@ -503,7 +534,7 @@ export function ProviderDetail({
       <ProviderFormDialog
         open={editOpen}
         onOpenChange={setEditOpen}
-        provider={provider}
+        provider={{ ...provider, models }}
         onSave={handleEditSave}
       />
 
@@ -514,6 +545,8 @@ export function ProviderDetail({
           if (!open) setEditingModel(null)
         }}
         model={editingModel}
+        providerCapability={provider.capability ?? EMPTY_CAPABILITY}
+        capabilityOverride={capabilityOverrideFor(provider, editingModel)}
         onSave={
           editingModel
             ? (body) => handleUpdateModel(body as ModelUpdate)

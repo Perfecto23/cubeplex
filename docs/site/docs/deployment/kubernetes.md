@@ -6,7 +6,7 @@ title: Kubernetes (Helm)
 # CubePlex on Kubernetes
 
 A single `helm upgrade --install` deploys CubePlex (backend + frontend +
-Postgres + Redis + rustfs + the alibaba OpenSandbox umbrella) to
+Postgres + Redis + rustfs + Tempo + the alibaba OpenSandbox umbrella) to
 an existing Kubernetes cluster.
 
 The backend Deployment requires two standard Kubernetes Pod features: **init
@@ -49,17 +49,19 @@ Namespace: cubeplex
 │    /*                → frontend Service:3000                 │
 ├───────────────────────────────────────────────────────────────┤
 │  backend Deployment (1 replica)                               │
-│    initContainer: wait for postgres, run `alembic upgrade`    │
+│    initContainer: wait for postgres, verify schema cutover    │
 │    container:     uvicorn (cubeplex.api.app:create_app)        │
 │    mounts: ConfigMap (non-secret) + Secret (secret)           │
 ├───────────────────────────────────────────────────────────────┤
 │  frontend Deployment (1 replica)                              │
 │    Next.js standalone runtime (node server.js)                │
 ├──────────────┬─────────────┬───────────────┬──────────────────┤
-│ postgres SS  │ redis SS    │ rustfs SS     │ opensandbox      │
-│  + PVC       │  + PVC      │  + PVC + Job  │ (bundled         │
-│              │             │  (bucket init)│  subchart)       │
-└──────────────┴─────────────┴───────────────┴──────────────────┘
+│ postgres SS  │ redis SS    │ rustfs SS     │ tempo SS         │
+│  + PVC       │  + PVC      │  + PVC + Job  │  + PVC           │
+│              │             │  (bucket init)│  ClusterIP only  │
+├──────────────┴─────────────┴───────────────┴──────────────────┤
+│  opensandbox (bundled subchart)                               │
+└───────────────────────────────────────────────────────────────┘
                                             │
                                             └── LLM providers (external)
 ```
@@ -69,11 +71,13 @@ chart creates. Override `storageClass.basePath` for a different node path,
 or set `storageClass.create: false` and point each StatefulSet at an
 existing class.
 
-Two more optional in-namespace services can be turned on: the egress
+Tempo ([§4.12](#412-tempo-tracing-default-on)) is on by default. It is
+ClusterIP-only and never on Ingress; the backend ConfigMap is auto-wired to
+it. Two more optional in-namespace services can be turned on: the egress
 secret-injection webhook ([§4.10](#410-egress-secret-injection-optional))
 and a docling-serve document parser
 ([§4.11](#411-docling-document-parsing-optional), Deployment + models PVC).
-Both are off by default.
+Both of those are off by default.
 
 ## 3. Images
 
@@ -184,8 +188,8 @@ Set `image` only to override:
 ```yaml
 image:
   # Pin a different image version than the chart's appVersion:
-  backend:  { tag: "v0.7.2" }
-  frontend: { tag: "v0.7.2" }
+  backend:  { tag: "v0.9.4" }
+  frontend: { tag: "v0.9.4" }
 ```
 
 For a self-built / private-registry image, also set the location:
@@ -322,8 +326,7 @@ to start:
 opensandbox:
   opensandbox-server:
     server:
-      image: { repository: "docker.io/opensandbox/server" }
-      ingress: { image: { repository: "docker.io/opensandbox/ingress" } }
+      image: { repository: "docker.io/opensandbox/server", tag: "release-1.1.1" }
     configToml: |
       [server]
       host = "0.0.0.0"
@@ -333,34 +336,48 @@ opensandbox:
       level = "INFO"
       [runtime]
       type = "kubernetes"
-      execd_image = "docker.io/opensandbox/execd:v1.0.19"
+      execd_image = "docker.io/opensandbox/execd:release-1.1.1"
       [kubernetes]
       namespace = "opensandbox"
-      informer_enabled = true
       informer_resync_seconds = 300
       informer_watch_timeout_seconds = 60
-      snapshot_create_timeout_seconds = 900
       workload_provider = "batchsandbox"
       batchsandbox_template_file = "/etc/opensandbox/example.batchsandbox-template.yaml"
       [egress]
-      image = "docker.io/opensandbox/egress:v1.0.12"
+      image = "docker.io/opensandbox/egress:release-1.1.1"
       mode = "dns+nft"
   opensandbox-controller:
     controller:
-      # v0.2.0 on Docker Hub crashes with `flag provided but not defined:
-      # -containerd-socket-path` — that published tag lags the chart's own
-      # template. Pin `latest` until upstream re-cuts a matching v0.2.0.
-      image: { repository: "docker.io/opensandbox/controller", tag: "latest" }
+      image: { repository: "docker.io/opensandbox/controller", tag: "release-1.1.1" }
       snapshot:
-        imageCommitterImage: "docker.io/opensandbox/image-committer:v0.1.0"
+        imageCommitterImage: "docker.io/opensandbox/image-committer:release-1.1.1"
 ```
 
-Also create the `opensandbox-system` and `opensandbox` namespaces before installing —
-neither the umbrella chart nor its subcharts create them:
+The vendored chart's own defaults already point at
+`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>` with
+tag `release-1.1.1` (an empty `tag` means that). Use the `docker.io/` form
+above only when the nodes cannot pull the default registry, or when CRI-O
+rejects short names. `egress.webhook.egressImage` must be the same string as
+`[egress].image`. The server refuses to start with an empty API key; the
+`configToml` value above can instead be left empty if you set
+`OPENSANDBOX_SERVER_API_KEY` from a Secret on the server container. That
+value is compared exactly, so the Secret must not contain a trailing newline.
+
+Create both namespaces before installing. CubePlex turns off the 1.1.1 base
+chart's namespace creation (`base.fastSandbox.namespaces.createSystem` and
+`create` are false): a namespace that already exists without Helm ownership
+cannot be adopted, and the fast-sandbox dataplane namespace is unused. The
+server chart never creates the sandbox workload namespace:
+
 ```bash
 kubectl create namespace opensandbox-system
 kubectl create namespace opensandbox   # where per-conversation sandbox pods actually run
 ```
+
+The server waits 60 seconds (`[kubernetes] sandbox_create_timeout_seconds`)
+for the sandbox pod to become Running. A cold pull of the execd or egress
+image can exceed that, and the create call then returns 504. Pre-pull those
+images on the nodes, or raise the timeout in `configToml`.
 
 ### 4.6 Bundled infra passwords (required)
 
@@ -454,12 +471,14 @@ rustfs:
 
 ### 4.9 OpenSandbox subchart
 
-The chart bundles alibaba's OpenSandbox umbrella (controller + server) under
-the same release by default. Its controller / server / execd / egress images default
-to Docker Hub (`opensandbox/*`), which the cluster nodes need to be able to
-pull. For mainland-China clusters, override each with the
-`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/` prefix (same
-image names and tags) in the vendored subchart values.
+The chart bundles the OpenSandbox 1.1.1 umbrella (controller + server) under
+the same release by default. Ingress gateway, node agent, and fast-sandbox stay
+off. Component images default to
+`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>` with
+tag `release-1.1.1`. For a registry the nodes cannot reach, or for CRI-O
+short-name enforcement, override each repository to
+`docker.io/opensandbox/<component>` and set the tag to `release-1.1.1`,
+including `execd_image` and `[egress].image` inside `configToml`.
 
 ```yaml
 opensandbox:
@@ -509,10 +528,10 @@ egress:
   sandboxNamespace: "opensandbox"
   webhook:
     image:
-      tag: "v0.7.2"             # same release version as backend/frontend
+      tag: "v0.9.4"             # same release version as backend/frontend
     # MUST exactly match opensandbox-server's configured egress.image.
-    # China mirror: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.0.12
-    egressImage: "opensandbox/egress:v1.0.12"
+    # Chart default. Docker Hub override: docker.io/opensandbox/egress:release-1.1.1
+    egressImage: "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:release-1.1.1"
 
 backend:
   sandbox:
@@ -626,6 +645,61 @@ backend:
         base_url: "http://docling.example.internal:5001"
 ```
 
+### 4.12 Tempo tracing (default on)
+
+The chart deploys Grafana Tempo 3.0.3 as a single process (`-target=all`)
+with a local filesystem backend and 7-day retention. The backend ConfigMap
+is auto-wired:
+
+- write: `tracing.otlp.endpoint` → `http://<release>-tempo:4318/v1/traces`
+- query: `tracing.tempo.query_endpoint` → `http://<release>-tempo:3200`
+
+The admin trace viewer at `/admin/traces` reads that query endpoint. A 503
+there means Tempo is disabled or `query_endpoint` is still null.
+
+Tempo's query API has no authentication. Org isolation lives only in
+CubePlex (`require_org_admin` plus a TraceQL `org_id` predicate). ClusterIP
+is not tenant isolation. Controls:
+
+- Never on Ingress.
+- NetworkPolicy (default on) allows ports 3200 / 4318 / 4317 only from pods
+  labeled `app.kubernetes.io/component: backend`. Set
+  `tempo.networkPolicy.enabled: false` if kubelet `/ready` probes fail —
+  those come from the node IP, not a pod.
+- `record_content` is false unless you turn it on.
+- JSONL on-disk export is off (`tracing.jsonl.enabled: false`) so spans do
+  not fill the backend writable layer.
+
+```yaml
+tempo:
+  enabled: true
+  image: grafana/tempo:3.0.3
+  retention: 168h
+  recordContent: false
+  networkPolicy:
+    enabled: true
+  persistence:
+    storageClass: cubeplex-work-hostpath
+    size: 10Gi
+```
+
+To disable bundled Tempo and point at an external one:
+
+```yaml
+tempo:
+  enabled: false
+backend:
+  configOverrides:
+    tracing:
+      enabled: true
+      jsonl:
+        enabled: false
+      otlp:
+        endpoint: "http://tempo.observability.svc:4318/v1/traces"
+      tempo:
+        query_endpoint: "http://tempo.observability.svc:3200"
+```
+
 ## 5. Install
 
 ### Recommended: from the published chart
@@ -635,7 +709,7 @@ needed, just your `values.local.yaml`:
 
 ```bash
 helm upgrade --install cubeplex oci://ghcr.io/cubeplexai/charts/cubeplex \
-  --version 0.7.2 \
+  --version 0.9.4 \
   --namespace cubeplex --create-namespace \
   --values values.local.yaml \
   --wait --timeout 10m
@@ -668,6 +742,39 @@ helm upgrade --install cubeplex deploy/kubernetes/charts/cubeplex \
   --wait --timeout 10m
 ```
 
+### Upgrading a database from before the task-lifecycle cutover
+
+The backend init container will refuse this one transition instead of trying
+to migrate underneath old pods during a rolling update. Run a two-step
+maintenance upgrade:
+
+```bash
+# Stop every old API/worker first and wait until no backend pod remains.
+kubectl -n cubeplex scale deployment/cubeplex-backend --replicas=0
+kubectl -n cubeplex wait --for=delete pod \
+  -l app.kubernetes.io/component=backend --timeout=5m
+
+# Upgrade with the one-shot, lock-guarded maintenance hook. Keep replicas at 0.
+helm upgrade cubeplex oci://ghcr.io/cubeplexai/charts/cubeplex \
+  --version <new-version> --namespace cubeplex --values values.local.yaml \
+  --set backend.replicaCount=0 \
+  --set backend.lifecycleMaintenance.enabled=true \
+  --wait --timeout 20m
+
+# After the hook succeeds, disable it and restore the intended replica count.
+helm upgrade cubeplex oci://ghcr.io/cubeplexai/charts/cubeplex \
+  --version <new-version> --namespace cubeplex --values values.local.yaml \
+  --set backend.lifecycleMaintenance.enabled=false \
+  --wait --timeout 10m
+```
+
+The maintenance Job stops on active legacy run-lifetime commands, monitors, or
+commands whose original sandbox instance or provider process handle was not
+recorded. Resolve or stop those items and rerun the same command. It preserves
+unknown provider handles instead of polling or killing the current sandbox by
+guesswork. Fresh installs and databases that already passed this cutover
+continue to use the normal one-command install/upgrade flow.
+
 ### Uninstall
 
 ```bash
@@ -698,6 +805,18 @@ INGRESS_IP=<your node IP> deploy/kubernetes/scripts/smoke-test.sh
 
 Checks: rollout complete, health endpoints respond, ingress routes backend
 + frontend, Next.js renders HTML. Does **not** hit the LLM.
+
+The backend Pod has `prometheus.io/scrape`, `prometheus.io/path`, and
+`prometheus.io/port` annotations for annotation-based Pod discovery. Configure
+your Prometheus installation to use those annotations. `/metrics` is available
+through the backend ClusterIP Service, not the public Ingress. To inspect it:
+
+```bash
+kubectl -n cubeplex port-forward svc/cubeplex-backend 18000:http
+curl http://localhost:18000/metrics
+```
+
+See the [metric list](./overview.md#metrics) for names and counting rules.
 
 ### 6.3 End-to-end test (LLM round-trip)
 
@@ -814,8 +933,8 @@ image:
   registry: "ghcr.io"
   repository: "cubeplexai"
   pullPolicy: "IfNotPresent"
-  backend:  { name: "cubeplex-backend",  tag: "" }     # tag required (e.g. v0.7.2)
-  frontend: { name: "cubeplex-frontend", tag: "" }     # tag required (e.g. v0.7.2)
+  backend:  { name: "cubeplex-backend",  tag: "" }     # tag required (e.g. v0.9.4)
+  frontend: { name: "cubeplex-frontend", tag: "" }     # tag required (e.g. v0.9.4)
 
 backend:
   replicaCount: 1
@@ -886,8 +1005,23 @@ docling:                            # optional, see §4.11
   env: { }                          # e.g. HF_ENDPOINT, HF_TOKEN
   resources: { ... }
 
+tempo:                              # default on, see §4.12
+  enabled: true
+  image: "grafana/tempo:3.0.3"
+  retention: 168h
+  recordContent: false
+  networkPolicy: { enabled: true }
+  persistence: { storageClass, size }
+  resources: { ... }
+
 opensandbox:
   enabled: true
+  base:
+    fastSandbox:
+      namespaces: { createSystem: false, create: false }
+  ingress-gateway: { enabled: false }
+  opensandbox-node-agent: { enabled: false }
+  fast-sandbox: { enabled: false }
   opensandbox-server:     { server:     { replicaCount: 1 } }
   opensandbox-controller: { controller: { replicaCount: 1 } }
 ```
@@ -896,8 +1030,8 @@ opensandbox:
 
 ```yaml
 image:
-  backend:  { tag: "v0.7.2" }
-  frontend: { tag: "v0.7.2" }
+  backend:  { tag: "v0.9.4" }
+  frontend: { tag: "v0.9.4" }
 
 backend:
   configOverrides:

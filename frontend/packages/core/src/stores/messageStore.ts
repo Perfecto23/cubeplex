@@ -10,13 +10,19 @@ import type {
   AgentEvent,
   ArtifactEventData,
   AssistantMessage as AssistantMessageType,
+  BackgroundTask,
+  BackgroundTaskEvent,
+  BackgroundTaskEventPage,
+  BackgroundTaskSummary,
   ContentBlock,
   ErrorEventData,
   FailoverEvent,
   RetryEvent,
+  RunControlStatus,
   Message,
   ReasoningEvent,
   TextDeltaEvent,
+  StopAllStatus,
   ReasoningControl,
   TodoItem,
   ToolCallDeltaEvent,
@@ -32,8 +38,14 @@ import {
   ApiError,
   cancelActiveRun,
   cancelSteer,
+  getAdmittedRunId,
   getConversationBootstrap,
+  getConversationExecutionGeneration,
   getHistoryWindow,
+  listBackgroundTaskEvents,
+  listBackgroundTasks,
+  stopAllConversationWork,
+  stopBackgroundTask as requestBackgroundTaskStop,
   steerRun,
   streamMessages,
   streamRun,
@@ -75,6 +87,9 @@ type InjectedMessageData = {
   steer_id: string
   sender_user_id?: string
   sender_display_name?: string
+  source?: string
+  notice_id?: string
+  execution_generation?: number
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -198,12 +213,25 @@ export interface MessageStore {
   messages: Record<string, Message[]>
   /** Per-conversation bootstrap state for the initial history window. */
   loadingMessagesByConv: Record<string, boolean>
+  bootstrapEtags: Record<string, string | null>
   pendingSteers: Record<string, PendingSteer[]>
+  backgroundTasks: Record<string, BackgroundTask[]>
+  backgroundEvents: Record<string, BackgroundTaskEvent[]>
+  backgroundEventCursor: Record<string, string | null>
+  backgroundEventsHasMore: Record<string, boolean>
+  backgroundSummary: Record<string, BackgroundTaskSummary>
+  executionGeneration: Record<string, number>
+  stopAllStatus: Record<string, StopAllStatus | null>
+  runControl: Record<string, RunControlStatus | null>
+  refreshingBackground: Record<string, true>
+  backgroundRefreshError: Record<string, string | null>
   runLifecycle: Record<string, RunLifecycle>
   streamAgents: Record<string, AgentStream> // "main" or "subagent:xxx"
   isStreaming: boolean
   streamingConversationId: string | null
   currentRunId: string | null
+  /** Client request identity used to recover only this tab's admitted run. */
+  pendingRunClientMessageId: string | null
   /** Live SSE pipe for the owned run. Null when no client is attached. */
   streamConnection: StreamConnection
   /** Set by the answer handlers to tell the next bootstrap "don't re-seed
@@ -268,7 +296,9 @@ export interface MessageStore {
     conversationId: string,
     options?: {
       force?: boolean
+      conditional?: boolean
       throwOnError?: boolean
+      preserveLoadedHistory?: boolean
       preserveOtherConversationStream?: boolean
     },
   ): Promise<void>
@@ -293,7 +323,7 @@ export interface MessageStore {
     content: string,
     attachmentIds?: string[],
     attachments?: import('../types').MessageAttachment[],
-    options?: { model_key?: string | null; reasoning?: ReasoningControl },
+    options?: { model_key?: string | null; reasoning?: ReasoningControl | null },
   ): Promise<void>
   /**
    * Append a ``model_failover`` event to the conversation's banner list.
@@ -308,6 +338,10 @@ export interface MessageStore {
    * without starting a run. Idempotent when the same ``id`` already exists.
    */
   appendHistoryMessage(conversationId: string, message: Message): void
+  refreshBackground(client: ApiClient, conversationId: string): Promise<void>
+  loadMoreBackgroundEvents(client: ApiClient, conversationId: string): Promise<void>
+  stopTask(client: ApiClient, conversationId: string, taskId: string): Promise<void>
+  stopAllWork(client: ApiClient, conversationId: string): Promise<void>
   cancelStream(client: ApiClient, conversationId: string): Promise<void>
   steer(client: ApiClient, conversationId: string, content: string): Promise<boolean>
   cancelSteer(client: ApiClient, conversationId: string, steerId: string): Promise<boolean>
@@ -375,7 +409,42 @@ function withoutConversationFlag(
   return next
 }
 
+function mergeBackgroundEventPage(
+  currentItems: BackgroundTaskEvent[],
+  currentCursor: string | null | undefined,
+  currentHasMore: boolean | undefined,
+  page: BackgroundTaskEventPage,
+): {
+  items: BackgroundTaskEvent[]
+  cursor: string | null
+  hasMore: boolean
+} {
+  const currentIds = new Set(currentItems.map((event) => event.id))
+  const pageOverlapsCurrent = page.items.some((event) => currentIds.has(event.id))
+  const items = [
+    ...new Map(
+      [...currentItems, ...page.items]
+        .sort((left, right) => left.revision - right.revision)
+        .map((event) => [event.id, event]),
+    ).values(),
+  ]
+
+  if (currentHasMore === undefined) {
+    return { items, cursor: page.next_cursor, hasMore: page.has_more }
+  }
+  if (currentHasMore) {
+    return pageOverlapsCurrent
+      ? { items, cursor: currentCursor ?? page.next_cursor, hasMore: true }
+      : { items, cursor: page.next_cursor, hasMore: page.has_more }
+  }
+  if (page.has_more && !pageOverlapsCurrent) {
+    return { items, cursor: page.next_cursor, hasMore: true }
+  }
+  return { items, cursor: null, hasMore: false }
+}
+
 const CANCEL_POLL_INTERVAL_MS = 500
+const CANCEL_RUN_ID_WAIT_MS = 5_000
 const CANCEL_STEER_MAX_ATTEMPTS = 10
 
 async function waitForConversationIdle(
@@ -385,8 +454,14 @@ async function waitForConversationIdle(
 ): Promise<boolean> {
   while (get().cancellingConversationIds[conversationId]) {
     try {
-      const bootstrap = await getConversationBootstrap(client, conversationId)
-      if (!bootstrap.active_run && !bootstrap.pending_hitl) return true
+      const { bootstrap } = await getConversationBootstrap(client, conversationId)
+      if (
+        bootstrap &&
+        !bootstrap.active_run &&
+        !bootstrap.pending_hitl &&
+        !bootstrap.run_control?.cleanup_pending
+      )
+        return true
     } catch (err) {
       // Deleted/inaccessible conversations cannot accept another send. Other
       // failures are usually transient; retain the lock and retry instead of
@@ -396,6 +471,57 @@ async function waitForConversationIdle(
     await new Promise((resolve) => setTimeout(resolve, CANCEL_POLL_INTERVAL_MS))
   }
   return false
+}
+
+function waitForPendingRunId(client: ApiClient, conversationId: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const clientMessageId = useMessageStore.getState().pendingRunClientMessageId
+    let settled = false
+    let unsubscribe = (): void => undefined
+    let probeTimer: ReturnType<typeof setTimeout> | null = null
+    const deadlineTimer = setTimeout(() => finish(null), CANCEL_RUN_ID_WAIT_MS)
+    const finish = (runId: string | null): void => {
+      if (settled) return
+      settled = true
+      if (probeTimer) clearTimeout(probeTimer)
+      clearTimeout(deadlineTimer)
+      unsubscribe()
+      resolve(runId)
+    }
+    const inspect = (state: MessageStore): void => {
+      if (state.streamingConversationId !== conversationId || !state.isStreaming) {
+        finish(null)
+        return
+      }
+      if (clientMessageId !== null && state.pendingRunClientMessageId !== clientMessageId) {
+        finish(null)
+        return
+      }
+      if (state.currentRunId) {
+        finish(state.currentRunId)
+      }
+    }
+    const probe = async (): Promise<void> => {
+      if (settled) return
+      try {
+        const runId = clientMessageId
+          ? await getAdmittedRunId(client, conversationId, clientMessageId)
+          : null
+        if (settled) return
+        if (runId) {
+          finish(runId)
+          return
+        }
+      } catch {
+        // The local subscription can still provide the run ID. Retry the
+        // persisted lookup until the bounded deadline expires.
+      }
+      if (!settled) probeTimer = setTimeout(() => void probe(), CANCEL_POLL_INTERVAL_MS)
+    }
+    unsubscribe = useMessageStore.subscribe(inspect)
+    inspect(useMessageStore.getState())
+    if (!settled) void probe()
+  })
 }
 
 async function reconcileAfterStop(
@@ -481,16 +607,18 @@ function maybeAutoOpenFilePreview(
     const current = panel.view.toolRef
     const sameId = Boolean(toolRef.tool_call_id) && current?.tool_call_id === toolRef.tool_call_id
     const sameIndex =
+      !(toolRef.tool_call_id && current?.tool_call_id) &&
       toolRef.index != null &&
       current?.index === toolRef.index &&
       current?.agent_id === toolRef.agent_id
     if (sameId || sameIndex) {
-      if (Object.keys(args).length > 0) {
+      const hasArgs = Object.keys(args).length > 0
+      if (hasArgs || (toolRef.tool_call_id && !current?.tool_call_id)) {
         usePanelStore.setState({
           view: {
             ...panel.view,
             toolName,
-            toolArgs: args,
+            toolArgs: hasArgs ? args : panel.view.toolArgs,
             toolRef,
           },
         })
@@ -504,13 +632,14 @@ function maybeAutoOpenFilePreview(
 
 /** Dedup map for ``loadMessages``: the page-level effect and ``<MessageList>``'s
  *  effect both fire on mount, but we only want one bootstrap fetch per open. */
-const loadMessagesInFlight = new Map<string, Promise<void>>()
+const loadMessagesInFlight = new Map<string, { promise: Promise<void>; conditional: boolean }>()
 
 /** Dedup map for ``loadOlderMessages``: a user click on "Load earlier" and the
  *  ``loadOlderUntilSeq`` deep-link loop may both fire concurrently. Sharing
  *  the in-flight promise lets the loop ``await`` the click's fetch instead
  *  of short-circuiting without progress. */
 const loadOlderInFlight = new Map<string, Promise<void>>()
+const HISTORY_GAP_PAGE_SIZE = 500
 
 const MAIN_AGENT_KEY = 'main'
 
@@ -555,10 +684,15 @@ function normalizeThinkingTiming(blocks: ContentBlock[]): ContentBlock[] {
   })
 }
 
-function normalizeMessages(messages: Message[]): Message[] {
+function normalizeMessages(messages: Message[], conversationId: string): Message[] {
   return messages.map((msg) => {
-    // Some legacy fixtures may omit `id`; synthesize one for React keys.
-    const withId = msg.id ? msg : { ...msg, id: nextMessageId(msg.role) }
+    // Checkpoint messages have a stable seq but no id. Keep React keys across refreshes.
+    const withId = msg.id
+      ? msg
+      : {
+          ...msg,
+          id: msg.seq != null ? `history-${conversationId}-${msg.seq}` : nextMessageId(msg.role),
+        }
     if (
       withId.role !== 'tool_result' &&
       Array.isArray(withId.content) &&
@@ -568,6 +702,139 @@ function normalizeMessages(messages: Message[]): Message[] {
     }
     return withId
   })
+}
+
+function reuseEqualValue<T>(current: T, next: T): T {
+  return current === next || JSON.stringify(current) === JSON.stringify(next) ? current : next
+}
+
+function reuseHistoryMessages(current: Message[], next: Message[]): Message[] {
+  const byId = new Map(current.map((message) => [message.id, message]))
+  const shared = next.map((message) => {
+    const previous = byId.get(message.id)
+    return previous ? reuseEqualValue(previous, message) : message
+  })
+  return shared.length === current.length && shared.every((message, i) => message === current[i])
+    ? current
+    : shared
+}
+
+function mergeHistoryTail(current: Message[], tail: Message[]): Message[] {
+  const tailIds = new Set(tail.map((message) => message.id))
+  const tailSeqs = new Set(
+    tail.flatMap((message) => (message.seq === undefined ? [] : [message.seq])),
+  )
+  const persistedCounterparts = new Map<string, number>()
+  for (const message of tail) {
+    const key = historyCounterpartKey(message)
+    if (key !== null) persistedCounterparts.set(key, (persistedCounterparts.get(key) ?? 0) + 1)
+  }
+  const retained: Message[] = []
+  // Bootstrap returns the newest history page. Match repeated identities from
+  // the end so a partial tail page replaces the latest local turn, not an
+  // earlier turn from the same run.
+  for (let index = current.length - 1; index >= 0; index -= 1) {
+    const message = current[index]
+    if (tailIds.has(message.id) || (message.seq !== undefined && tailSeqs.has(message.seq))) {
+      continue
+    }
+    if (message.seq !== undefined) {
+      retained.push(message)
+      continue
+    }
+    const key = historyCounterpartKey(message)
+    if (key === null) {
+      retained.push(message)
+      continue
+    }
+    const remaining = persistedCounterparts.get(key) ?? 0
+    if (remaining === 0) {
+      retained.push(message)
+      continue
+    }
+    persistedCounterparts.set(key, remaining - 1)
+  }
+  return sortHistoryMessages([...retained.reverse(), ...tail])
+}
+
+async function fillHistoryGap(
+  client: ApiClient,
+  conversationId: string,
+  current: Message[],
+  tail: Message[],
+): Promise<Message[]> {
+  const currentSeqs = current.flatMap((message) => (message.seq === undefined ? [] : [message.seq]))
+  const tailSeqs = tail.flatMap((message) => (message.seq === undefined ? [] : [message.seq]))
+  if (currentSeqs.length === 0 || tailSeqs.length === 0) return tail
+
+  const currentNewest = Math.max(...currentSeqs)
+  let cursor = Math.min(...tailSeqs)
+  if (cursor <= currentNewest) return tail
+
+  let bridge: Message[] = []
+  const visitedCursors = new Set<number>()
+  while (cursor > currentNewest && !visitedCursors.has(cursor)) {
+    visitedCursors.add(cursor)
+    const page = await getHistoryWindow(client, conversationId, {
+      beforeSeq: cursor,
+      limit: HISTORY_GAP_PAGE_SIZE,
+    })
+    bridge = [...normalizeMessages(page.messages, conversationId), ...bridge]
+    if (page.oldest_seq === null || page.oldest_seq >= cursor || !page.has_more) break
+    cursor = page.oldest_seq
+  }
+  return [...bridge, ...tail]
+}
+
+function historyCounterpartKey(message: Message): string | null {
+  const boundary = compactionBoundary(message)
+  if (boundary !== null) return JSON.stringify(['compaction', boundary])
+  if (message.role === 'user' && message.metadata?.source === 'background_task') {
+    const noticeId = message.metadata.notice_id ?? message.metadata.steer_id
+    if (typeof noticeId === 'string' && noticeId) {
+      return JSON.stringify(['background-notice', noticeId])
+    }
+  }
+  const steerId = message.role === 'user' ? message.metadata?.steer_id : undefined
+  if (typeof steerId === 'string') return JSON.stringify(['steer', steerId])
+  const clientMessageId = message.role === 'user' ? message.metadata?.client_message_id : undefined
+  if (typeof clientMessageId === 'string') {
+    return JSON.stringify(['client-message', clientMessageId])
+  }
+  if (typeof message.run_id !== 'string') return null
+  if (message.role === 'tool_result') {
+    return JSON.stringify([message.run_id, message.role, message.tool_call_id])
+  }
+  if (message.role === 'assistant') {
+    return JSON.stringify([message.run_id, message.role])
+  }
+  return JSON.stringify([message.run_id, message.role, message.content])
+}
+
+function compactionBoundary(message: Message): number | null {
+  if (message.role !== 'user') return null
+  const meta = message.metadata
+  if (!meta || meta.synthetic !== true) return null
+  if (meta.synthetic_source !== 'compaction' && meta.kind !== 'compaction') return null
+  const compaction = meta.compaction
+  if (!compaction || typeof compaction !== 'object' || !('boundary' in compaction)) return null
+  return typeof compaction.boundary === 'number' ? compaction.boundary : null
+}
+
+function sortHistoryMessages(messages: Message[]): Message[] {
+  if (messages.every((message) => message.seq !== undefined)) {
+    return messages.sort((left, right) => (left.seq as number) - (right.seq as number))
+  }
+  if (messages.every((message) => message.timestamp != null)) {
+    return messages.sort((left, right) => (left.timestamp as number) - (right.timestamp as number))
+  }
+  const sequenced = messages
+    .filter((message) => message.seq !== undefined)
+    .sort((left, right) => (left.seq as number) - (right.seq as number))
+  const unsequenced = messages
+    .filter((message) => message.seq === undefined)
+    .sort((left, right) => (left.timestamp ?? Infinity) - (right.timestamp ?? Infinity))
+  return [...sequenced, ...unsequenced]
 }
 
 /** Finalize the last thinking block's duration if switching to a different block type */
@@ -742,6 +1009,24 @@ function hydrateCitationsFromHistory(conversationId: string, messages: Message[]
   }
 }
 
+function toolResultsFromHistory(messages: Message[]): MessageStore['toolResultMap'] {
+  const results: MessageStore['toolResultMap'] = {}
+  for (const message of messages) {
+    if (message.role !== 'tool_result' || !message.tool_call_id) continue
+    const timing = toolTimingFromDetails(message.details)
+    results[message.tool_call_id] = {
+      content: message.content
+        .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+        .map((block) => block.text)
+        .join(''),
+      receivedAt: timing.receivedAt ?? (message.timestamp ?? 0) * 1000,
+      startedAt: timing.startedAt,
+      details: message.details,
+    }
+  }
+  return results
+}
+
 /**
  * Batched state updater: collects multiple set() calls within a single microtask
  * and flushes them as one Zustand update. This prevents N SSE events arriving in
@@ -902,13 +1187,18 @@ function applyStreamEvent(state: MessageStore, event: AgentEvent): Partial<Messa
         : state.toolStartedMap
 
     const existingIdx = blocks.findIndex(
-      (block) => block.type === 'tool_call_streaming' && block.index === idx,
+      (block) =>
+        block.type === 'tool_call_streaming' &&
+        (block.tool_call_id && e.data.tool_call_id
+          ? block.tool_call_id === e.data.tool_call_id
+          : block.index === idx),
     )
 
     if (existingIdx >= 0) {
       const existing = blocks[existingIdx] as Extract<ContentBlock, { type: 'tool_call_streaming' }>
       blocks[existingIdx] = {
         ...existing,
+        name: e.data.name || existing.name,
         args_text: existing.args_text + (e.data.args_delta || ''),
         tool_call_id: e.data.tool_call_id ?? existing.tool_call_id,
       }
@@ -1293,6 +1583,7 @@ async function finalizeCompletedStream(
         pendingAsk: null,
         streamingConversationId: null,
         currentRunId: null,
+        pendingRunClientMessageId: null,
         statusPhase: null,
         pendingSteers: {
           ...state.pendingSteers,
@@ -1335,6 +1626,7 @@ async function finalizeCompletedStream(
       pendingAsk: null,
       streamingConversationId: null,
       currentRunId: null,
+      pendingRunClientMessageId: null,
       statusPhase: null,
       pendingSteers: {
         ...state.pendingSteers,
@@ -1519,6 +1811,7 @@ async function consumeRunStream(
                       pendingAsk: null,
                       streamingConversationId: null,
                       currentRunId: null,
+                      pendingRunClientMessageId: null,
                       statusPhase: null,
                       streamConnection: null,
                       runLifecycle: { ...s.runLifecycle, [conversationId]: 'idle' },
@@ -1621,8 +1914,8 @@ async function consumeRunStream(
         return
       }
       try {
-        const bootstrap = await getConversationBootstrap(client, conversationId)
-        if (bootstrap.active_run?.run_id !== runId) {
+        const { bootstrap } = await getConversationBootstrap(client, conversationId)
+        if (bootstrap && bootstrap.active_run?.run_id !== runId) {
           shouldFinalize = false
           set({ streamConnection: null })
           queueMicrotask(() => {
@@ -1658,12 +1951,24 @@ const unreadMarkAt: Record<string, number> = {}
 export const useMessageStore = create<MessageStore>((set, get) => ({
   messages: {},
   loadingMessagesByConv: {},
+  bootstrapEtags: {},
   pendingSteers: {},
+  backgroundTasks: {},
+  backgroundEvents: {},
+  backgroundEventCursor: {},
+  backgroundEventsHasMore: {},
+  backgroundSummary: {},
+  executionGeneration: {},
+  stopAllStatus: {},
+  runControl: {},
+  refreshingBackground: {},
+  backgroundRefreshError: {},
   runLifecycle: {},
   streamAgents: {},
   isStreaming: false,
   streamingConversationId: null,
   currentRunId: null,
+  pendingRunClientMessageId: null,
   streamConnection: null,
   lastAnsweredAskQuestionId: null,
   lastResolvedSandboxQuestionId: null,
@@ -1711,7 +2016,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
   },
 
   appendHistoryMessage(conversationId, message) {
-    const [normalized] = normalizeMessages([message])
+    const [normalized] = normalizeMessages([message], conversationId)
     if (!normalized) return
     set((s) => {
       const existing = s.messages[conversationId] ?? []
@@ -1731,34 +2036,315 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     })
   },
 
+  async refreshBackground(client, conversationId) {
+    if (get().refreshingBackground[conversationId]) return
+    const startingSummary = get().backgroundSummary[conversationId]
+    set((state) => ({
+      refreshingBackground: {
+        ...state.refreshingBackground,
+        [conversationId]: true,
+      },
+    }))
+    try {
+      const [inflight, eventPage] = await Promise.all([
+        listBackgroundTasks(client, conversationId),
+        listBackgroundTaskEvents(client, conversationId, { delivery: 'all' }),
+      ])
+      const cachedEvents = get().backgroundEvents[conversationId] ?? []
+      const newestEventIds = new Set(eventPage.items.map((event) => event.id))
+      const unresolvedEventIds = new Set(
+        cachedEvents
+          .filter(
+            (event) =>
+              (event.state === 'pending' || event.state === 'claimed') &&
+              !newestEventIds.has(event.id),
+          )
+          .map((event) => event.id),
+      )
+      const refreshedOlderEvents: BackgroundTaskEvent[] = []
+      const visitedCursors = new Set<string>()
+      let refreshCursor = eventPage.next_cursor
+      let remainingPages = Math.ceil(cachedEvents.length / 50) + 1
+      while (
+        unresolvedEventIds.size > 0 &&
+        refreshCursor !== null &&
+        !visitedCursors.has(refreshCursor) &&
+        remainingPages > 0
+      ) {
+        visitedCursors.add(refreshCursor)
+        const olderPage = await listBackgroundTaskEvents(client, conversationId, {
+          delivery: 'all',
+          cursor: refreshCursor,
+          limit: 50,
+        })
+        refreshedOlderEvents.push(...olderPage.items)
+        for (const event of olderPage.items) unresolvedEventIds.delete(event.id)
+        refreshCursor = olderPage.has_more ? olderPage.next_cursor : null
+        remainingPages -= 1
+      }
+      const refreshedEvents = [...eventPage.items, ...refreshedOlderEvents]
+      const knownIds = new Set<string>()
+      for (const task of inflight) knownIds.add(task.id)
+      for (const event of refreshedEvents) knownIds.add(event.task_id)
+      for (const task of get().backgroundTasks[conversationId] ?? []) knownIds.add(task.id)
+      const boundedIds = [...knownIds].slice(0, 100)
+      const tasks =
+        boundedIds.length > 0
+          ? await listBackgroundTasks(client, conversationId, boundedIds)
+          : inflight
+      const actionableIds = new Set(inflight.map((task) => task.id))
+      const byId = new Map(tasks.map((task) => [task.id, task]))
+      for (const task of inflight) {
+        const current = byId.get(task.id)
+        if (!current || task.revision > current.revision) byId.set(task.id, task)
+      }
+      const mergedTasks = [...byId.values()].sort(
+        (left, right) =>
+          left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id),
+      )
+      const derivedSummary: BackgroundTaskSummary = {
+        // The unfiltered task query is the authoritative actionable set: it
+        // includes every in-flight task, pending notification, and cleanup
+        // row even when that task's event is older than the first event page.
+        // Fresh event/detail reads also cover work created between the two
+        // concurrent snapshot requests.
+        has_inflight: mergedTasks.some((task) =>
+          ['starting', 'running', 'waiting_input', 'unknown'].includes(task.state),
+        ),
+        has_pending:
+          inflight.some((task) => task.notification.has_pending) ||
+          refreshedEvents.some((event) => event.state === 'pending' || event.state === 'claimed'),
+        has_cleanup: mergedTasks.some((task) => task.cleanup_pending),
+        can_stop: mergedTasks.some((task) => task.capabilities.can_stop),
+      }
+      set((state) => ({
+        backgroundTasks: {
+          ...state.backgroundTasks,
+          [conversationId]: [
+            ...new Map(
+              [
+                ...mergedTasks,
+                ...(state.backgroundTasks[conversationId] ?? []).filter(
+                  (task) =>
+                    !(
+                      ['starting', 'running', 'waiting_input', 'unknown'].includes(task.state) ||
+                      task.cleanup_pending ||
+                      task.notification.has_pending ||
+                      task.capabilities.can_stop
+                    ) || actionableIds.has(task.id),
+                ),
+              ]
+                .sort((left, right) => left.revision - right.revision)
+                .map((task) => [task.id, task]),
+            ).values(),
+          ].sort(
+            (left, right) =>
+              left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id),
+          ),
+        },
+        ...(() => {
+          const merged = mergeBackgroundEventPage(
+            state.backgroundEvents[conversationId] ?? [],
+            state.backgroundEventCursor[conversationId],
+            state.backgroundEventsHasMore[conversationId],
+            eventPage,
+          )
+          const items = [
+            ...new Map(
+              [...merged.items, ...refreshedOlderEvents]
+                .sort((left, right) => left.revision - right.revision)
+                .map((event) => [event.id, event]),
+            ).values(),
+          ]
+          return {
+            backgroundEvents: {
+              ...state.backgroundEvents,
+              [conversationId]: items,
+            },
+            backgroundEventCursor: {
+              ...state.backgroundEventCursor,
+              [conversationId]: merged.cursor,
+            },
+            backgroundEventsHasMore: {
+              ...state.backgroundEventsHasMore,
+              [conversationId]: merged.hasMore,
+            },
+          }
+        })(),
+        backgroundSummary: {
+          ...state.backgroundSummary,
+          [conversationId]:
+            state.backgroundSummary[conversationId] !== startingSummary
+              ? {
+                  has_inflight:
+                    derivedSummary.has_inflight ||
+                    Boolean(state.backgroundSummary[conversationId]?.has_inflight),
+                  has_pending:
+                    derivedSummary.has_pending ||
+                    Boolean(state.backgroundSummary[conversationId]?.has_pending),
+                  has_cleanup:
+                    derivedSummary.has_cleanup ||
+                    Boolean(state.backgroundSummary[conversationId]?.has_cleanup),
+                  can_stop:
+                    derivedSummary.can_stop ||
+                    Boolean(state.backgroundSummary[conversationId]?.can_stop),
+                }
+              : {
+                  has_inflight: derivedSummary.has_inflight,
+                  has_pending: derivedSummary.has_pending,
+                  has_cleanup: derivedSummary.has_cleanup,
+                  can_stop: derivedSummary.can_stop,
+                },
+        },
+        refreshingBackground: withoutConversationFlag(state.refreshingBackground, conversationId),
+        backgroundRefreshError: {
+          ...state.backgroundRefreshError,
+          [conversationId]: null,
+        },
+      }))
+    } catch (error) {
+      set((state) => ({
+        refreshingBackground: withoutConversationFlag(state.refreshingBackground, conversationId),
+        backgroundRefreshError: {
+          ...state.backgroundRefreshError,
+          [conversationId]: error instanceof Error ? error.message : String(error),
+        },
+      }))
+      throw error
+    }
+  },
+
+  async loadMoreBackgroundEvents(client, conversationId) {
+    const cursor = get().backgroundEventCursor[conversationId]
+    if (!cursor || !get().backgroundEventsHasMore[conversationId]) return
+    const page = await listBackgroundTaskEvents(client, conversationId, {
+      delivery: 'all',
+      cursor,
+    })
+    const taskIds = [...new Set(page.items.map((event) => event.task_id))].slice(0, 100)
+    const tasks =
+      taskIds.length > 0 ? await listBackgroundTasks(client, conversationId, taskIds) : []
+    set((state) => {
+      const events = new Map(
+        [...(state.backgroundEvents[conversationId] ?? []), ...page.items]
+          .sort((left, right) => left.revision - right.revision)
+          .map((event) => [event.id, event]),
+      )
+      const taskMap = new Map(
+        [...(state.backgroundTasks[conversationId] ?? []), ...tasks]
+          .sort((left, right) => left.revision - right.revision)
+          .map((task) => [task.id, task]),
+      )
+      const cursorStillCurrent = state.backgroundEventCursor[conversationId] === cursor
+      return {
+        backgroundEvents: {
+          ...state.backgroundEvents,
+          [conversationId]: [...events.values()],
+        },
+        backgroundEventCursor: {
+          ...state.backgroundEventCursor,
+          [conversationId]: cursorStillCurrent
+            ? page.next_cursor
+            : state.backgroundEventCursor[conversationId],
+        },
+        backgroundEventsHasMore: {
+          ...state.backgroundEventsHasMore,
+          [conversationId]: cursorStillCurrent
+            ? page.has_more
+            : state.backgroundEventsHasMore[conversationId],
+        },
+        backgroundTasks: {
+          ...state.backgroundTasks,
+          [conversationId]: [...taskMap.values()],
+        },
+      }
+    })
+  },
+
+  async stopTask(client, conversationId, taskId) {
+    const result = await requestBackgroundTaskStop(client, conversationId, taskId)
+    set((state) => {
+      const current = state.backgroundTasks[conversationId] ?? []
+      const next = current.some((task) => task.id === result.task.id)
+        ? current.map((task) =>
+            task.id === result.task.id && result.task.revision >= task.revision
+              ? result.task
+              : task,
+          )
+        : [...current, result.task]
+      return {
+        backgroundTasks: { ...state.backgroundTasks, [conversationId]: next },
+      }
+    })
+  },
+
+  async stopAllWork(client, conversationId) {
+    // A new admission reopens a closed conversation by advancing its generation.
+    // Re-read the authoritative value at click time so a long-open tab never
+    // submits a harmless-but-misleading Stop-all against an older generation.
+    const generation = await getConversationExecutionGeneration(client, conversationId)
+    const result = await stopAllConversationWork(client, conversationId, generation)
+    set((state) => ({
+      executionGeneration: {
+        ...state.executionGeneration,
+        [conversationId]: generation,
+      },
+      stopAllStatus: {
+        ...state.stopAllStatus,
+        [conversationId]: {
+          execution_generation: result.execution_generation,
+          requested_at: new Date().toISOString(),
+          cleanup_pending: result.cleanup_pending,
+        },
+      },
+    }))
+  },
+
   async loadMessages(
     client: ApiClient,
     conversationId: string,
     options?: {
       force?: boolean
+      conditional?: boolean
       throwOnError?: boolean
+      preserveLoadedHistory?: boolean
       preserveOtherConversationStream?: boolean
     },
   ) {
     const force = options?.force === true
+    const conditional = options?.conditional === true && !force
     const state = get()
     if (!force && state.isStreaming && state.streamingConversationId === conversationId) return
+    const requestKey = JSON.stringify([
+      useAuthStore.getState().user?.id,
+      client.baseUrl,
+      client.workspaceId,
+      conversationId,
+    ])
     // The page-level effect and <MessageList>'s own effect both fire on mount
     // — dedupe so the (heavy) bootstrap fetch runs once per conversation open.
-    const existingLoad = loadMessagesInFlight.get(conversationId)
-    if (existingLoad) {
-      if (!force) return existingLoad
-      await existingLoad
+    let existingLoad = loadMessagesInFlight.get(requestKey)
+    while (existingLoad) {
+      if (!force && (conditional || !existingLoad.conditional)) return existingLoad.promise
+      // Recovery still needs a full response if the background check failed.
+      await existingLoad.promise.catch(() => undefined)
+      existingLoad = loadMessagesInFlight.get(requestKey)
     }
-    set((s) => ({
-      loadingMessagesByConv: {
-        ...s.loadingMessagesByConv,
-        [conversationId]: true,
-      },
-    }))
+    const showLoading = !conditional || get().messages[conversationId] === undefined
+    if (showLoading) {
+      set((s) => ({
+        loadingMessagesByConv: { ...s.loadingMessagesByConv, [conversationId]: true },
+      }))
+    }
     const promise = (async () => {
       try {
-        const bootstrap = await getConversationBootstrap(client, conversationId)
+        const etag =
+          conditional && get().messages[conversationId] !== undefined
+            ? (get().bootstrapEtags[requestKey] ?? undefined)
+            : undefined
+        const response = await getConversationBootstrap(client, conversationId, etag)
+        const { bootstrap } = response
+        if (bootstrap === null) return
         const current = get()
         if (
           options?.preserveOtherConversationStream &&
@@ -1770,7 +2356,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
         if (!force && current.isStreaming && current.streamingConversationId === conversationId)
           return
 
-        let messages = normalizeMessages(bootstrap.messages ?? [])
+        let messages = normalizeMessages(bootstrap.messages ?? [], conversationId)
         if (bootstrap.active_run?.user_message) {
           messages = trimHistoryForActiveRun(
             messages,
@@ -1778,6 +2364,30 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
             bootstrap.active_run.user_message,
             bootstrap.active_run.started_at ?? null,
           )
+        }
+        const preserveHistory = options?.preserveLoadedHistory === true
+        if (preserveHistory) {
+          messages = await fillHistoryGap(
+            client,
+            conversationId,
+            current.messages[conversationId] ?? [],
+            messages,
+          )
+          const refreshed = get()
+          if (
+            options?.preserveOtherConversationStream &&
+            refreshed.streamingConversationId !== null &&
+            refreshed.streamingConversationId !== conversationId
+          ) {
+            return
+          }
+          if (
+            !force &&
+            refreshed.isStreaming &&
+            refreshed.streamingConversationId === conversationId
+          ) {
+            return
+          }
         }
 
         // Backend walks the full history (not just the tail) to pick the
@@ -1789,12 +2399,17 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
         const usageSummary = bootstrap.usage_summary
         const newTurnUsage = {
           ...get().turnUsage,
-          [conversationId]: (usageSummary?.turn ?? null) as import('../types').TurnUsage | null,
+          [conversationId]: reuseEqualValue(
+            get().turnUsage[conversationId] ?? null,
+            (usageSummary?.turn ?? null) as import('../types').TurnUsage | null,
+          ),
         }
         const newSessionUsage = {
           ...get().sessionUsage,
-          [conversationId]: (usageSummary?.session ?? null) as
-            import('../types').SessionUsage | null,
+          [conversationId]: reuseEqualValue(
+            get().sessionUsage[conversationId] ?? null,
+            (usageSummary?.session ?? null) as import('../types').SessionUsage | null,
+          ),
         }
         const newContextWindow = {
           ...get().contextWindow,
@@ -1938,23 +2553,6 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
         const nextError =
           seedError ?? (!hasPersistedAssistant && currentError !== null ? currentError : null)
 
-        // Restore toolResultMap from history so tool preview panels remain
-        // interactive on reload (e.g. edit diff, write completed state).
-        const restoredToolResultMap: MessageStore['toolResultMap'] = {}
-        for (const msg of messages) {
-          if (msg.role !== 'tool_result' || !msg.tool_call_id) continue
-          const timing = toolTimingFromDetails(msg.details)
-          restoredToolResultMap[msg.tool_call_id] = {
-            content: msg.content
-              .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-              .map((b) => b.text)
-              .join(''),
-            receivedAt: timing.receivedAt ?? (msg.timestamp ?? 0) * 1000,
-            startedAt: timing.startedAt,
-            details: msg.details,
-          }
-        }
-
         const injectedHistorySteerIds = new Set(
           messages.flatMap((message) => {
             const steerId = message.role === 'user' ? message.metadata?.steer_id : undefined
@@ -1983,39 +2581,126 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
               left.createdAt.localeCompare(right.createdAt) ||
               left.steerId.localeCompare(right.steerId),
           )
+          const backgroundPage = bootstrap.background_events ?? {
+            items: [],
+            next_cursor: null,
+            has_more: false,
+          }
+          const mergedBackgroundEvents = mergeBackgroundEventPage(
+            s.backgroundEvents[conversationId] ?? [],
+            s.backgroundEventCursor[conversationId],
+            s.backgroundEventsHasMore[conversationId],
+            backgroundPage,
+          )
+          const currentMessages = s.messages[conversationId] ?? []
+          const nextMessages = reuseHistoryMessages(
+            currentMessages,
+            preserveHistory ? mergeHistoryTail(currentMessages, messages) : messages,
+          )
+          const hasExistingCursor = Object.prototype.hasOwnProperty.call(
+            s.oldestSeqByConv,
+            conversationId,
+          )
+          const hasExistingMore = Object.prototype.hasOwnProperty.call(
+            s.hasMoreByConv,
+            conversationId,
+          )
           return {
-            messages: { ...s.messages, [conversationId]: messages },
-            oldestSeqByConv: { ...s.oldestSeqByConv, [conversationId]: bootstrap.oldest_seq },
-            hasMoreByConv: { ...s.hasMoreByConv, [conversationId]: bootstrap.has_more },
-            todos: restoredTodos,
+            bootstrapEtags: { ...s.bootstrapEtags, [requestKey]: response.etag },
+            messages: { ...s.messages, [conversationId]: nextMessages },
+            oldestSeqByConv: {
+              ...s.oldestSeqByConv,
+              [conversationId]:
+                preserveHistory && hasExistingCursor
+                  ? s.oldestSeqByConv[conversationId]
+                  : bootstrap.oldest_seq,
+            },
+            hasMoreByConv: {
+              ...s.hasMoreByConv,
+              [conversationId]:
+                preserveHistory && hasExistingMore
+                  ? s.hasMoreByConv[conversationId]
+                  : bootstrap.has_more,
+            },
+            todos: reuseEqualValue(s.todos, restoredTodos),
             // Clear only when bootstrap has authoritative error state or persisted
             // assistant history; otherwise keep a live error visible through the
             // bootstrap race.
             errors: { ...s.errors, [conversationId]: nextError },
             lastRunStatus: bootstrap.last_run_status ?? null,
-            streamAgents: nextStreamAgents,
+            streamAgents: reuseEqualValue(s.streamAgents, nextStreamAgents),
             pendingSteers: {
               ...s.pendingSteers,
-              [conversationId]: hydratedPending,
+              [conversationId]: reuseEqualValue(
+                s.pendingSteers[conversationId] ?? [],
+                hydratedPending,
+              ),
+            },
+            backgroundTasks: {
+              ...s.backgroundTasks,
+              [conversationId]: s.backgroundTasks[conversationId] ?? [],
+            },
+            backgroundEvents: {
+              ...s.backgroundEvents,
+              [conversationId]: reuseEqualValue(
+                s.backgroundEvents[conversationId] ?? [],
+                mergedBackgroundEvents.items,
+              ),
+            },
+            backgroundEventCursor: {
+              ...s.backgroundEventCursor,
+              [conversationId]: mergedBackgroundEvents.cursor,
+            },
+            backgroundEventsHasMore: {
+              ...s.backgroundEventsHasMore,
+              [conversationId]: mergedBackgroundEvents.hasMore,
+            },
+            backgroundSummary: {
+              ...s.backgroundSummary,
+              [conversationId]: bootstrap.background_summary ?? {
+                has_inflight: false,
+                has_pending: false,
+                has_cleanup: false,
+                can_stop: false,
+              },
+            },
+            executionGeneration: {
+              ...s.executionGeneration,
+              [conversationId]: bootstrap.execution_generation ?? 0,
+            },
+            stopAllStatus: {
+              ...s.stopAllStatus,
+              [conversationId]: bootstrap.stop_all ?? null,
+            },
+            runControl: {
+              ...s.runControl,
+              [conversationId]: bootstrap.run_control ?? null,
             },
             runLifecycle: { ...s.runLifecycle, [conversationId]: lifecycle },
             toolStartedMap: {},
-            toolResultMap: restoredToolResultMap,
+            // A periodic baseline refresh returns only the newest page. Build
+            // this map from the merged history so older loaded tool cards keep
+            // their result state and previews.
+            toolResultMap: reuseEqualValue(s.toolResultMap, toolResultsFromHistory(nextMessages)),
             // When `skipSeed` fired (we just answered this exact question),
             // preserve the current pendingAsk / pendingConfirmMap
             // instead of clearing them. The form stays mounted in its
             // submitting/cancelling state until the SSE `ask_user_resolved`
             // event arrives, which avoids the visible blank gap that
             // optimistic-clear used to produce.
-            pendingConfirmMap: skipSeed ? s.pendingConfirmMap : seedPendingConfirmMap,
-            pendingAsk: skipSeed ? s.pendingAsk : seedPendingAsk,
-            cancellingConversationIds:
-              !bootstrap.active_run && !bootstrap.pending_hitl
+            pendingConfirmMap: skipSeed
+              ? s.pendingConfirmMap
+              : reuseEqualValue(s.pendingConfirmMap, seedPendingConfirmMap),
+            pendingAsk: skipSeed ? s.pendingAsk : reuseEqualValue(s.pendingAsk, seedPendingAsk),
+            cancellingConversationIds: bootstrap.run_control?.cleanup_pending
+              ? { ...s.cancellingConversationIds, [conversationId]: true }
+              : !bootstrap.active_run && !bootstrap.pending_hitl
                 ? withoutConversationFlag(s.cancellingConversationIds, conversationId)
                 : s.cancellingConversationIds,
             isStreaming: isStreamingActive,
             streamingConversationId: streamingActive ? conversationId : null,
             currentRunId: streamRunId,
+            pendingRunClientMessageId: null,
             lastAppliedEventId: streamCursor,
             statusPhase: null,
             turnUsage: newTurnUsage,
@@ -2066,17 +2751,18 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
         }))
       }
     })()
-    loadMessagesInFlight.set(conversationId, promise)
+    loadMessagesInFlight.set(requestKey, { promise, conditional })
     try {
       await promise
     } finally {
-      loadMessagesInFlight.delete(conversationId)
-      set((s) => ({
-        loadingMessagesByConv: {
-          ...s.loadingMessagesByConv,
-          [conversationId]: false,
-        },
-      }))
+      if (loadMessagesInFlight.get(requestKey)?.promise === promise) {
+        loadMessagesInFlight.delete(requestKey)
+      }
+      if (showLoading) {
+        set((s) => ({
+          loadingMessagesByConv: { ...s.loadingMessagesByConv, [conversationId]: false },
+        }))
+      }
     }
   },
 
@@ -2095,7 +2781,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     const promise = (async () => {
       try {
         const page = await getHistoryWindow(client, conversationId, { beforeSeq: cursor })
-        const older = normalizeMessages(page.messages)
+        const older = normalizeMessages(page.messages, conversationId)
         hydrateCitationsFromHistory(conversationId, older)
         set((s) => ({
           messages: {
@@ -2166,7 +2852,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     content: string,
     attachmentIds?: string[],
     attachments?: import('../types').MessageAttachment[],
-    options?: { model_key?: string | null; reasoning?: ReasoningControl },
+    options?: { model_key?: string | null; reasoning?: ReasoningControl | null },
   ) {
     if (get().cancellingConversationIds[conversationId]) {
       throw new ApiError('Previous turn is still finishing.', 409, 'active_run_conflict', null)
@@ -2183,12 +2869,14 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     const senderMeta =
       me != null ? { sender_user_id: me.id, sender_display_name: me.display_name ?? me.email } : {}
 
+    const userMessageId = nextMessageId('user-temp')
     const userMessage: UserMessageType = {
-      id: nextMessageId('user-temp'),
+      id: userMessageId,
       role: 'user',
       content: [{ type: 'text', text: content }],
       timestamp: Date.now() / 1000,
       metadata: {
+        client_message_id: userMessageId,
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
         ...senderMeta,
       },
@@ -2204,6 +2892,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
       runLifecycle: { ...state.runLifecycle, [conversationId]: 'running' },
       streamingConversationId: conversationId,
       currentRunId: null,
+      pendingRunClientMessageId: userMessage.id,
       lastAppliedEventId: null,
       statusPhase: null,
       streamConnection: 'connected',
@@ -2242,6 +2931,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     const handleRunId = (runId: string) => {
       set((s) => ({
         currentRunId: runId,
+        stopAllStatus: { ...s.stopAllStatus, [conversationId]: null },
         messages: {
           ...s.messages,
           [conversationId]: (s.messages[conversationId] ?? []).map((m) =>
@@ -2250,7 +2940,11 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
         },
       }))
     }
-    const streamOptions = { ...(options ?? {}), onRunId: handleRunId }
+    const streamOptions = {
+      ...(options ?? {}),
+      client_message_id: userMessage.id,
+      onRunId: handleRunId,
+    }
 
     let streamSource = streamMessages(
       client,
@@ -2345,6 +3039,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
                         pendingAsk: null,
                         streamingConversationId: null,
                         currentRunId: null,
+                        pendingRunClientMessageId: null,
                         statusPhase: null,
                       }
                     : {}),
@@ -2380,6 +3075,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
                       pendingAsk: null,
                       streamingConversationId: null,
                       currentRunId: null,
+                      pendingRunClientMessageId: null,
                       statusPhase: null,
                       runLifecycle: { ...s.runLifecycle, [conversationId]: 'idle' },
                       lastAppliedEventId: nextEventId(s.lastAppliedEventId, event.event_id),
@@ -2498,6 +3194,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
                 pendingAsk: null,
                 streamingConversationId: null,
                 currentRunId: null,
+                pendingRunClientMessageId: null,
                 streamConnection: null,
                 runLifecycle: { ...s.runLifecycle, [conversationId]: 'idle' },
               }
@@ -2713,6 +3410,15 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
               sender_display_name: data.sender_display_name,
             }
           : {}),
+        ...(data.source === 'background_task'
+          ? {
+              source: data.source,
+              ...(data.notice_id ? { notice_id: data.notice_id } : {}),
+              ...(data.execution_generation !== undefined
+                ? { execution_generation: data.execution_generation }
+                : {}),
+            }
+          : {}),
       },
     }
 
@@ -2745,6 +3451,9 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     const hasPendingHitl =
       state.pendingAsk !== null || Object.keys(state.pendingConfirmMap).length > 0
     const ownsConversation = state.streamingConversationId === conversationId
+    const pendingRunId =
+      state.pendingAsk?.run_id ?? Object.values(state.pendingConfirmMap)[0]?.run_id ?? null
+    let targetRunId: string | null = state.currentRunId ?? pendingRunId
     if (state.cancellingConversationIds[conversationId]) return
     if (!ownsConversation || (!state.isStreaming && !hasPendingHitl)) return
 
@@ -2753,8 +3462,25 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
       runLifecycle: { ...s.runLifecycle, [conversationId]: 'stopping' },
     }))
 
+    if (!targetRunId) {
+      targetRunId = await waitForPendingRunId(client, conversationId)
+      if (!targetRunId) {
+        set((s) => ({
+          cancellingConversationIds: withoutConversationFlag(
+            s.cancellingConversationIds,
+            conversationId,
+          ),
+          runLifecycle:
+            s.isStreaming && s.streamingConversationId === conversationId
+              ? { ...s.runLifecycle, [conversationId]: 'running' }
+              : s.runLifecycle,
+        }))
+        throw new Error('Could not identify the active run. Stop was not applied.')
+      }
+    }
+
     try {
-      await cancelActiveRun(client, conversationId)
+      await cancelActiveRun(client, conversationId, targetRunId)
     } catch (err) {
       set((s) => ({
         cancellingConversationIds: withoutConversationFlag(
@@ -2839,6 +3565,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
           pendingAsk: null,
           streamingConversationId: null,
           currentRunId: null,
+          pendingRunClientMessageId: null,
           statusPhase: null,
           pendingSteers: {
             ...s.pendingSteers,
@@ -2875,6 +3602,16 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
     set({
       streamAgents: {},
       pendingSteers: {},
+      backgroundTasks: {},
+      backgroundEvents: {},
+      backgroundEventCursor: {},
+      backgroundEventsHasMore: {},
+      backgroundSummary: {},
+      executionGeneration: {},
+      stopAllStatus: {},
+      runControl: {},
+      refreshingBackground: {},
+      backgroundRefreshError: {},
       runLifecycle: {},
       streamConnection: null,
       isStreaming: false,
@@ -2884,6 +3621,7 @@ export const useMessageStore = create<MessageStore>((set, get) => ({
       retryEvents: {},
       streamingConversationId: null,
       currentRunId: null,
+      pendingRunClientMessageId: null,
       lastAppliedEventId: null,
       statusPhase: null,
       todos: [],

@@ -4,12 +4,12 @@ This adapter keeps CubePlex's accounts, workspaces, conversations, run IDs, Slac
 
 The local integration flow has passed: the real CubeLoop Worker calls the actual HTTP router, PostgreSQL, Redis and RustFS to execute a command, present a file, pause for human input and resume from a fresh workspace. The Native Runtime is the only AgentCore product runtime, is `READY` in Testing, and real Web/Slack task and follow-up checks have passed. See the [design](../../docs/dev/specs/2026-09-13-agentcore-native-entry-design.md) and [plan](../../docs/dev/plans/2026-09-13-agentcore-native-entry.md). The independent [Git slice](../agentcore-git-slice/README.md) is retired historical evidence, not a product runtime.
 
-The current Testing baseline uses Runtime `cubeplex_native_entry_20260913-sWxaCf7pyC`, Worker source
-`09f272ec4088f72fe709cc89b01d7abd68fe45d3` with digest
-`sha256:b173931fb47dfa4ad1195938b1f4d40ed41d251801fd6467f6d3b2d8624b4edc`, and Backend source
-`5e616137415f7b93d3e86b9514739ba129d9a7c4` with digest
-`sha256:4f53c623cc2daa10fee54b3acfcab2b76e14ff5cb43c44cdccb293feb1c05812`. The Backend migration and
-image must remain on the same source baseline.
+The November refresh integrates upstream main `7abf66d1472565bdcb5f13223bf2e358bfa79180`
+and pins both Backend and Native Worker to CubeLoop 0.16.1. Deployment uses the
+existing Runtime `cubeplex_native_entry_20260913-sWxaCf7pyC` and K3s control plane.
+The fork release manifest records the committed source, all three image digests,
+and the deployed Runtime version. September's Native v2 acceptance remains a
+historical baseline; a new release requires its own deployment checks.
 
 ## What an employee uses
 
@@ -30,13 +30,13 @@ These boundaries keep this stage focused on the control-plane/execution connecti
 
 The Runtime receives `{version: 2, dispatch_id, capability}`. Its HTTPS control-plane origin is fixed by deployment configuration. The purpose-specific capability is accepted only by `/api/v1/agentcore/tasks/{dispatch_id}/...`; the server resolves identity and scope from the immutable dispatch row. A normal user login token cannot act as a task capability.
 
-Checkpoint mutations and their request receipts commit in the same PostgreSQL transaction. Reusing a request ID with another body is rejected. Model-call claims are durable before calling the external provider, so an uncertain model response is not automatically invoked again. Progress events use a per-dispatch sequence and atomic Redis deduplication. Terminal events and run status are applied together, then the dispatch records completion.
+Checkpoint mutations and their request receipts commit in the same PostgreSQL transaction. Reusing a request ID with another body is rejected. Model-call claims are durable before calling the external provider, so an uncertain model response is not automatically invoked again. Progress events use a per-dispatch sequence and atomic Redis deduplication. The immutable dispatch also carries the upstream admission, execution generation and attempt binding. Callbacks verify current execution authority. Terminal outcome is persisted before Redis delivery and slot release; a prepared finish receipt lets the control plane retry only cleanup after interruption.
 
 Successful completion requires both a durable CubeLoop completed-run checkpoint and an acknowledged workspace snapshot. A human-input pause requires the pending question and original run ID to be saved. Stop requests are persisted before stopping the exact AWS Runtime session; an unconfirmed stop remains fenced. New callbacks after a stop cannot mutate the conversation.
 
 ## Build and deploy
 
-Use the normal repository hooks and commit reviewed source before building. [build.sh](build.sh) creates the Native ARM64 image and matched AMD64 Backend image from a clean Git archive and records the commit and image identity. The deployed Frontend image is unchanged.
+Use the normal repository hooks and commit reviewed source before building. [build.sh](build.sh) creates the Native ARM64 image plus AMD64 Backend and Frontend images from the same clean Git archive. It installs Native dependencies from its frozen lockfile and verifies CubeLoop version, architecture, user and shell tools inside the image.
 
 [infra.yaml](infra.yaml) creates the Native immutable ECR repository and minimal Runtime role. Providing the immutable image URI enables the PUBLIC Runtime and adds an exact invoke/stop permission to the existing Product `NodeRole`. The template creates no EC2, EKS, NAT Gateway, database or Secrets Manager secret. The Native Dockerfile uses the Git slice Worker digest `sha256:454e29089075d2e3c49bb91f9d73624218e7a8eb953e5d9cd2ed9c323953974d` as its base; keep that one base image and repository for future rebuilds even though the Git slice Runtime, Lambda, S3 state and dedicated Secrets are retired. This target is account `986420599013`, region `us-west-2`, profile `moego-testing`; verify it with explicit-profile STS readback before any deployment change.
 
@@ -52,16 +52,48 @@ agentcore:
   region: us-west-2
 ```
 
-The existing auth signing secret stays in the Backend credential store. Run the generated `agentcore_callbacks` migration before enabling the Native route. The Backend uses `execution.backend=agentcore`, `agentcore.execution_mode=native`, and the same verified Native ARN in both `runtime_arn` and `native_runtime_arn`. Update only the Backend image and Native execution configuration after callback and persistence checks pass.
+The existing auth signing secret stays in the Backend credential store. The migration chain keeps the already deployed `c3fd20f6c1d6` callback revision before the upstream lifecycle revisions. The Backend uses `execution.backend=agentcore`, `agentcore.execution_mode=native`, and the same verified Native ARN in both `runtime_arn` and `native_runtime_arn`. Update Backend, its migration image, Frontend and Native Runtime from one release manifest after callback and persistence checks pass.
 
-The former compatibility Runtime is retired and is no longer a rollback target. Older deployment images have been removed, so an application rollback first requires rebuilding a reviewed source revision. Retain the newer migration init container so it can recognize the current Alembic revision; do not downgrade the database. A Native dispatch stores its selected Runtime ARN, so stop and recovery must target the Native Runtime that owns it. Keep the existing node, OpenSandbox services and PVCs running while the product is in service; they host the website, persistent services and Browser/Terminal/file-sidebar capabilities.
+### Upgrading the September deployment
 
-## Current acceptance boundary
+1. Save a database backup, object-store data and the current deployment/configuration
+   manifests. Confirm no run remains active, then scale the old Backend to zero;
+   stop every other process that writes to the same database.
+2. Run `python -m cubeplex.scripts.lifecycle_upgrade --maintenance` once using the
+   new Backend image and the existing private configuration. This executes the
+   upstream task-lifecycle backfill and moves the fork database from
+   `c3fd20f6c1d6` to the current head. Existing data must not be stamped past DDL.
+3. Apply the reviewed Helm values with the new Backend/migrator/Frontend images,
+   `tempo.enabled=false` for the economical overlay, and OpenSandbox 1.1.1.
+   Preserve the existing PVCs and server API key; the server TOML remains a Secret.
+4. Update the existing Native Runtime with the release image, read back its
+   version/endpoint and verify the new website, old history, a real task, human
+   input/resume and cancellation. Later ordinary starts use the normal lifecycle
+   upgrade command without `--maintenance`.
 
-The current Native route has passed real Web and Slack tasks and follow-ups, including command execution,
+Keep the previous image/configuration identities and the pre-migration data
+backup until acceptance. A failed schema upgrade is recovered by restoring the
+matching backup and images; switching to retired compatibility resources is not
+an available rollback. OpenSandbox continues serving Browser, Terminal and the
+sandbox file sidebar. Native tool processes do not become persistent upstream
+background tasks.
+
+### Publishing a fork deployment
+
+Fork tags use `agentcore-YYYY.MM.DD.N` to distinguish these deployments from
+upstream's versioned public images. Build from the reviewed commit with
+`deploy/agentcore-native-entry/build.sh <commit> --push`, merge through the normal
+PR checks, and attach a secret-free `release-manifest.json` to the tag on the
+merged commit. Record the build commit when its tree is identical to that merge.
+The release contains the three immutable ECR images and the required Native base
+image, plus the migration/validation result. The upstream `v*` image workflow is
+reserved for the upstream release process.
+
+## Acceptance contract and historical baseline
+
+The September Native route passed real Web and Slack tasks and follow-ups, including command execution,
 file presentation/download, HITL pause and answer in a new Worker session, stop with no late file write,
-Backend restart with the same pending question/run, duplicate admission and late-callback fencing. The
-Native Runtime is `READY` and the final Native Worker/Backend image pair above is the tested baseline.
+Backend restart with the same pending question/run, duplicate admission and late-callback fencing. Every new deployed release must repeat the affected checks against its actual images.
 The final Web and Slack acceptance completed after local SSM, Kubernetes, database/Redis forwarding and
 test Docker services were stopped; it used the deployed service path rather than a local relay.
 

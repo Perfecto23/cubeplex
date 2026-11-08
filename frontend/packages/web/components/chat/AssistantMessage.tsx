@@ -32,7 +32,7 @@ import { ToolCallItem } from './ToolCallItem'
 import { MessageActions } from './MessageActions'
 import { CopyButton, TimeChip } from './MessageMeta'
 import { RunInfoChip } from './RunInfoChip'
-import { deriveRunChipStatus } from '@/lib/runChipStatus'
+import { conversationErrorApplies, deriveRunChipStatus, isLiveRunChip } from '@/lib/runChipStatus'
 import { TokenUsageBar } from './TokenUsageBar'
 import { MemoryUpdateChip } from './MemoryUpdateChip'
 import { getWriteFileSummary } from '@/lib/writeFilePreview'
@@ -43,6 +43,7 @@ import { MarkdownWithCitations } from '@/components/shared/MarkdownWithCitations
 import { useNowSeconds } from '@/hooks/useNowSeconds'
 import { SkillSearchResults } from './tool-results/SkillSearchResults'
 import { ASSISTANT_CONTENT_MAX_CLASS } from '@/lib/chatLayout'
+import { foldToolActivity, type FoldPiece } from '@/lib/foldToolActivity'
 import { cn, proseClasses } from '@/lib/utils'
 
 interface ReasoningBlockProps {
@@ -59,6 +60,7 @@ function useTurnRunChip(opts: {
   stopReason?: string | null
   isLive: boolean
   isLastRun?: boolean
+  isRunAnchor?: boolean
 }) {
   const streamConnection = useMessageStore((s) => s.streamConnection)
   const currentRunId = useMessageStore((s) => s.currentRunId)
@@ -69,20 +71,24 @@ function useTurnRunChip(opts: {
   const errorEntry = useMessageStore((s) =>
     opts.conversationId ? (s.errors[opts.conversationId] ?? null) : null,
   )
-  const live =
-    opts.isLive ||
-    (opts.runId != null &&
-      opts.runId === currentRunId &&
-      streamConnection != null &&
-      streamConnection !== 'connected')
+  const isRunAnchor = opts.isRunAnchor === true
+  const live = isLiveRunChip({
+    isLiveStreaming: opts.isLive,
+    isRunAnchor,
+    messageRunId: opts.runId,
+    currentRunId,
+    streamConnection,
+  })
   const status = deriveRunChipStatus({
     isLive: live,
     cancelling,
     streamConnection,
     stopReason: opts.stopReason,
-    hasError: Boolean(
-      errorEntry && (opts.runId == null || !errorEntry.runId || errorEntry.runId === opts.runId),
-    ),
+    hasError: conversationErrorApplies(errorEntry, {
+      messageRunId: opts.runId,
+      isLive: opts.isLive,
+      isRunAnchor,
+    }),
     isStaleLastRun: Boolean(opts.isLastRun && lastRunStatus === 'stale'),
   })
   const onRetry =
@@ -250,6 +256,10 @@ interface HistoryProps {
   // its run_id (thinking + tool_call blocks filtered out). Powers the
   // copy button so a multi-step turn copies as one block.
   turnCopyText?: string
+  // True when this bubble is the last assistant of its run. Run-level
+  // status (Reply failed, Reconnecting, …) belongs here — not on every
+  // intermediate tool-use bubble that shares the same run_id.
+  isRunAnchor?: boolean
   // True when this anchor is the latest completed run in the conversation.
   // Gates the session/context view inside TokenUsageBar and the
   // MemoryUpdateChip — both are conversation-level signals that only make
@@ -279,6 +289,7 @@ interface StreamingProps {
   showForkAction?: never
   turnUsage?: never
   turnCopyText?: never
+  isRunAnchor?: never
   isLastRun?: never
   sessionUsage?: never
   contextWindow?: never
@@ -628,37 +639,14 @@ function ContentBlockRenderer({
   return _exhaustive
 }
 
-/** Group consecutive tool_call blocks for compact rendering (subagent calls render individually) */
-function groupBlocks(blocks: ContentBlock[]): (ContentBlock | ContentBlock[])[] {
-  const result: (ContentBlock | ContentBlock[])[] = []
-  for (const block of blocks) {
-    if (
-      block.type === 'tool_call' &&
-      block.name !== 'subagent' &&
-      block.name !== 'save_artifact' &&
-      block.name !== 'generate_image' &&
-      block.name !== 'present_file' &&
-      block.name !== 'write_todos' &&
-      block.name !== 'show_widget' &&
-      !isSkillsFindCall(block)
-    ) {
-      const last = result[result.length - 1]
-      if (
-        Array.isArray(last) &&
-        last[0].type === 'tool_call' &&
-        (last[0] as ContentBlock & { name: string }).name !== 'subagent'
-      ) {
-        last.push(block)
-      } else {
-        result.push([block])
-      }
-    } else if (block.type === 'tool_call' && block.name === 'write_todos') {
-      continue
-    } else {
-      result.push(block)
+function activityKey(piece: Extract<FoldPiece, { kind: 'activity' }>, index: number): string {
+  for (const block of piece.blocks) {
+    if (block.type === 'tool_call') return block.id || `activity-${index}`
+    if (block.type === 'tool_call_streaming') {
+      return block.tool_call_id ?? `activity-${index}`
     }
   }
-  return result
+  return `activity-${index}`
 }
 
 function extractTodosFromMessage(msg: AssistantMessageType): TodoItem[] {
@@ -697,6 +685,7 @@ export function AssistantMessage({
   showForkAction,
   turnUsage,
   turnCopyText,
+  isRunAnchor,
   isLastRun,
   sessionUsage,
   contextWindow,
@@ -715,7 +704,9 @@ export function AssistantMessage({
     : undefined
 
   const _hasContent = blocks.length > 0
-  const grouped = groupBlocks(blocks)
+  const grouped = foldToolActivity(blocks)
+  const tailActivityStreaming =
+    isStreaming === true && grouped[grouped.length - 1]?.kind === 'activity'
 
   const currentRunId = useMessageStore((s) => s.currentRunId)
   const runChip = useTurnRunChip({
@@ -725,6 +716,7 @@ export function AssistantMessage({
     stopReason: message?.stop_reason,
     isLive: isStreaming === true,
     isLastRun,
+    isRunAnchor,
   })
   const runChipError =
     runChip.error ??
@@ -742,8 +734,12 @@ export function AssistantMessage({
   let subagentCounter = 0
   const subagentIndexMap = new Map<number, number>()
   for (let i = 0; i < grouped.length; i++) {
-    const item = grouped[i]
-    if (!Array.isArray(item) && item.type === 'tool_call' && item.name === 'subagent') {
+    const piece = grouped[i]
+    if (
+      piece.kind === 'block' &&
+      piece.block.type === 'tool_call' &&
+      piece.block.name === 'subagent'
+    ) {
       subagentCounter++
       subagentIndexMap.set(i, subagentCounter)
     }
@@ -753,22 +749,31 @@ export function AssistantMessage({
   // Count active subagents (streaming)
   const activeSubagentCount = subAgentStreams ? Object.keys(subAgentStreams).length : 0
 
-  const renderItem = (item: (typeof grouped)[number], i: number) => {
-    if (Array.isArray(item)) {
-      const tcBlocks = item as (ContentBlock & { type: 'tool_call' })[]
+  const renderItem = (piece: (typeof grouped)[number], i: number) => {
+    if (piece.kind === 'activity') {
+      const streaming = tailActivityStreaming && i === grouped.length - 1
       return (
         <ToolCallGroup
-          key={i}
-          blocks={tcBlocks}
+          key={activityKey(piece, i)}
+          blocks={piece.blocks}
           toolResultMap={toolResultMap}
-          isStreaming={isStreaming === true}
+          isStreaming={streaming}
           messageCreatedAt={msgCreatedAt}
           agentId={streamAgentId}
           pendingConfirmMap={pendingConfirmMap}
           onSandboxConfirm={onSandboxConfirm}
+          renderThinking={(block, { isLast }) => (
+            <ReasoningBlock
+              thinking={block.thinking}
+              isStreaming={streaming && isLast}
+              startedAt={block.started_at}
+              durationMs={block.duration_ms}
+            />
+          )}
         />
       )
     }
+    const item = piece.block
     return (
       <ContentBlockRenderer
         key={i}

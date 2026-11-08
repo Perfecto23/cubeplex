@@ -26,6 +26,7 @@ const ADMIN_CSP = "frame-src 'self'; default-src 'self' 'unsafe-inline' 'unsafe-
 export const nextConfig: NextConfig = {
   // Keep development captures free of the Next.js route/build indicator.
   devIndicators: false,
+  agentRules: false,
   allowedDevOrigins: [
     'localhost',
     '127.0.0.1',
@@ -39,7 +40,7 @@ export const nextConfig: NextConfig = {
   // container deploys. Gated on an env var so dev / E2E aren't affected —
   // the Dockerfile sets NEXT_OUTPUT=standalone before `next build`.
   output: process.env.NEXT_OUTPUT === 'standalone' ? 'standalone' : undefined,
-  transpilePackages: ['katex', '@cubeplex/core'],
+  transpilePackages: ['@cubeplex/core'],
   // Pin the workspace root to the frontend monorepo. Otherwise Next walks up,
   // finds the user's global ~/pnpm-lock.yaml (for global CLI tools), and picks
   // /home/chris as the root — which misroots module resolution (e.g. resolving
@@ -54,6 +55,7 @@ export const nextConfig: NextConfig = {
   },
   experimental: {
     proxyClientMaxBodySize: ATTACHMENT_PROXY_BODY_LIMIT,
+    optimizePackageImports: ['@base-ui/react', '@dicebear/core', '@dicebear/styles', 'recharts'],
   },
   async headers() {
     return [

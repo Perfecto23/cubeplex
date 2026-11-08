@@ -3,32 +3,30 @@
 import ReactMarkdown from 'react-markdown'
 import { memo, useDeferredValue, useMemo } from 'react'
 import type { ComponentProps, MouseEvent } from 'react'
+import dynamic from 'next/dynamic'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
-import remarkMath from 'remark-math'
-import rehypeKatex from 'rehype-katex'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeExternalLinks from 'rehype-external-links'
-import 'katex/dist/katex.min.css'
 import { useConversationStore } from '@cubeplex/core'
 import { renderWithCitations } from '@/lib/citations'
 import { CitationMarker } from '@/components/chat/CitationMarker'
 import { resolveSandboxHref } from '@/lib/sandboxLinks'
+import { markdownComponents } from './markdownComponents'
 
 const CITATION_RE = /【\d+-\d+】/
 
+const MarkdownMathRenderer = dynamic(() =>
+  import('./MarkdownMathRenderer').then((m) => m.MarkdownMathRenderer),
+)
+
 // singleTilde:false → only ~~text~~ is strikethrough, so "28~29℃" ranges render literally.
-// singleDollarTextMath:false → only `$$…$$` (display math) is parsed as KaTeX.
-// Plain single `$…$` (e.g. currency like "$271,677.37") renders literally instead of
-// being mis-detected as an inline formula.
-const REMARK_PLUGINS: ComponentProps<typeof ReactMarkdown>['remarkPlugins'] = [
+const BASE_REMARK_PLUGINS: ComponentProps<typeof ReactMarkdown>['remarkPlugins'] = [
   [remarkGfm, { singleTilde: false }],
   remarkBreaks,
-  [remarkMath, { singleDollarTextMath: false }],
 ]
 
-const REHYPE_PLUGINS: ComponentProps<typeof ReactMarkdown>['rehypePlugins'] = [
-  rehypeKatex,
+const BASE_REHYPE_PLUGINS: ComponentProps<typeof ReactMarkdown>['rehypePlugins'] = [
   [rehypeHighlight, { detect: true, ignoreMissing: true }],
   [rehypeExternalLinks, { target: '_blank', rel: ['noopener', 'noreferrer'] }],
 ]
@@ -41,6 +39,29 @@ function fixCjkBoldQuotes(text: string): string {
   return text
     .replace(/\*\*\s*(["\u201c\u300c])/g, '$1**')
     .replace(/(["\u201d\u300d])\s*\*\*/g, '**$1')
+}
+
+/**
+ * Escape currency dollar signs (e.g. $100, $271,677.37, $.99) so remark-math does
+ * not misinterpret them as LaTeX math delimiters, while leaving code blocks,
+ * inline code, and true math formulas ($x = \pi$, $1$, $0$, $1 + 1 = 2$, $$E=mc^2$$) intact.
+ */
+export function escapeCurrencyDollars(text: string): string {
+  return text.replace(
+    /(```[\s\S]*?```|`[^`\n]*`)|(?<![\\$])\$(?!\$)(?=(?:[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?|\.[0-9]+)(?!\$)(?:\s*[a-zA-Z]{2,}|\s*[\u4e00-\u9fa5]|[,.;:!?\)\}\]、。，]|\s*$))/g,
+    (match, code) => (code ? match : '\\$'),
+  )
+}
+
+const MATH_INLINE_RE = /(?:^|[^\\])\$(?!\s)[^$\n]+?(?<!\s)\$(?!\$)/
+
+/**
+ * Check whether markdown text contains math (display math $$...$$ or inline math $...$).
+ */
+export function containsMath(text: string): boolean {
+  if (text.includes('$$')) return true
+  const textWithoutCode = text.replace(/(```[\s\S]*?```|`[^`\n]*`)/g, '')
+  return MATH_INLINE_RE.test(textWithoutCode)
 }
 
 export interface SandboxMarkdownContext {
@@ -78,15 +99,18 @@ function MarkdownWithCitationsImpl({
   // value is parsed once the main thread is idle. Combined with the outer
   // `memo`, an unchanged `children` short-circuits before this runs.
   const deferredChildren = useDeferredValue(children)
-  const md = useMemo(() => fixCjkBoldQuotes(deferredChildren), [deferredChildren])
+  const md = useMemo(
+    () => escapeCurrencyDollars(fixCjkBoldQuotes(deferredChildren)),
+    [deferredChildren],
+  )
   const hasCitations = useMemo(() => CITATION_RE.test(md), [md])
-  const sandboxComponents = useMemo(
-    () => (sandbox ? buildSandboxComponents(sandbox) : null),
+  const baseComponents = useMemo(
+    () => ({ ...markdownComponents, ...(sandbox ? buildSandboxComponents(sandbox) : {}) }),
     [sandbox],
   )
   const citationComponents = useMemo<MarkdownComponents>(
     () => ({
-      ...(sandboxComponents ?? {}),
+      ...baseComponents,
       p: ({ children: c }) => <p>{renderWithCitations(c, conversationId, CitationMarker)}</p>,
       li: ({ children: c }) => <li>{renderWithCitations(c, conversationId, CitationMarker)}</li>,
       td: ({ children: c }) => <td>{renderWithCitations(c, conversationId, CitationMarker)}</td>,
@@ -101,16 +125,28 @@ function MarkdownWithCitationsImpl({
       h5: ({ children: c }) => <h5>{renderWithCitations(c, conversationId, CitationMarker)}</h5>,
       h6: ({ children: c }) => <h6>{renderWithCitations(c, conversationId, CitationMarker)}</h6>,
     }),
-    [sandboxComponents, conversationId],
+    [baseComponents, conversationId],
   )
+
+  const hasMath = useMemo(() => containsMath(md), [md])
+  if (hasMath) {
+    return (
+      <div className={className}>
+        <MarkdownMathRenderer
+          md={md}
+          components={hasCitations ? citationComponents : baseComponents}
+        />
+      </div>
+    )
+  }
 
   if (!hasCitations) {
     return (
       <div className={className}>
         <ReactMarkdown
-          remarkPlugins={REMARK_PLUGINS}
-          rehypePlugins={REHYPE_PLUGINS}
-          components={sandboxComponents ?? undefined}
+          remarkPlugins={BASE_REMARK_PLUGINS}
+          rehypePlugins={BASE_REHYPE_PLUGINS}
+          components={baseComponents}
         >
           {md}
         </ReactMarkdown>
@@ -121,8 +157,8 @@ function MarkdownWithCitationsImpl({
   return (
     <div className={className}>
       <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
+        remarkPlugins={BASE_REMARK_PLUGINS}
+        rehypePlugins={BASE_REHYPE_PLUGINS}
         components={citationComponents}
       >
         {md}

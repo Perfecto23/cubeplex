@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-cubeloop = { git = "https://github.com/cubeplexai/cubeloop.git", rev = "bdf88a08855b1bf3626eaaccc371f965d8b62906" }
+cubeloop = { git = "https://github.com/cubeplexai/cubeloop.git", rev = "bb2d6336e537f286ccac3dec072218bbec13405b" }
 
 [dependency-groups]
 dev = [

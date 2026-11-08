@@ -20,9 +20,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from cubeloop.hitl import CheckpointedChannel
+from cubeloop.middleware.subagents import SubagentMiddleware
 
 from cubeplex.llm.config import ProviderConfig
 from cubeplex.llm.snapshot import LLMSnapshot, ModelPreset
+from cubeplex.middleware.sandbox import SandboxMiddleware
+from cubeplex.services.conversation_execution import RunExecutionBinding
 from cubeplex.streams.run_manager import RunContext, RunManager
 
 pytestmark = pytest.mark.asyncio
@@ -53,6 +56,9 @@ async def _build(
     monkeypatch: pytest.MonkeyPatch,
     *,
     sandbox: Any | None,
+    execution: RunExecutionBinding | None = None,
+    redis: Any | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[MagicMock, list[Any], Any]:
     """Drive the factory with the minimum viable mock surface."""
     # The agent factory's actual implementation needs a real provider +
@@ -120,15 +126,21 @@ async def _build(
 
     rm = RunManager(
         app=_stub_app(),
-        redis=MagicMock(),
+        redis=redis if redis is not None else MagicMock(),
         key_prefix="test_t7",
         run_event_ttl_seconds=60,
     )
     cp = _stub_cp()
-    extra_ref_holder: dict[str, Any] = {"extra": None}
+    extra_ref_holder: dict[str, Any] = extra if extra is not None else {"extra": None}
 
     agent, all_tools, channel = await rm._build_agent_for_conversation(
-        ctx=RunContext(user_id="u1", org_id="o1", workspace_id="w1", conversation_id=_CONV_ID),
+        ctx=RunContext(
+            user_id="u1",
+            org_id="o1",
+            workspace_id="w1",
+            conversation_id=_CONV_ID,
+            execution=execution,
+        ),
         conversation_id=_CONV_ID,
         run_id=_RUN_ID,
         cp=cp,
@@ -137,7 +149,6 @@ async def _build(
         catalog_session=None,
         effective_system_prompt="you are a test",
         extra_ref_holder=extra_ref_holder,
-        sse_queue=MagicMock(),
         publish_stream_event=MagicMock(),
     )
     # The factory stashes provider_name / model_id / mem_repo_factory on
@@ -158,6 +169,25 @@ async def test_build_returns_tuple_shape(monkeypatch: pytest.MonkeyPatch) -> Non
     # Tools are a list of callable/registered objects; the smoke test just
     # cares that the return slot is a list (not None, not a tuple).
     assert isinstance(channel, CheckpointedChannel)
+
+
+async def test_subagent_receives_foreground_sandbox_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _build(monkeypatch, sandbox=MagicMock())
+
+    from cubeplex.agents.graph import create_cubeplex_agent
+
+    middleware = create_cubeplex_agent.call_args.kwargs["middleware"]
+    sandbox = next(item for item in middleware if isinstance(item, SandboxMiddleware))
+    subagent = next(item for item in middleware if isinstance(item, SubagentMiddleware))
+    main_execute = next(tool for tool in sandbox.tools if tool.name == "execute")
+    child_execute = next(tool for tool in subagent.shared_tools if tool.name == "execute")
+
+    assert "background" in main_execute.parameters.model_fields
+    assert "background" not in child_execute.parameters.model_fields
+    assert "notify_on_complete" not in child_execute.parameters.model_fields
+    assert {tool.name for tool in subagent.shared_tools}.isdisjoint({"monitor", "kill_execute"})
 
 
 async def test_build_wires_run_id_into_channel(
@@ -292,7 +322,6 @@ async def test_build_keeps_persona_update_schema_for_non_interactive(
         catalog_session=None,
         effective_system_prompt="you are a test",
         extra_ref_holder=extra_ref_holder,
-        sse_queue=MagicMock(),
         publish_stream_event=MagicMock(),
         trigger="schedule",
     )

@@ -41,6 +41,15 @@
 ) -}}
 {{- end -}}
 {{- $config := mergeOverwrite (deepCopy $defaults) (deepCopy (default (dict) .Values.backend.configOverrides)) -}}
+{{- if .Values.tempo.enabled -}}
+{{- $_ := set $config "tracing" (dict
+      "enabled" true
+      "record_content" .Values.tempo.recordContent
+      "jsonl" (dict "enabled" false)
+      "otlp" (dict "endpoint" (printf "http://%s:4318/v1/traces" (include "cubeplex.tempo.host" .)))
+      "tempo" (dict "query_endpoint" (printf "http://%s:3200" (include "cubeplex.tempo.host" .)))
+) -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

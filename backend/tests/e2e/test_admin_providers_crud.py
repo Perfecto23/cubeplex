@@ -131,10 +131,62 @@ async def test_model_crud(admin_client: tuple[AsyncClient, str]) -> None:
     # Update
     res = await client.patch(
         f"/api/v1/admin/providers/{pid}/models/{mid}",
-        json={"display_name": "Updated Model"},
+        json={
+            "display_name": "Updated Model",
+            "expected_configuration_revision": model_data["configuration_revision"],
+        },
     )
     assert res.status_code == 200
     assert res.json()["display_name"] == "Updated Model"
+    model_revision = res.json()["configuration_revision"]
+
+    # A model's calling configuration is saved on the model, stored as an override.
+    res = await client.patch(
+        f"/api/v1/admin/providers/{pid}/models/{mid}",
+        json={
+            "capability": {"supports_tools": False},
+            "expected_configuration_revision": model_revision,
+        },
+    )
+    assert res.status_code == 200
+    model_revision = res.json()["configuration_revision"]
+    provider = (await client.get(f"/api/v1/admin/providers/{pid}")).json()
+    assert provider["model_capability_overrides"]["test-model-1"] == {"supports_tools": False}
+    provider_revision = provider["configuration_revision"]
+
+    rejected = await client.patch(
+        f"/api/v1/admin/providers/{pid}/models/{mid}",
+        json={
+            "capability": {"not_a_capability": True},
+            "expected_configuration_revision": model_revision,
+        },
+    )
+    assert rejected.status_code == 400
+
+    # Fields other than capability leave the override in place.
+    res = await client.patch(
+        f"/api/v1/admin/providers/{pid}/models/{mid}",
+        json={
+            "display_name": "Updated Model",
+            "expected_configuration_revision": model_revision,
+        },
+    )
+    assert res.status_code == 200
+    model_revision = res.json()["configuration_revision"]
+    provider = (await client.get(f"/api/v1/admin/providers/{pid}")).json()
+    assert provider["model_capability_overrides"]["test-model-1"] == {"supports_tools": False}
+    assert provider["configuration_revision"] == provider_revision
+
+    res = await client.patch(
+        f"/api/v1/admin/providers/{pid}/models/{mid}",
+        json={
+            "capability": None,
+            "expected_configuration_revision": model_revision,
+        },
+    )
+    assert res.status_code == 200
+    provider = (await client.get(f"/api/v1/admin/providers/{pid}")).json()
+    assert "test-model-1" not in provider["model_capability_overrides"]
 
     # Delete
     res = await client.delete(f"/api/v1/admin/providers/{pid}/models/{mid}")
@@ -334,7 +386,7 @@ async def test_create_provider_persists_capability(
             "base_url": "https://example.com",
             "auth_type": "api_key",
             "api_key": "sk-x",
-            "preset_slug": "anthropic",
+            "preset_slug": "anthropic/intl/anthropic-messages",
             "capability": cap,
             "model_capability_overrides": {},
         },
@@ -342,7 +394,7 @@ async def test_create_provider_persists_capability(
     assert res.status_code == 201
     pid = res.json()["id"]
     got = (await client.get(f"/api/v1/admin/providers/{pid}")).json()
-    assert got["preset_slug"] == "anthropic"
+    assert got["preset_slug"] == "anthropic/intl/anthropic-messages"
     assert got["capability"] == cap
     await client.delete(f"/api/v1/admin/providers/{pid}")
 

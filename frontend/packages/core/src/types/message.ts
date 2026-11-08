@@ -76,6 +76,9 @@ interface MessageBase {
     subagent_events?: SubagentSummary
     // Set on a steer user message committed mid-run; used for replay idempotency.
     steer_id?: string
+    // Stable browser request identity used to reconcile an optimistic user
+    // bubble when the POST response carrying its run_id is lost.
+    client_message_id?: string
     // Framework-injected user-role message (cubeloop synthetic_user_message):
     // model-facing scaffolding like todo-guard nudges or goal continuations.
     // Never rendered as a user bubble. ``synthetic_source === 'compaction'``
@@ -93,6 +96,11 @@ interface MessageBase {
     // being a group chat (is_group_chat), not on the mere presence of these.
     sender_user_id?: string
     sender_display_name?: string
+    // Delivered background result. The row stays in checkpoint order, and the
+    // transcript draws a result card instead of a user bubble.
+    source?: string
+    notice_id?: string
+    execution_generation?: number
   }
 }
 

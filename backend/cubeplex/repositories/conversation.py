@@ -22,7 +22,6 @@ from cubeplex.models import Conversation
 from cubeplex.models.conversation_participant import ConversationParticipant
 from cubeplex.models.public_id import generate_public_id
 from cubeplex.models.topic import Topic, TopicParticipant
-from cubeplex.reasoning import DEFAULT_REASONING
 from cubeplex.repositories.base import ScopedRepository
 from cubeplex.utils.time import utc_isoformat
 
@@ -126,6 +125,7 @@ class ConversationRepository(ScopedRepository[Conversation]):
         *,
         draft: bool = False,
         topic_id: str | None = None,
+        commit: bool = True,
     ) -> Conversation:
         # Cross-workspace FK guard at the persistence boundary so any caller
         # (dispatch, REST routes, agent tools) that passes a topic_id from
@@ -152,7 +152,11 @@ class ConversationRepository(ScopedRepository[Conversation]):
             has_messages=not draft,
             topic_id=topic_id,
         )
-        return await self.add(conv)
+        if commit:
+            return await self.add(conv)
+        self.session.add(conv)
+        await self.session.flush()
+        return conv
 
     async def get_by_id(self, conversation_id: str) -> Conversation | None:
         return await self.get(conversation_id)
@@ -255,7 +259,7 @@ class ConversationRepository(ScopedRepository[Conversation]):
         self,
         conversation_id: str,
         *,
-        model_setting: tuple[str | None, dict[str, Any]] | None = None,
+        model_setting: tuple[str | None, dict[str, Any] | None] | None = None,
     ) -> None:
         """Mark the conversation as having user activity.
 
@@ -361,11 +365,11 @@ class ConversationRepository(ScopedRepository[Conversation]):
             is_pinned=False,
             is_group_chat=False,
             model_key=src.model_key,
-            reasoning=dict(src.reasoning or DEFAULT_REASONING),
+            reasoning=dict(src.reasoning) if src.reasoning is not None else None,
         )
         return await self.add(conv)
 
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(self, conversation_id: str, *, now: datetime) -> bool:
         """Soft-delete: stamp ``deleted_at`` so the row stays as a FK target.
 
         Child tables (billing_events for cost audit, artifacts, attachments)
@@ -390,6 +394,6 @@ class ConversationRepository(ScopedRepository[Conversation]):
             workspace_id=self.workspace_id,
         )
         await steering_repo.delete_for_conversation(conversation_id)
-        conv.deleted_at = datetime.now(UTC)
-        await self.session.commit()
+        conv.deleted_at = now
+        await self.session.flush()
         return True

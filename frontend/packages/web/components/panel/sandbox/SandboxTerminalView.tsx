@@ -1,13 +1,24 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
+import { useTranslations } from 'next-intl'
+import { createApiClient, listBackgroundTasks, stopBackgroundTask } from '@cubeplex/core'
+import type { BackgroundTask } from '@cubeplex/core'
+import { toast } from 'sonner'
 
+import { Button } from '@/components/ui/button'
 import { useSandboxTerminal } from '@/hooks/useSandboxTerminal'
 import { csrfHeaders } from '@/lib/csrf'
 import { cn } from '@/lib/utils'
 
 const KEEPALIVE_MS = 30_000
+const INFLIGHT_TASK_STATES = new Set<BackgroundTask['state']>([
+  'starting',
+  'running',
+  'waiting_input',
+  'unknown',
+])
 
 interface SandboxTerminalViewProps {
   workspaceId: string
@@ -66,8 +77,9 @@ export function SandboxTerminalView({
     return () => clearInterval(id)
   }, [workspaceId, url])
 
+  let terminal: React.ReactNode = null
   if (loading) {
-    return (
+    terminal = (
       <div
         className="flex h-full items-center justify-center
           bg-black text-sm text-white/60"
@@ -75,31 +87,115 @@ export function SandboxTerminalView({
         Starting terminal…
       </div>
     )
-  }
-
-  if (error) {
-    return (
+  } else if (error) {
+    terminal = (
       <div
         className="flex h-full flex-col items-center
           justify-center gap-3 text-sm"
       >
         <p className="text-destructive">Could not start terminal. {error.message}</p>
-        <button
-          type="button"
-          onClick={() => refresh()}
-          className="inline-flex items-center gap-1.5
-            rounded border border-border px-3 py-1.5
-            text-xs font-medium hover:bg-muted
-            transition-colors"
-        >
+        <Button type="button" onClick={() => refresh()} variant="outline" size="sm">
           <RefreshCw className="size-3" />
           Retry
-        </button>
+        </Button>
       </div>
     )
+  } else if (url) {
+    terminal = <TerminalFrame url={url} />
   }
 
-  if (!url) return null
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {conversationId ? (
+        <RunningCommandList workspaceId={workspaceId} conversationId={conversationId} />
+      ) : null}
+      <div className="min-h-0 flex-1">{terminal}</div>
+    </div>
+  )
+}
 
-  return <TerminalFrame url={url} />
+function RunningCommandList({
+  workspaceId,
+  conversationId,
+}: {
+  workspaceId: string
+  conversationId: string
+}) {
+  const t = useTranslations('backgroundTasks')
+  const [rows, setRows] = useState<BackgroundTask[]>([])
+  const [stopping, setStopping] = useState<string | null>(null)
+  const load = useCallback(async () => {
+    const client = createApiClient('')
+    client.setWorkspaceId(workspaceId)
+    try {
+      const tasks = await listBackgroundTasks(client, conversationId)
+      setRows(
+        tasks.filter((task) => task.kind === 'command' && INFLIGHT_TASK_STATES.has(task.state)),
+      )
+    } catch {
+      // Keep the last durable snapshot visible through a transient refresh failure.
+    }
+  }, [workspaceId, conversationId])
+
+  useEffect(() => {
+    const initial = setTimeout(() => void load(), 0)
+    const id = setInterval(() => void load(), 5000)
+    return () => {
+      clearTimeout(initial)
+      clearInterval(id)
+    }
+  }, [load])
+
+  const stop = async (task: BackgroundTask) => {
+    setStopping(task.id)
+    try {
+      const client = createApiClient('')
+      client.setWorkspaceId(workspaceId)
+      await stopBackgroundTask(client, conversationId, task.id)
+      await load()
+    } catch {
+      toast.error(t('stopFailed'))
+    } finally {
+      setStopping(null)
+    }
+  }
+
+  if (rows.length === 0) return null
+  return (
+    <ul className="border-b border-border bg-muted/40 px-3 py-2 text-xs">
+      {rows.map((row) => {
+        const stopRequested = row.stop_requested_at !== null
+        const canStop = row.capabilities.can_stop
+        return (
+          <li key={row.id} className="flex items-center justify-between gap-2 py-0.5">
+            <span className="min-w-0 truncate">
+              {row.description || row.id}
+              <span className="ml-1 text-muted-foreground">· {formatElapsed(row.created_at)}</span>
+            </span>
+            {canStop || stopRequested ? (
+              <Button
+                type="button"
+                className="shrink-0"
+                variant="destructive"
+                size="xs"
+                aria-label={`Stop ${row.description || row.id}`}
+                disabled={stopping === row.id || stopRequested}
+                onClick={() => void stop(row)}
+              >
+                {stopping === row.id || stopRequested ? 'Stopping…' : 'Stop'}
+              </Button>
+            ) : null}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+function formatElapsed(startedAt: string): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }

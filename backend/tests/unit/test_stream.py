@@ -8,6 +8,7 @@ from cubeloop.agent.types import (
     HitlRequestEvent,
     MessageEndEvent,
     ToolExecutionEndEvent,
+    ToolExecutionUpdateEvent,
 )
 from cubeloop.hitl.types import ApproveAnswer, ApproveRequest, HitlRequest
 from cubeloop.providers.base import (
@@ -77,6 +78,32 @@ def test_toolcall_delta_emits_tool_call_delta() -> None:
     assert out[0]["index"] == 0
     assert out[0]["id"] == "tc1"
     assert out[0]["name"] == "search"
+
+
+def test_toolcall_start_opens_write_before_any_arguments_arrive() -> None:
+    partial = _mk_assistant(tool_calls=[ToolCall(id="write-1", name="write", arguments={})])
+    evt = StreamEvent(type="toolcall_start", content_index=0, partial=partial)
+    assert convert_event_to_sse(evt) == [
+        {
+            "type": "tool_call_delta",
+            "id": "write-1",
+            "name": "write",
+            "index": 0,
+            "delta": "",
+        }
+    ]
+
+
+def test_toolcall_start_without_identity_does_not_create_a_phantom_tool() -> None:
+    assert convert_event_to_sse(StreamEvent(type="toolcall_start", content_index=0)) == []
+
+
+def test_deferred_toolcall_start_waits_for_real_tool_identity() -> None:
+    partial = _mk_assistant(
+        tool_calls=[ToolCall(id="deferred-1", name="deferred_tool_call", arguments={})]
+    )
+    evt = StreamEvent(type="toolcall_start", content_index=0, partial=partial)
+    assert convert_event_to_sse(evt) == []
 
 
 def test_live_chain_toolcall_delta_reaches_frontend_shape() -> None:
@@ -200,6 +227,27 @@ def test_message_end_with_none_usage_is_dropped() -> None:
 # repr like ``content=[TextContent(text='{"foo":1}')] details=None ...``
 # which broke frontend JSON.parse and surfaced ``save_artifact`` as a regular
 # tool call card instead of an artifact card during live runs.
+
+
+def test_tool_execution_update_projects_running_tool_result() -> None:
+    payload = AgentToolResult(
+        content=[TextContent(text="partial out")],
+        details={"status": "running"},
+    )
+    evt = ToolExecutionUpdateEvent(
+        tool_call_id="tc-run",
+        tool_name="execute",
+        partial_result=payload,
+    )
+    out = convert_agent_event_to_sse(evt)
+    assert len(out) == 1
+    d = out[0]
+    assert d["type"] == "tool_result"
+    assert d["tool_call_id"] == "tc-run"
+    assert d["name"] == "execute"
+    assert d["result"] == "partial out"
+    assert d["details"] == {"status": "running"}
+    assert d["is_error"] is False
 
 
 def test_tool_result_extracts_text_from_agent_tool_result() -> None:
@@ -369,6 +417,28 @@ def test_injected_user_message_becomes_injected_message_dict() -> None:
 def test_injected_user_message_without_steer_id_is_dropped() -> None:
     msg = UserMessage(content=[TextContent(text="seed prompt")])
     assert convert_agent_event_to_sse(MessageEndEvent(message=msg)) == []
+
+
+def test_background_task_input_is_projected_as_a_result_card_source() -> None:
+    msg = UserMessage(
+        content=[TextContent(text='Background task result:\n{"source":"background_task"}')],
+        metadata={
+            "source": "background_task",
+            "notice_id": "bge-notice",
+            "execution_generation": 3,
+            "steer_id": "bge-notice",
+        },
+    )
+    assert convert_agent_event_to_sse(MessageEndEvent(message=msg)) == [
+        {
+            "type": "injected_message",
+            "content": 'Background task result:\n{"source":"background_task"}',
+            "steer_id": "bge-notice",
+            "source": "background_task",
+            "notice_id": "bge-notice",
+            "execution_generation": 3,
+        }
+    ]
 
 
 def test_injected_group_chat_message_carries_sender_identity() -> None:

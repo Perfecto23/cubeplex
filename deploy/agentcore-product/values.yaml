@@ -28,10 +28,13 @@ backend:
       # The API key is intentionally left for the operator's private overlay.
       domain: "opensandbox-server.opensandbox-system.svc.cluster.local:80"
       api_key: ""
-      image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.7.2@sha256:da1b5c88e947f1fd28442e56080aef9bedc8b6d61299b3b35c685d41d1a5bb40"
+      image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.9.4@sha256:8f3291ba1a666f55dcc2db53b851a23525e54681e99178136481fbf5a31804cc"
 
 frontend:
   replicaCount: 1
+
+tempo:
+  enabled: false
 
 # Caddy owns host-network 80/443 in the k3s node. Do not create an ingress
 # controller from this chart; the operator supplies Caddy routing separately.
@@ -74,16 +77,17 @@ opensandbox:
     controller:
       replicaCount: 1
       image:
-        # v0.2.0 does not accept --containerd-socket-path. The current
-        # official image was checked with --help and the digest is pinned.
         repository: opensandbox/controller
-        tag: "latest@sha256:1ecfb02b5d24a92bd756a0f67b55900dee24332ba0c184766c2d7aecb3ace69f"
+        tag: "release-1.1.1@sha256:aca5cda09a0fbc5867e6028f8b6aaa60fdcd78ebee634f71a263d45d5f6c2bab"
       snapshot:
         containerdSocketPath: /run/k3s/containerd/containerd.sock
   opensandbox-server:
     namespaceOverride: opensandbox-system
     server:
       replicaCount: 1
+      image:
+        repository: opensandbox/server
+        tag: "release-1.1.1@sha256:bcd5f264101262cebfa7e1ff9cd0424403e42f31a6596e4364cf90d8cb5c936b"
       resources:
         requests:
           cpu: "500m"

@@ -16,6 +16,8 @@ You do not create artifacts directly. The agent creates them by calling one of t
 
 When the agent only needs you to **see a file right now** (a login QR code, a screenshot, a one-off export) it uses **`present_file`** instead. That file appears inline in the chat and is **not** added to the artifact gallery. On Feishu, Slack, or Discord the same file is delivered as a native image or file message when the reply finishes.
 
+Images shown with `present_file` load the original image and fit it into the chat at up to 480 pixels wide, preserving its proportions. Click the image to open the original in a new tab. If the image cannot load, the card offers the file for download.
+
 This happens naturally when you ask the agent to build something concrete:
 
 - "Build me a landing page"
@@ -60,6 +62,21 @@ While expanded, the theater is a modal overlay — the side panel underneath is 
 Markdown document artifacts (`.md` / `.markdown` / `.mdx`, or `text/markdown`)
 render **inline** in the transcript — similar to image previews — so you can
 read them without opening the side panel.
+
+Markdown previews support Mermaid diagrams in chat messages, inline artifact
+cards, the right-side panel, and expanded previews. Put the diagram source in a
+fenced code block labeled `mermaid`:
+
+````markdown
+```mermaid
+flowchart LR
+  A[Draft] --> B[Review] --> C[Publish]
+```
+````
+
+Diagrams follow the light or dark theme. While a diagram is loading, or if its
+syntax is incomplete or invalid, the preview shows its source instead. Other
+code blocks keep their normal formatting. Downloads retain the Markdown source.
 
 - **Edit** opens a rich-text editor (TipTap). Save creates a **new version** of
   the artifact. If the conversation sandbox and file path are still valid,

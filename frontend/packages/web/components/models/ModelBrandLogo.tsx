@@ -1,3 +1,5 @@
+'use client'
+
 import { Cpu } from 'lucide-react'
 
 import { BRAND_ICONS } from '@/lib/models/brand-icons'

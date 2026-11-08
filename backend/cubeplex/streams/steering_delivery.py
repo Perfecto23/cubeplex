@@ -6,10 +6,11 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Protocol
 
 from cubeloop.providers.base import TextContent, UserMessage
+from cubeloop.session.input import InputEnvelope, InputReceipt
 from loguru import logger
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -24,6 +25,8 @@ from cubeplex.repositories.steering_message import (
 
 HistorySteerLoader = Callable[[str], Awaitable[set[str]]]
 MAINTENANCE_BATCH_SIZE = 100
+ACKNOWLEDGEMENT_ATTEMPTS = 3
+ACKNOWLEDGEMENT_RETRY_SECONDS = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,17 +36,41 @@ class SteeringRunScope:
     conversation_id: str
 
 
+class SteeringSessionProtocol(Protocol):
+    def submit_input(self, envelope: InputEnvelope) -> InputReceipt: ...
+
+    def cancel_input(self, input_id: str) -> InputReceipt: ...
+
+
+def _is_checkpoint_committed(receipt: InputReceipt) -> bool:
+    return receipt.status == "committed" and receipt.durability == "checkpoint"
+
+
 def steering_message_to_cubeloop(row: SteeringMessage) -> UserMessage:
-    metadata: dict[str, Any] = {
-        "steer_id": row.client_steer_id,
-        "sender_user_id": row.sender_user_id,
-    }
-    if row.sender_display_name:
-        metadata["sender_display_name"] = row.sender_display_name
+    metadata: dict[str, Any] = {}
+    if row.source_kind == "background_task":
+        metadata.update(
+            source="background_task",
+            notice_id=row.notice_id,
+            execution_generation=row.execution_generation,
+        )
+    else:
+        metadata["steer_id"] = row.client_steer_id
+        metadata["sender_user_id"] = row.sender_user_id
+        if row.sender_display_name:
+            metadata["sender_display_name"] = row.sender_display_name
+    if row.source_kind == "user_message" and row.client_steer_id.startswith("scmw-"):
+        metadata["notice_id"] = row.client_steer_id.split(":", 1)[0]
     return UserMessage(
         content=[TextContent(text=row.content)],
         metadata=metadata,
     )
+
+
+def _checkpoint_key(row: SteeringMessage) -> str:
+    if row.source_kind == "background_task" and row.notice_id:
+        return row.notice_id
+    return row.client_steer_id
 
 
 async def _load_checkpoint_steer_ids(conversation_id: str) -> set[str]:
@@ -58,14 +85,15 @@ async def _load_checkpoint_steer_ids(conversation_id: str) -> set[str]:
         metadata = getattr(message, "metadata", None)
         if not isinstance(metadata, dict):
             continue
-        steer_id = metadata.get("steer_id")
-        if isinstance(steer_id, str) and steer_id:
-            steer_ids.add(steer_id)
+        for key in ("steer_id", "notice_id"):
+            delivery_id = metadata.get(key)
+            if isinstance(delivery_id, str) and delivery_id:
+                steer_ids.add(delivery_id)
     return steer_ids
 
 
 class DurableSteeringCoordinator:
-    """Owns delivery for the Agents registered in one RunManager process."""
+    """Owns delivery for Sessions registered in one RunManager process."""
 
     def __init__(
         self,
@@ -82,8 +110,10 @@ class DurableSteeringCoordinator:
         self._redis = redis
         self._redis_key_prefix = redis_key_prefix
         self._owner = f"steering-{uuid7()}"
-        self._agents: dict[str, Any] = {}
+        self._sessions: dict[str, SteeringSessionProtocol] = {}
         self._scopes: dict[str, SteeringRunScope] = {}
+        self._claim_tokens: dict[str, str | None] = {}
+        self._input_gates: dict[str, bool] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._poll_task: asyncio.Task[None] | None = None
         self._poll_count = 0
@@ -100,46 +130,158 @@ class DurableSteeringCoordinator:
             workspace_id=scope.workspace_id,
         )
 
+    async def _acknowledge_row_checkpoint(
+        self,
+        *,
+        session: AsyncSession,
+        repo: SteeringMessageRepository,
+        row: SteeringMessage,
+        owned: bool,
+    ) -> None:
+        if row.source_kind == "background_task" and row.notice_id:
+            from cubeplex.services.background_task_delivery import (
+                BackgroundTaskDeliveryService,
+            )
+
+            acknowledged = await BackgroundTaskDeliveryService(
+                session,
+                org_id=row.org_id,
+                workspace_id=row.workspace_id,
+            ).acknowledge_history(
+                notice_id=row.notice_id,
+                run_id=row.run_id,
+                input_id=row.client_steer_id,
+                now=datetime.now(UTC),
+            )
+            if not acknowledged:
+                return
+        if owned:
+            transitioned = await repo.mark_owned_injected(row_id=row.id, owner=self._owner)
+        else:
+            transitioned = await repo.reconcile_terminal(
+                row_id=row.id,
+                state=SteeringMessageState.injected,
+            )
+        if not transitioned:
+            await session.refresh(row)
+            if row.state != SteeringMessageState.injected:
+                return
+
     async def register_and_drain(
         self,
         *,
         run_id: str,
         scope: SteeringRunScope,
-        agent: Any,
+        session: SteeringSessionProtocol,
+        claim_token: str | None = None,
+        input_gate_open: bool = True,
     ) -> None:
-        self._agents[run_id] = agent
-        self._scopes[run_id] = scope
-        self._locks.setdefault(run_id, asyncio.Lock())
+        lock = self._locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            if not await self._claim_is_current(run_id, claim_token):
+                return
+            await self._repair_checkpointed_owned_claims(run_id=run_id, scope=scope)
+            self._sessions[run_id] = session
+            self._scopes[run_id] = scope
+            self._claim_tokens[run_id] = claim_token
+            self._input_gates[run_id] = input_gate_open
         await self.drain(run_id)
+
+    async def open_input_gate(self, run_id: str) -> None:
+        lock = self._locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            if run_id not in self._sessions:
+                return
+            self._input_gates[run_id] = True
+        await self.drain(run_id)
+
+    async def _claim_is_current(self, run_id: str, claim_token: str | None) -> bool:
+        if self._redis is None or self._redis_key_prefix is None:
+            return True
+        from cubeplex.streams.hitl_resume import get_resume_claim_token
+
+        distributed_claim = await get_resume_claim_token(
+            self._redis,
+            prefix=self._redis_key_prefix,
+            run_id=run_id,
+        )
+        return distributed_claim == claim_token
+
+    async def _repair_checkpointed_owned_claims(
+        self,
+        *,
+        run_id: str,
+        scope: SteeringRunScope,
+    ) -> None:
+        async with self._session_maker() as session:
+            repo = self._repo(session, scope)
+            rows = await repo.list_owned_claims(run_id=run_id, owner=self._owner)
+            if not rows:
+                return
+            history_ids = await self._history_loader(scope.conversation_id)
+            for row in rows:
+                if row.source_kind == "background_task" and row.notice_id:
+                    # Change only steering state while this transaction owns
+                    # the row. The background coordinator settles event then
+                    # steering after this lock is released.
+                    if _checkpoint_key(row) in history_ids:
+                        continue
+                    if row.state == SteeringMessageState.cancel_requested:
+                        await repo.reconcile_terminal(
+                            row_id=row.id,
+                            state=SteeringMessageState.cancelled,
+                        )
+                    else:
+                        await repo.return_claim_to_queue(row_id=row.id, owner=self._owner)
+                    continue
+                if _checkpoint_key(row) in history_ids:
+                    await self._acknowledge_row_checkpoint(
+                        session=session,
+                        repo=repo,
+                        row=row,
+                        owned=True,
+                    )
+                elif row.state == SteeringMessageState.cancel_requested:
+                    await repo.reconcile_terminal(
+                        row_id=row.id,
+                        state=SteeringMessageState.cancelled,
+                    )
+                else:
+                    await repo.return_claim_to_queue(row_id=row.id, owner=self._owner)
+            await session.commit()
 
     async def unregister(
         self,
         run_id: str,
         *,
-        agent: Any,
+        session: SteeringSessionProtocol,
         requeue_owned: bool = False,
     ) -> None:
-        if self._agents.get(run_id) is not agent:
+        if self._sessions.get(run_id) is not session:
             return
         lock = self._locks.get(run_id)
         if lock is None:
-            if self._agents.get(run_id) is not agent:
+            if self._sessions.get(run_id) is not session:
                 return
-            self._agents.pop(run_id, None)
+            self._sessions.pop(run_id, None)
             self._scopes.pop(run_id, None)
+            self._claim_tokens.pop(run_id, None)
+            self._input_gates.pop(run_id, None)
             return
         async with lock:
-            if self._agents.get(run_id) is not agent:
+            if self._sessions.get(run_id) is not session:
                 return
             scope = self._scopes.get(run_id)
             if requeue_owned and scope is not None:
                 await self._reconcile_owned_before_pause(
                     run_id=run_id,
                     scope=scope,
-                    agent=agent,
+                    session=session,
                 )
-            self._agents.pop(run_id, None)
+            self._sessions.pop(run_id, None)
             self._scopes.pop(run_id, None)
+            self._claim_tokens.pop(run_id, None)
+            self._input_gates.pop(run_id, None)
             if self._locks.get(run_id) is lock:
                 self._locks.pop(run_id, None)
 
@@ -148,40 +290,99 @@ class DurableSteeringCoordinator:
         *,
         run_id: str,
         scope: SteeringRunScope,
-        agent: Any,
+        session: SteeringSessionProtocol,
     ) -> None:
-        async with self._session_maker() as session:
-            repo = self._repo(session, scope)
+        async with self._session_maker() as db_session:
+            repo = self._repo(db_session, scope)
             rows = await repo.list_owned_claims(run_id=run_id, owner=self._owner)
             history_ids: set[str] | None = None
             for row in rows:
-                removed = agent.cancel_steer(row.client_steer_id)
+                receipt = session.cancel_input(row.client_steer_id)
+                if row.source_kind == "background_task" and row.notice_id:
+                    # Session cleanup may requeue or cancel its own steering
+                    # row, but event proof belongs to the background
+                    # coordinator after this row lock is released.
+                    checkpointed = _is_checkpoint_committed(receipt) or (
+                        receipt.status == "committed"
+                    )
+                    if not checkpointed and receipt.status != "cancelled":
+                        if history_ids is None:
+                            history_ids = await self._history_loader(scope.conversation_id)
+                        checkpointed = _checkpoint_key(row) in history_ids
+                    if checkpointed:
+                        continue
+                    if row.state == SteeringMessageState.cancel_requested:
+                        if receipt.status == "cancelled":
+                            await repo.mark_owned_cancelled(
+                                row_id=row.id,
+                                owner=self._owner,
+                            )
+                        else:
+                            await repo.reconcile_terminal(
+                                row_id=row.id,
+                                state=SteeringMessageState.cancelled,
+                            )
+                    else:
+                        await repo.return_claim_to_queue(row_id=row.id, owner=self._owner)
+                    continue
                 if row.state == SteeringMessageState.cancel_requested:
-                    if removed:
+                    if receipt.status == "cancelled":
                         await repo.mark_owned_cancelled(row_id=row.id, owner=self._owner)
+                        continue
+                    if _is_checkpoint_committed(receipt):
+                        await self._acknowledge_row_checkpoint(
+                            session=db_session,
+                            repo=repo,
+                            row=row,
+                            owned=False,
+                        )
+                        continue
+                    if receipt.status == "committed":
+                        # Session memory has consumed the input, but its
+                        # suspension checkpoint has not committed yet. Keep
+                        # ownership until that checkpoint or later history
+                        # reconciliation proves the durable outcome.
                         continue
                     if history_ids is None:
                         history_ids = await self._history_loader(scope.conversation_id)
-                    await repo.reconcile_terminal(
-                        row_id=row.id,
-                        state=(
-                            SteeringMessageState.injected
-                            if row.client_steer_id in history_ids
-                            else SteeringMessageState.cancelled
-                        ),
-                    )
-                    continue
-                if not removed:
-                    if history_ids is None:
-                        history_ids = await self._history_loader(scope.conversation_id)
-                    if row.client_steer_id in history_ids:
+                    if _checkpoint_key(row) in history_ids:
+                        await self._acknowledge_row_checkpoint(
+                            session=db_session,
+                            repo=repo,
+                            row=row,
+                            owned=False,
+                        )
+                    else:
                         await repo.reconcile_terminal(
                             row_id=row.id,
-                            state=SteeringMessageState.injected,
+                            state=SteeringMessageState.cancelled,
+                        )
+                    continue
+                if _is_checkpoint_committed(receipt):
+                    await self._acknowledge_row_checkpoint(
+                        session=db_session,
+                        repo=repo,
+                        row=row,
+                        owned=False,
+                    )
+                    continue
+                if receipt.status == "committed":
+                    # Requeueing a memory-committed input would submit it a
+                    # second time after the upcoming suspension checkpoint.
+                    continue
+                if receipt.status != "cancelled":
+                    if history_ids is None:
+                        history_ids = await self._history_loader(scope.conversation_id)
+                    if _checkpoint_key(row) in history_ids:
+                        await self._acknowledge_row_checkpoint(
+                            session=db_session,
+                            repo=repo,
+                            row=row,
+                            owned=False,
                         )
                         continue
                 await repo.return_claim_to_queue(row_id=row.id, owner=self._owner)
-            await session.commit()
+            await db_session.commit()
 
     async def _repair_expired_claims(
         self,
@@ -196,10 +397,12 @@ class DurableSteeringCoordinator:
             return
         history_ids = await self._history_loader(scope.conversation_id)
         for row in foreign:
-            if row.client_steer_id in history_ids:
-                await repo.reconcile_terminal(
-                    row_id=row.id,
-                    state=SteeringMessageState.injected,
+            if _checkpoint_key(row) in history_ids:
+                await self._acknowledge_row_checkpoint(
+                    session=repo.session,
+                    repo=repo,
+                    row=row,
+                    owned=False,
                 )
             elif row.state == SteeringMessageState.cancel_requested:
                 await repo.reconcile_terminal(
@@ -215,51 +418,89 @@ class DurableSteeringCoordinator:
         *,
         scope: SteeringRunScope,
         run_id: str,
-        agent: Any,
+        session: SteeringSessionProtocol,
+        claim_token: str | None,
     ) -> None:
         rows = await repo.list_owned_cancel_requests(run_id=run_id, owner=self._owner)
         history_ids: set[str] | None = None
         for row in rows:
-            if agent.cancel_steer(row.client_steer_id):
+            if not await self._claim_is_current(run_id, claim_token):
+                return
+            receipt = session.cancel_input(row.client_steer_id)
+            if receipt.status == "cancelled":
                 await repo.mark_owned_cancelled(row_id=row.id, owner=self._owner)
+                continue
+            if _is_checkpoint_committed(receipt):
+                await self._acknowledge_row_checkpoint(
+                    session=repo.session,
+                    repo=repo,
+                    row=row,
+                    owned=False,
+                )
                 continue
             if history_ids is None:
                 history_ids = await self._history_loader(scope.conversation_id)
-            if row.client_steer_id in history_ids:
-                await repo.reconcile_terminal(
-                    row_id=row.id,
-                    state=SteeringMessageState.injected,
+            if _checkpoint_key(row) in history_ids:
+                await self._acknowledge_row_checkpoint(
+                    session=repo.session,
+                    repo=repo,
+                    row=row,
+                    owned=False,
                 )
 
     async def drain(self, run_id: str) -> None:
-        agent = self._agents.get(run_id)
+        execution_session = self._sessions.get(run_id)
         scope = self._scopes.get(run_id)
-        if agent is None or scope is None:
+        claim_token = self._claim_tokens.get(run_id)
+        if execution_session is None or scope is None:
+            return
+        if not self._input_gates.get(run_id, True):
             return
         lock = self._locks.setdefault(run_id, asyncio.Lock())
         async with lock:
             if (
                 self._locks.get(run_id) is not lock
-                or self._agents.get(run_id) is not agent
+                or self._sessions.get(run_id) is not execution_session
                 or self._scopes.get(run_id) is not scope
+                or self._claim_tokens.get(run_id) != claim_token
             ):
                 return
-            assert agent is not None
+            if not await self._claim_is_current(run_id, claim_token):
+                return
+            assert execution_session is not None
             async with self._session_maker() as session:
                 repo = self._repo(session, scope)
                 await self._process_owned_cancel_requests(
                     repo,
                     scope=scope,
                     run_id=run_id,
-                    agent=agent,
+                    session=execution_session,
+                    claim_token=claim_token,
                 )
+                if not await self._claim_is_current(run_id, claim_token):
+                    return
                 await self._repair_expired_claims(repo, scope=scope, run_id=run_id)
+                if not await self._claim_is_current(run_id, claim_token):
+                    return
                 claimed = await repo.claim_queued(run_id=run_id, owner=self._owner)
                 await session.commit()
 
+            checkpoint_committed_ids: list[str] = []
             for index, row in enumerate(claimed):
                 try:
-                    agent.steer(steering_message_to_cubeloop(row))
+                    if not await self._claim_is_current(run_id, claim_token):
+                        raise RuntimeError("resume claim changed before durable input admission")
+                    receipt = execution_session.submit_input(
+                        InputEnvelope(
+                            input_id=row.client_steer_id,
+                            message=steering_message_to_cubeloop(row),
+                            mode="steer",
+                        )
+                    )
+                    if receipt.status not in ("queued", "committed"):
+                        raise RuntimeError(f"input admission returned {receipt.status}")
+                    if _is_checkpoint_committed(receipt):
+                        checkpoint_committed_ids.append(row.id)
                 except Exception:
                     logger.opt(exception=True).warning(
                         "durable steering delivery failed synchronously for row {}",
@@ -274,36 +515,96 @@ class DurableSteeringCoordinator:
                             )
                         await session.commit()
                     break
-
-    async def acknowledge_injected(self, run_id: str, client_steer_id: str) -> None:
-        scope = self._scopes.get(run_id)
-        if scope is None:
-            return
-        lock = self._locks.setdefault(run_id, asyncio.Lock())
-        async with lock:
-            try:
+            if checkpoint_committed_ids:
                 async with self._session_maker() as session:
                     repo = self._repo(session, scope)
-                    row = await repo.get_by_client_id(
-                        conversation_id=scope.conversation_id,
-                        client_steer_id=client_steer_id,
-                    )
-                    if row is not None and row.run_id == run_id:
-                        await repo.mark_owned_injected(row_id=row.id, owner=self._owner)
+                    for row_id in checkpoint_committed_ids:
+                        checkpoint_row = await repo.get(row_id)
+                        if checkpoint_row is not None:
+                            await self._acknowledge_row_checkpoint(
+                                session=session,
+                                repo=repo,
+                                row=checkpoint_row,
+                                owned=True,
+                            )
                     await session.commit()
-            except Exception:
-                logger.opt(exception=True).warning(
-                    "durable steering acknowledgement failed for run {}",
-                    run_id,
+
+    async def acknowledge_injected(
+        self,
+        run_id: str,
+        client_steer_id: str,
+        *,
+        scope: SteeringRunScope | None = None,
+    ) -> None:
+        registered_scope = self._scopes.get(run_id)
+        resolved_scope = registered_scope or scope
+        if resolved_scope is None:
+            return
+        lock = self._locks.setdefault(run_id, asyncio.Lock())
+        try:
+            async with lock:
+                for attempt in range(ACKNOWLEDGEMENT_ATTEMPTS):
+                    try:
+                        await self._acknowledge_injected_once(
+                            run_id=run_id,
+                            client_steer_id=client_steer_id,
+                            scope=resolved_scope,
+                        )
+                        break
+                    except Exception:
+                        if attempt + 1 == ACKNOWLEDGEMENT_ATTEMPTS:
+                            raise
+                        logger.opt(exception=True).warning(
+                            "durable steering acknowledgement retry {} for run {}",
+                            attempt + 1,
+                            run_id,
+                        )
+                        await asyncio.sleep(ACKNOWLEDGEMENT_RETRY_SECONDS)
+        finally:
+            if (
+                registered_scope is None
+                and self._scopes.get(run_id) is None
+                and self._locks.get(run_id) is lock
+            ):
+                self._locks.pop(run_id, None)
+
+    async def _acknowledge_injected_once(
+        self,
+        *,
+        run_id: str,
+        client_steer_id: str,
+        scope: SteeringRunScope,
+    ) -> None:
+        async with self._session_maker() as session:
+            repo = self._repo(session, scope)
+            row = await repo.get_by_client_id(
+                conversation_id=scope.conversation_id,
+                client_steer_id=client_steer_id,
+            )
+            if row is not None and row.run_id == run_id:
+                await self._acknowledge_row_checkpoint(
+                    session=session,
+                    repo=repo,
+                    row=row,
+                    owned=True,
                 )
+            await session.commit()
 
     async def cancel_dispatched(self, run_id: str, client_steer_id: str) -> None:
         scope = self._scopes.get(run_id)
-        agent = self._agents.get(run_id)
-        if scope is None or agent is None:
+        execution_session = self._sessions.get(run_id)
+        claim_token = self._claim_tokens.get(run_id)
+        if scope is None or execution_session is None:
             return
         lock = self._locks.setdefault(run_id, asyncio.Lock())
         async with lock:
+            if (
+                self._sessions.get(run_id) is not execution_session
+                or self._scopes.get(run_id) is not scope
+                or self._claim_tokens.get(run_id) != claim_token
+                or not await self._claim_is_current(run_id, claim_token)
+            ):
+                return
             async with self._session_maker() as session:
                 repo = self._repo(session, scope)
                 row = await repo.get_by_client_id(
@@ -316,14 +617,26 @@ class DurableSteeringCoordinator:
                     or row.state != SteeringMessageState.cancel_requested
                 ):
                     return
-                if agent.cancel_steer(client_steer_id):
+                if not await self._claim_is_current(run_id, claim_token):
+                    return
+                receipt = execution_session.cancel_input(client_steer_id)
+                if receipt.status == "cancelled":
                     await repo.mark_owned_cancelled(row_id=row.id, owner=self._owner)
+                elif _is_checkpoint_committed(receipt):
+                    await self._acknowledge_row_checkpoint(
+                        session=session,
+                        repo=repo,
+                        row=row,
+                        owned=False,
+                    )
                 else:
                     history_ids = await self._history_loader(scope.conversation_id)
-                    if client_steer_id in history_ids:
-                        await repo.reconcile_terminal(
-                            row_id=row.id,
-                            state=SteeringMessageState.injected,
+                    if _checkpoint_key(row) in history_ids:
+                        await self._acknowledge_row_checkpoint(
+                            session=session,
+                            repo=repo,
+                            row=row,
+                            owned=False,
                         )
                 await session.commit()
 
@@ -332,6 +645,7 @@ class DurableSteeringCoordinator:
         run_id: str,
         *,
         scope: SteeringRunScope | None = None,
+        cancel_uncommitted: bool = False,
     ) -> None:
         scope = scope or self._scopes.get(run_id)
         if scope is None:
@@ -344,10 +658,34 @@ class DurableSteeringCoordinator:
                     repo = self._repo(session, scope)
                     active = await repo.list_active_for_run(run_id)
                     for row in active:
-                        if row.client_steer_id in history_ids:
+                        if _checkpoint_key(row) in history_ids:
+                            await self._acknowledge_row_checkpoint(
+                                session=session,
+                                repo=repo,
+                                row=row,
+                                owned=False,
+                            )
+                        elif row.source_kind == "background_task" and row.notice_id:
+                            from cubeplex.services.background_task_delivery import (
+                                BackgroundTaskDeliveryService,
+                            )
+
+                            released = await BackgroundTaskDeliveryService(
+                                session,
+                                org_id=row.org_id,
+                                workspace_id=row.workspace_id,
+                            ).settle_uncommitted_attempt(
+                                notice_id=row.notice_id,
+                                run_id=row.run_id,
+                                input_id=row.client_steer_id,
+                                discard_cancelled_initial=cancel_uncommitted,
+                            )
+                            if released:
+                                await session.delete(row)
+                        elif cancel_uncommitted:
                             await repo.reconcile_terminal(
                                 row_id=row.id,
-                                state=SteeringMessageState.injected,
+                                state=SteeringMessageState.cancelled,
                             )
                     await repo.finalize_active_for_run(run_id)
                     await session.commit()
@@ -356,9 +694,11 @@ class DurableSteeringCoordinator:
                     "durable steering finalization failed for run {}",
                     run_id,
                 )
+                if cancel_uncommitted:
+                    raise
 
     async def poll_once(self) -> None:
-        for run_id in tuple(self._agents):
+        for run_id in tuple(self._sessions):
             await self.drain(run_id)
 
     async def maintain_once(self) -> None:
@@ -386,7 +726,12 @@ class DurableSteeringCoordinator:
             finalized_runs: set[tuple[str, str, str]] = set()
             async with shared_checkpointer() as checkpointer:
                 for row in rows:
-                    if row.run_id in self._agents:
+                    if row.run_id in self._sessions:
+                        continue
+                    if row.source_kind == "background_task" and row.notice_id:
+                        # Both positive and negative recovery need CubeLoop's
+                        # run fence and the admission -> event -> steering order.
+                        # The background delivery coordinator owns that path.
                         continue
                     history_ids = history_by_conversation.get(row.conversation_id)
                     if history_ids is None:
@@ -397,10 +742,12 @@ class DurableSteeringCoordinator:
                         org_id=row.org_id,
                         workspace_id=row.workspace_id,
                     )
-                    if row.client_steer_id in history_ids:
-                        await repo.reconcile_terminal(
-                            row_id=row.id,
-                            state=SteeringMessageState.injected,
+                    if _checkpoint_key(row) in history_ids:
+                        await self._acknowledge_row_checkpoint(
+                            session=session,
+                            repo=repo,
+                            row=row,
+                            owned=False,
                         )
                         continue
                     if row.conversation_id not in pending_by_conversation:

@@ -104,3 +104,29 @@ async def test_boto_client_sends_only_dispatch_wire_payload() -> None:
         client.kwargs["payload"]
         == ('{"version":1,"dispatch_id":"' + str(dispatch_id) + '"}').encode()
     )
+
+
+def test_dispatch_freezes_admission_and_attempt_for_prompt_and_resume() -> None:
+    ctx = _ctx()
+    ctx.execution = SimpleNamespace(
+        admission_id="adm-1",
+        execution_generation=3,
+        start_token="original-start",
+        attempt_id="current-attempt",
+    )
+    prompt = build_prompt_request(
+        content="inspect", attachments=[], ctx=ctx, model_key=None, reasoning=None
+    )
+    respond = build_respond_request(
+        question_id="q1", answer="yes", claim_token="current-attempt", ctx=ctx
+    )
+    expected = {
+        "admission_id": "adm-1",
+        "generation": 3,
+        "start_token": "original-start",
+        "attempt_id": "current-attempt",
+    }
+    assert request_context_from_payload(prompt)["execution"] == expected
+    assert request_context_from_payload(respond)["execution"] == expected
+    ctx.execution.attempt_id = "later-attempt"
+    assert request_context_from_payload(prompt)["execution"] == expected

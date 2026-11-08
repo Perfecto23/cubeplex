@@ -1,6 +1,6 @@
 # CubePlex × AgentCore
 
-这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的 fork，上游基线为 `f5272e19`（产品版本 `0.7.2`）。本 fork 将 CubePlex 的产品控制面与 Agent 执行环境拆开：员工继续使用原来的网页或 Slack，CubeLoop Agent 和 Git/Shell/文件工具在 AgentCore MicroVM 中按需运行。
+这是基于 [cubeplexai/cubeplex](https://github.com/cubeplexai/cubeplex) 的 fork，当前源码已同步上游 main `7abf66d1472565bdcb5f13223bf2e358bfa79180`（2026-11-08，版本线 `0.9.4`）。本 fork 将 CubePlex 的产品控制面与 Agent 执行环境拆开：员工继续使用原来的网页或 Slack，CubeLoop Agent 和 Git/Shell/文件工具在 AgentCore MicroVM 中按需运行。
 
 ```text
 员工使用 Web / Slack
@@ -12,20 +12,20 @@
       保存检查点、进度、人工确认和文件，再展示给员工
 ```
 
-当前 Testing 使用 `cubeplex_native_entry_20260913-sWxaCf7pyC` Runtime v2，状态 `READY`。Native 真实网页与 Slack 任务、跨会话追问、下载文件、人工确认、Backend 重启、停止与回收、重复消息和晚到回调均有对应验收记录；本次 cleanup Web readback 为 `CLEANUP-NATIVE-OK`。关闭本机运维连接后，网页与 Slack 的新任务仍由云端处理；没有进行物理电脑关机实验。
+本 fork 的部署入口仍为 Native AgentCore。11 月升级对齐 CubeLoop 0.16.1、上游 execution admission/attempt 生命周期，以及新版网页和 OpenSandbox 1.1.1。可部署版本使用独立的 `agentcore-YYYY.MM.DD.N` 发布标签；镜像、源码和 Runtime 版本从 [fork Releases](https://github.com/Perfecto23/cubeplex/releases) 的 `release-manifest.json` 核对。
 
 ## 实现与部署
 
 - **Kubernetes 控制面**：复用现有单节点 k3s、Backend、Frontend、Postgres、Redis、RustFS 和原生 Slack Socket Mode，入口不依赖本机轮询程序。
 - **Native 执行层**：自制 ARM64 镜像运行 CubeLoop 与本地工具。模型、数据库和存储主凭据留在 Backend；MicroVM 只有对应任务的短期回调权限和最小 AWS 角色。
 - **状态与恢复**：检查点与请求回执在同一 PostgreSQL 事务提交；事件、终态和停止有去重与隔离。等待人工回答时可以回收 VM，回答后用新会话继续同一个 run。
-- **运行边界**：Native Runtime v2 是当前唯一产品执行路径。OpenSandbox 继续承载 Browser、Terminal 和文件侧栏；旧 compatibility Runtime、Git slice Runtime、Lambda、S3 状态和专属 Secrets 已退休。
+- **运行边界**：Native Runtime 是当前唯一产品执行路径。OpenSandbox 继续承载 Browser、Terminal 和文件侧栏；旧 compatibility Runtime、Git slice Runtime、Lambda、S3 状态和专属 Secrets 已退休。
 
-Native Worker 来自 `09f272ec4088f72fe709cc89b01d7abd68fe45d3`，Backend 来自 `5e616137415f7b93d3e86b9514739ba129d9a7c4`，镜像 digest 与部署方法见 [Native 运行指南](deploy/agentcore-native-entry/README.md)。Backend 主容器和 migration 初始化容器须使用同一新版镜像。Frontend 沿用已部署版本。已修复有供应商补丁的镜像问题；仍保留已知未修复的 zlib High，Native 镜像另有 nghttp2 Medium，不能宣称扫描清零。
+[Native 运行指南](deploy/agentcore-native-entry/README.md) 说明同一提交的三镜像构建、数据库维护迁移和升级验证。Backend、migration 初始化容器和 Frontend 使用同一发布；Native Worker 的 CubeLoop 版本与 Backend 对齐。升级保留账号、会话和成果，迁移前须备份并暂停旧 Backend 写入。安全扫描结果随发布资产记录。
 
 ## 当前能力边界
 
-原生路径支持公开仓库的 clone、读取和命令执行，以及普通文件的保存、展示和恢复。真实 Git 测试首轮因 Agent 未切换目录而发现 0 个测试，未计为通过；同会话纠正后实际运行了 4 个测试（1 通过、3 失败，测试仓库 main 故意保留缺陷），结果已如实保存。
+原生路径支持公开仓库的 clone、读取和有界前台命令执行，以及普通文件的保存、展示和恢复。上游新增的持久后台命令使用 OpenSandbox 任务体系；Native 本地工具仍随所属 AgentCore 会话结束。
 
 普通文件快照不保存 `.git`、隐藏文件、凭据、安装环境或后台进程。Browser、Terminal 和文件侧栏仍使用 OpenSandbox 环境；Native 的实际用户入口是对话和下载卡片。独立 Git slice 只保留历史证据，未接入产品入口；其 Worker ECR 基础镜像仍因 Native Dockerfile 的 `FROM` 依赖保留。员工私库授权、200 仓库检索、AgentCore Browser 和其余工具迁移继续分批实施。
 
@@ -85,21 +85,24 @@ fork 的 AgentCore 产品接入边界、Testing 操作和当前状态以上方�
   </a>
 </p>
 
-CubePlex is a cloud-native platform for managed agents in team workspaces —
-skills, shared memory, MCP tools, persistent sandboxes, governed access, and
-self-hosted deploy on Docker Compose or Kubernetes.
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+CubePlex is a cloud-native platform for **long-lived, team-owned Agents**. A Workspace gives a team one Agent with a stable role, shared knowledge, approved tools, and a persistent work environment—available from the web and the channels where the team already works.
 
 <p align="center">
   <img src="docs/site/static/img/architecture/cubeplex-overview.svg" alt="CubePlex architecture: clients, the application and agent runtime, workspace sandboxes, external services, and persistent infrastructure" width="100%" />
 </p>
 
-The diagram reflects the current application architecture. CubePlex's agent
-runtime is built on [CubeLoop](https://github.com/cubeplexai/cubeloop), an
-async-native agent framework for multi-provider model access, tool execution,
-streaming, middleware, and durable checkpoints. Workspace sandboxes
-are isolated execution environments with persistent working state; external
-model providers, MCP servers, and IM platforms remain outside CubePlex's trust
-boundary.
+## Why CubePlex
+
+- **One long-lived Workspace Agent** — The team returns to the same Agent across tasks, with its role, Skills, memory, MCP connections, and working state intact.
+- **Team-owned state, not personal state** — Agent configuration, shared knowledge, approved tools, deliverables, and working state belong to the Workspace and remain with the team.
+- **One Agent across every entry point** — Use the same Workspace Agent from the web, Slack, Discord, Teams, Feishu, DingTalk, WeCom, and more, while each conversation keeps its own participants and execution context.
+- **Durable, governed execution** — Isolated persistent sandboxes and organization controls make ongoing Agent work inspectable, repeatable, and manageable.
+
+CubePlex's Agent runtime is built on [CubeLoop](https://github.com/cubeplexai/cubeloop), an async-native agent framework for multi-provider model access, tool execution, streaming, middleware, and durable checkpoints. Workspace sandboxes are isolated execution environments with persistent working state; external model providers, MCP servers, and IM platforms remain outside CubePlex's trust boundary.
 
 ## Demos
 
@@ -109,11 +112,14 @@ boundary.
 
 > **Build Interactive Website** — a full product website generated from a single prompt.
 
+<details>
+<summary>More demos</summary>
+
 <div align="center">
   <video src="https://github.com/user-attachments/assets/d93360b7-8141-42c9-bc4f-3d9488a309b1" width="100%" controls></video>
 </div>
 
-> **Skills Workflow** — find a skill, install it and use it to build agentic frontend, end to end.
+> **Skills Workflow** — find a skill, install it, and use it to build an agentic frontend end to end.
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/85975ccb-b512-45ff-96d2-0b7df7c8de57" width="100%" controls></video>
@@ -131,24 +137,34 @@ boundary.
   <video src="https://github.com/user-attachments/assets/1d979ec6-7ddc-489b-bb43-9f4c78c89b38" width="100%" controls></video>
 </div>
 
-> **Browser Control** — an agent drives the browser to complete a task autonomously.
+> **Browser Control** — an Agent drives the browser to complete a task autonomously.
 
+</details>
 
-
-## Features
+## Platform capabilities
 
 | Area | What you get |
 |---|---|
-| **Multi-model chat** | Hosted and custom providers (Anthropic, OpenAI, and more). Attach files, stream replies, switch models mid-conversation. |
-| **Skills** | Packaged agent capabilities — built-in, org-uploaded, or from remote registries (e.g. skills.sh). |
-| **Memory** | Personal, workspace, and org-scoped memory the agent recalls across conversations. |
-| **MCP tools** | Catalog of connectors with static credentials or OAuth; grant tools per workspace. |
-| **Workspace sandboxes** | Per-workspace isolated runtimes with **persistent storage** — files, packages, and the working tree survive restarts so agents resume the same work site. |
-| **Artifacts** | Versioned deliverables — files, previews, code, images — rendered in the thread. |
-| **Automation** | Scheduled tasks (cron / interval / one-shot) and webhook event triggers. |
-| **IM bridges** | Talk to agents from Slack, Discord, Teams, Feishu, DingTalk, and more. |
-| **Team governance** | Organizations, workspaces, roles, model access policies, and cost tracking. |
-| **Deploy anywhere** | Docker Compose for a single host; Helm for Kubernetes. |
+| **Long-lived Workspace Agents** | Give each team a stable Agent role, shared configuration, approved capabilities, and a work environment that continues across tasks. |
+| **Team conversations** | Use private chats, group chats, and Topics to keep participants, conversation context, and execution separate while the Workspace Agent keeps its shared role and knowledge. |
+| **Layered memory** | Recall personal preferences, shared workspace facts and procedures, and organization policies at the appropriate scope. |
+| **Skills** | Package reusable Agent workflows from built-in capabilities, organization-provided skills, or remote registries such as skills.sh, then make them available in the right workspace. |
+| **Governed MCP tools** | Org admins curate a connector catalog; workspaces enable the tools they need. Credentials can be organization-, workspace-, or user-scoped, using OAuth or static credentials. |
+| **Workspace sandboxes** | Per-workspace isolated runtimes with **persistent storage** — files, packages, and the working tree survive restarts so Agents resume the same work site. |
+| **Secrets and credential controls** | Credentials are encrypted at rest. Kubernetes deployments can resolve approved sandbox secrets at request time rather than exposing them as plain environment variables. |
+| **Multi-model chat** | Use hosted and custom providers including Anthropic, OpenAI, and more. Attach files, stream replies, and switch models mid-conversation. |
+| **Automation** | Run scheduled tasks (cron, interval, or one-shot) and webhook event triggers. |
+| **Artifacts** | Deliver versioned files, previews, code, images, and other outputs directly in the conversation. |
+| **IM bridges** | Bring the same Workspace Agent to Slack, Discord, Teams, Feishu, DingTalk, WeCom, and more; configure shared or per-member conversations in group chats. |
+| **Organization and workspace governance** | Manage organizations, workspaces, roles, model access policies, connector catalogs, credentials, and cost tracking. |
+| **Deploy anywhere** | Use Docker Compose for a single host or Helm for Kubernetes. |
+
+## How CubePlex compares
+
+- [**CubePlex vs DeerFlow**](https://cubeplex.ai/blog/cubeplex-vs-deerflow-workspace-and-harness) — team-owned Workspace Agents versus personal Agent environments.
+- [**CubePlex vs Dify**](https://cubeplex.ai/blog/cubeplex-vs-dify-team-agent-workspace) — long-lived Agents versus scenario-specific Apps.
+- [**CubePlex vs QM**](https://cubeplex.ai/blog/qm-cubeplex-team-agent-collaboration) — a long-lived team Agent with entry-point-specific execution contexts versus Agent-computer scopes.
+
 
 ## Get started
 

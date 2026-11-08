@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from datetime import datetime
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 from loguru import logger
 
 if TYPE_CHECKING:
     from cubeplex.parsers import FileReadOutput, ParseOptions
+
+T = TypeVar("T")
 
 
 class SandboxError(Exception):
@@ -27,12 +31,56 @@ class SandboxConflictError(SandboxError):
     (e.g. restart while provisioning)."""
 
 
+class SandboxInstanceGoneError(SandboxError):
+    """The provider confirms this exact instance is absent or terminal."""
+
+    def __init__(self, sandbox_instance_id: str) -> None:
+        self.sandbox_instance_id = sandbox_instance_id
+        super().__init__(f"original sandbox instance {sandbox_instance_id} no longer exists")
+
+
+class ProcessHandleNotFoundError(SandboxError):
+    """The provider cannot find a process previously returned by command start."""
+
+    def __init__(self, provider_ref: str) -> None:
+        super().__init__(f"provider process record {provider_ref} is unavailable")
+
+
 @dataclass
 class ExecuteResult:
     """Result of a shell command execution."""
 
     output: str
     exit_code: int | None = None
+
+
+@dataclass
+class ProcessHandle:
+    """CubePlex-owned command id plus a driver-private provider handle."""
+
+    command_id: str
+    provider_ref: str
+    log_cursor: str | None = None
+    deadline_at: datetime | None = None
+
+
+@dataclass
+class ProcessSnapshot:
+    """Incremental status from ``Sandbox.poll``."""
+
+    status: Literal["running", "exited", "killed"]
+    exit_code: int | None = None
+    new_output: str = ""
+    log_cursor: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class ProcessOutput:
+    """Unacknowledged output returned from a provider cursor."""
+
+    new_output: str = ""
+    log_cursor: str | None = None
 
 
 @dataclass
@@ -69,6 +117,11 @@ class Sandbox(ABC):
         """Working directory for command execution."""
         ...
 
+    @property
+    def user_sandbox_id(self) -> str | None:
+        """CubePlex ``user_sandboxes.id`` once the instance is attached."""
+        return None
+
     @abstractmethod
     async def execute(
         self,
@@ -77,6 +130,7 @@ class Sandbox(ABC):
         timeout: int | None = None,
         envs: dict[str, str] | None = None,
         as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> ExecuteResult:
         """Execute a shell command. Returns combined stdout+stderr and exit code.
 
@@ -90,6 +144,8 @@ class Sandbox(ABC):
                   instead of the sandbox agent user. Used for infra helpers
                   (browser stack, workspace chown). Ignored by drivers that
                   have no privilege separation.
+            on_chunk: Optional callback for stdout/stderr text as it arrives.
+                  Exceptions in the callback must not fail the command.
         """
         ...
 
@@ -103,6 +159,59 @@ class Sandbox(ABC):
         support it (OpenSandbox) override this.
         """
         return  # no-op default; OpenSandbox overrides
+
+    def supports_background(self) -> bool:
+        """Whether ``start`` / ``poll`` / ``kill`` are implemented."""
+        return False
+
+    async def run_with_backend(self, operation: Callable[[Sandbox], Awaitable[T]]) -> T:
+        """Run an operation against a concrete backend for its entire lifetime."""
+        return await operation(self)
+
+    def supports_background_reconnect(self) -> bool:
+        """Whether another worker can recover a persisted process handle."""
+        return False
+
+    async def observe(self, handle: ProcessHandle) -> ProcessSnapshot:
+        """Observe execution independently of fetching or acknowledging output."""
+        del handle
+        raise SandboxError("this sandbox driver does not support process observation")
+
+    async def start(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        provider_timeout: bool = False,
+        envs: dict[str, str] | None = None,
+        as_root: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
+    ) -> ProcessHandle:
+        del command, timeout, provider_timeout, envs, as_root, on_chunk, on_started
+        raise SandboxError("this sandbox driver does not support background commands")
+
+    async def poll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        del handle
+        raise SandboxError("this sandbox driver does not support background commands")
+
+    async def read_output(self, handle: ProcessHandle) -> ProcessOutput:
+        """Read output after ``handle.log_cursor`` without acknowledging it."""
+
+        snapshot = await self.poll(handle)
+        return ProcessOutput(
+            new_output=snapshot.new_output,
+            log_cursor=snapshot.log_cursor,
+        )
+
+    async def acknowledge_output(self, handle: ProcessHandle, cursor: str) -> None:
+        """Advance driver-local output state after the durable cursor commits."""
+
+        handle.log_cursor = cursor
+
+    async def kill(self, handle: ProcessHandle) -> None:
+        del handle
+        raise SandboxError("this sandbox driver does not support background commands")
 
     @abstractmethod
     async def upload(self, files: list[tuple[str, bytes]]) -> None:

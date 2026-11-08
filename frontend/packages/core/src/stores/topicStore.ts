@@ -1,7 +1,9 @@
 import { create } from 'zustand'
 import type { Conversation, Topic, TopicParticipant } from '../types'
 import type { ApiClient } from '../api'
+import type { AccessRemovalResult } from '../api/execution'
 import {
+  type ArchiveTopicResult,
   listTopics,
   getTopic,
   createTopic,
@@ -36,11 +38,11 @@ export interface TopicStore {
     client: ApiClient,
     body: { title: string; sandbox_mode?: string; member_user_ids?: string[] },
   ): Promise<{ topicId: string; conversationId: string }>
-  remove(client: ApiClient, topicId: string): Promise<void>
+  remove(client: ApiClient, topicId: string): Promise<ArchiveTopicResult>
   rename(client: ApiClient, topicId: string, title: string): Promise<void>
   setPin(client: ApiClient, topicId: string, isPinned: boolean): Promise<void>
   addMembers(client: ApiClient, topicId: string, userIds: string[]): Promise<void>
-  removeMember(client: ApiClient, topicId: string, userId: string): Promise<void>
+  removeMember(client: ApiClient, topicId: string, userId: string): Promise<AccessRemovalResult>
   updateParticipantRole(
     client: ApiClient,
     topicId: string,
@@ -154,7 +156,7 @@ export const useTopicStore = create<TopicStore>((set) => ({
   },
 
   async remove(client, topicId) {
-    await deleteTopic(client, topicId)
+    const result = await deleteTopic(client, topicId)
     set((s) => {
       // Drop the topic's participants too so a future panel mount for
       // the same id doesn't render stale state, and let the
@@ -170,6 +172,7 @@ export const useTopicStore = create<TopicStore>((set) => ({
         topicConversations: nextConversations,
       }
     })
+    return result
   },
 
   async rename(client, topicId, title) {
@@ -209,13 +212,14 @@ export const useTopicStore = create<TopicStore>((set) => ({
   },
 
   async removeMember(client, topicId, userId) {
-    await removeTopicParticipant(client, topicId, userId)
+    const result = await removeTopicParticipant(client, topicId, userId)
     set((s) => ({
       topicParticipants: {
         ...s.topicParticipants,
         [topicId]: (s.topicParticipants[topicId] ?? []).filter((p) => p.user_id !== userId),
       },
     }))
+    return result
   },
 
   async updateParticipantRole(client, topicId, userId, role) {

@@ -21,7 +21,9 @@ from cubeplex.agentcore.native_service import (
     canonical,
     load_native_dispatch,
     payload_hash,
+    require_native_execution,
 )
+from cubeplex.cache import RedisHandle
 from cubeplex.config import config
 from cubeplex.db.engine import async_session_maker
 from cubeplex.models.agentcore_callback import AgentCoreCallback
@@ -78,7 +80,11 @@ def decode_file(value: dict[str, Any], *, maximum: int) -> bytes:
 
 
 async def save_workspace(
-    dispatch_id: UUID, request_id: UUID, files: list[dict[str, Any]]
+    dispatch_id: UUID,
+    request_id: UUID,
+    files: list[dict[str, Any]],
+    *,
+    run_store: RedisHandle | None = None,
 ) -> dict[str, Any]:
     if len(files) > 4096 or len(canonical(files)) > MAX_SNAPSHOT:
         raise NativeTaskError("native_workspace_too_large", 413)
@@ -94,7 +100,9 @@ async def save_workspace(
     ordered = sorted(files, key=lambda file: file["path"])
     snapshot = {"files": ordered}
     sha = payload_hash(snapshot)
-    async with callback_transaction(dispatch_id, request_id, "workspace", snapshot) as tx:
+    async with callback_transaction(
+        dispatch_id, request_id, "workspace", snapshot, run_store=run_store
+    ) as tx:
         if tx.replay:
             result = tx.result or {}
         else:
@@ -108,11 +116,14 @@ async def save_workspace(
         return {key: result[key] for key in ("sha256", "file_count")}
 
 
-async def load_workspace(dispatch_id: UUID) -> dict[str, Any]:
+async def load_workspace(
+    dispatch_id: UUID, *, run_store: RedisHandle | None = None
+) -> dict[str, Any]:
     async with async_session_maker() as session:
         d = await load_native_dispatch(session, dispatch_id)
         if d.status == "created":
             raise NativeTaskError("native_task_not_claimed")
+        await require_native_execution(session, d, run_store=run_store)
         saved = await session.scalar(
             select(AgentCoreCallback)
             .join(
@@ -138,7 +149,13 @@ async def load_workspace(dispatch_id: UUID) -> dict[str, Any]:
     return {**value, "sha256": result["sha256"]}
 
 
-async def present_file(dispatch_id: UUID, request_id: UUID, file: dict[str, Any]) -> dict[str, Any]:
+async def present_file(
+    dispatch_id: UUID,
+    request_id: UUID,
+    file: dict[str, Any],
+    *,
+    run_store: RedisHandle | None = None,
+) -> dict[str, Any]:
     content = decode_file(file, maximum=MAX_PRESENT)
     filename = PurePosixPath(file["path"]).name
     # First native slice presents text deliverables; don't run image/document
@@ -150,7 +167,9 @@ async def present_file(dispatch_id: UUID, request_id: UUID, file: dict[str, Any]
         content.decode("utf-8")
     except UnicodeError as exc:
         raise NativeTaskError("native_present_encoding_invalid", 422) from exc
-    async with callback_transaction(dispatch_id, request_id, "present", file) as tx:
+    async with callback_transaction(
+        dispatch_id, request_id, "present", file, run_store=run_store
+    ) as tx:
         if tx.replay:
             return tx.result or {}
         d = tx.dispatch

@@ -108,6 +108,11 @@ class NativeWorker:
             except asyncio.TimeoutError:
                 pass
 
+    async def _require_tool_authority(self) -> None:
+        control = await self.client.control()
+        if control.get("stop_requested") is True:
+            raise asyncio.CancelledError("native execution stopped before tool entry")
+
     @staticmethod
     def _reasoning(value: Any) -> ReasoningControl:
         mode = "auto"
@@ -170,7 +175,11 @@ class NativeWorker:
                 thread_id=conversation_id,
                 run_id=run_id,
             )
-            native_tools = NativeTools(self.workspace, present_callback=self._present_file)
+            native_tools = NativeTools(
+                self.workspace,
+                present_callback=self._present_file,
+                require_authority=self._require_tool_authority,
+            )
             tools = [*native_tools.as_cubeloop_tools(), ask_user_tool(channel)]
             model_config = ModelConfig(
                 model=str((claim.get("model") or {}).get("id") or ""),

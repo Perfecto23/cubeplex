@@ -6,12 +6,15 @@ vi.mock('../../src/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/api')>()
   return {
     ...actual,
-    cancelActiveRun: vi.fn().mockResolvedValue({ status: 'cancelled', run_id: 'r1' }),
+    cancelActiveRun: vi
+      .fn()
+      .mockResolvedValue({ run_id: 'r1', accepted: true, cleanup_pending: true }),
+    getAdmittedRunId: vi.fn(),
     getConversationBootstrap: vi.fn(),
   }
 })
 
-import { cancelActiveRun, getConversationBootstrap } from '../../src/api'
+import { cancelActiveRun, getAdmittedRunId, getConversationBootstrap } from '../../src/api'
 
 const fakeClient = { resolvePath: (s: string) => s, post: vi.fn() } as never
 
@@ -44,19 +47,34 @@ function idleBootstrap() {
     active_run: null,
     pending_hitl: null,
     last_run_status: null,
+    execution_generation: 0,
+    stop_all: null,
+    run_control: null,
+    background_summary: {
+      has_inflight: false,
+      has_pending: false,
+      has_cleanup: false,
+      can_stop: false,
+    },
+    background_events: { items: [], next_cursor: null, has_more: false },
   }
 }
 
 describe('messageStore.cancelStream', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(getConversationBootstrap).mockResolvedValue(idleBootstrap())
+    vi.mocked(getAdmittedRunId).mockResolvedValue(null)
+    vi.mocked(getConversationBootstrap).mockResolvedValue({
+      bootstrap: idleBootstrap(),
+      etag: null,
+    })
     useMessageStore.setState({
       messages: {},
       streamAgents: {},
       isStreaming: false,
       streamingConversationId: null,
       currentRunId: null,
+      pendingRunClientMessageId: null,
       pendingConfirmMap: {},
       pendingAsk: null,
     })
@@ -72,15 +90,18 @@ describe('messageStore.cancelStream', () => {
       blocks: [{ type: 'text', text: 'partial answer' }],
     })
     vi.mocked(getConversationBootstrap).mockResolvedValue({
-      ...idleBootstrap(),
-      messages: [
-        {
-          id: 'cancelled-assistant-1',
-          role: 'assistant',
-          content: [{ type: 'text', text: 'partial answer' }],
-          stop_reason: 'aborted',
-        },
-      ],
+      bootstrap: {
+        ...idleBootstrap(),
+        messages: [
+          {
+            id: 'cancelled-assistant-1',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'partial answer' }],
+            stop_reason: 'aborted',
+          },
+        ],
+      },
+      etag: null,
     })
 
     await useMessageStore.getState().cancelStream(fakeClient, 'conv1')
@@ -93,6 +114,7 @@ describe('messageStore.cancelStream', () => {
     expect(msgs[0].stop_reason).toBe('aborted')
     expect(msgs[0].content).toEqual([{ type: 'text', text: 'partial answer' }])
     expect(cancelActiveRun).toHaveBeenCalledOnce()
+    expect(cancelActiveRun).toHaveBeenCalledWith(fakeClient, 'conv1', 'r1')
   })
 
   it('does not append an empty bubble when nothing was streamed', async () => {
@@ -121,15 +143,18 @@ describe('messageStore.cancelStream', () => {
       },
     })
     vi.mocked(getConversationBootstrap).mockResolvedValue({
-      ...idleBootstrap(),
-      messages: [
-        {
-          id: 'steer-message-1',
-          role: 'user',
-          content: [{ type: 'text', text: 'already injected' }],
-          metadata: { steer_id: 'steer-before-cancel' },
-        },
-      ],
+      bootstrap: {
+        ...idleBootstrap(),
+        messages: [
+          {
+            id: 'steer-message-1',
+            role: 'user',
+            content: [{ type: 'text', text: 'already injected' }],
+            metadata: { steer_id: 'steer-before-cancel' },
+          },
+        ],
+      },
+      etag: null,
     })
 
     await useMessageStore.getState().cancelStream(fakeClient, 'conv1')
@@ -153,18 +178,21 @@ describe('messageStore.cancelStream', () => {
       },
     })
     vi.mocked(getConversationBootstrap)
-      .mockResolvedValueOnce(idleBootstrap())
+      .mockResolvedValueOnce({ bootstrap: idleBootstrap(), etag: null })
       .mockRejectedValueOnce(new Error('bootstrap unavailable'))
       .mockResolvedValue({
-        ...idleBootstrap(),
-        messages: [
-          {
-            id: 'steer-message-retry',
-            role: 'user',
-            content: [{ type: 'text', text: 'already injected' }],
-            metadata: { steer_id: 'steer-retry-refresh' },
-          },
-        ],
+        bootstrap: {
+          ...idleBootstrap(),
+          messages: [
+            {
+              id: 'steer-message-retry',
+              role: 'user',
+              content: [{ type: 'text', text: 'already injected' }],
+              metadata: { steer_id: 'steer-retry-refresh' },
+            },
+          ],
+        },
+        etag: null,
       })
 
     let settled = false
@@ -193,11 +221,94 @@ describe('messageStore.cancelStream', () => {
     expect(cancelActiveRun).not.toHaveBeenCalled()
   })
 
+  it('honors Stop once the pending send receives its run id', async () => {
+    seedStreaming('conv1', {})
+    useMessageStore.setState({ currentRunId: null })
+
+    let settled = false
+    const cancelling = useMessageStore
+      .getState()
+      .cancelStream(fakeClient, 'conv1')
+      .finally(() => {
+        settled = true
+      })
+    await Promise.resolve()
+
+    expect(settled).toBe(false)
+    expect(cancelActiveRun).not.toHaveBeenCalled()
+    expect(useMessageStore.getState()).toMatchObject({
+      cancellingConversationIds: { conv1: true },
+      runLifecycle: { conv1: 'stopping' },
+    })
+
+    useMessageStore.setState({ currentRunId: 'r1' })
+    await cancelling
+
+    expect(cancelActiveRun).toHaveBeenCalledWith(fakeClient, 'conv1', 'r1')
+  })
+
+  it('recovers the persisted run id when the start response is lost', async () => {
+    seedStreaming('conv1', {})
+    useMessageStore.setState({
+      currentRunId: null,
+      pendingRunClientMessageId: 'client-message-1',
+    })
+    vi.mocked(getAdmittedRunId).mockResolvedValue('server-run')
+
+    await useMessageStore.getState().cancelStream(fakeClient, 'conv1')
+
+    expect(getAdmittedRunId).toHaveBeenCalledWith(fakeClient, 'conv1', 'client-message-1')
+    expect(cancelActiveRun).toHaveBeenCalledWith(fakeClient, 'conv1', 'server-run')
+  })
+
+  it('bounds run-id recovery when no admitted run appears', async () => {
+    vi.useFakeTimers()
+    seedStreaming('conv1', {})
+    useMessageStore.setState({
+      currentRunId: null,
+      pendingRunClientMessageId: 'client-message-1',
+    })
+
+    const cancelling = useMessageStore.getState().cancelStream(fakeClient, 'conv1')
+    const rejected = expect(cancelling).rejects.toThrow('Could not identify the active run')
+    await vi.advanceTimersByTimeAsync(5_000)
+    await rejected
+
+    expect(cancelActiveRun).not.toHaveBeenCalled()
+    expect(useMessageStore.getState()).toMatchObject({
+      cancellingConversationIds: {},
+      runLifecycle: { conv1: 'running' },
+    })
+  })
+
+  it('does not revive an idle lifecycle when run-id recovery loses its send', async () => {
+    vi.useFakeTimers()
+    seedStreaming('conv1', {})
+    useMessageStore.setState({
+      currentRunId: null,
+      pendingRunClientMessageId: 'client-message-1',
+    })
+
+    const cancelling = useMessageStore.getState().cancelStream(fakeClient, 'conv1')
+    const rejected = expect(cancelling).rejects.toThrow('Could not identify the active run')
+    useMessageStore.setState({
+      isStreaming: false,
+      streamingConversationId: null,
+      runLifecycle: { conv1: 'idle' },
+    })
+    await rejected
+
+    expect(useMessageStore.getState()).toMatchObject({
+      cancellingConversationIds: {},
+      runLifecycle: { conv1: 'idle' },
+    })
+  })
+
   it('does not clear a replacement conversation after cancellation returns', async () => {
     let resolveCancel: (() => void) | undefined
     vi.mocked(cancelActiveRun).mockReturnValueOnce(
       new Promise((resolve) => {
-        resolveCancel = () => resolve({ status: 'cancelled', run_id: 'r1' })
+        resolveCancel = () => resolve({ run_id: 'r1', accepted: true, cleanup_pending: true })
       }),
     )
     seedStreaming('conv-a', {})
@@ -235,10 +346,13 @@ describe('messageStore.cancelStream', () => {
     })
     vi.mocked(getConversationBootstrap)
       .mockResolvedValueOnce({
-        ...idleBootstrap(),
-        active_run: { run_id: 'r1', status: 'running' },
+        bootstrap: {
+          ...idleBootstrap(),
+          active_run: { run_id: 'r1', status: 'running' },
+        },
+        etag: null,
       })
-      .mockResolvedValue(idleBootstrap())
+      .mockResolvedValue({ bootstrap: idleBootstrap(), etag: null })
 
     const cancelling = useMessageStore.getState().cancelStream(fakeClient, 'conv1')
     await Promise.resolve()

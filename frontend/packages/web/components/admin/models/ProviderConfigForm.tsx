@@ -66,7 +66,7 @@ interface ProviderConfigFormProps {
 export function ProviderConfigForm({
   mode,
   preset,
-  provider,
+  provider: currentProvider,
   initialValues,
   onValuesChange,
   saving,
@@ -74,6 +74,7 @@ export function ProviderConfigForm({
   submitLabel,
   onSubmit,
 }: ProviderConfigFormProps) {
+  const [provider] = useState(currentProvider)
   const t = useTranslations('adminModels')
   const tc = useTranslations('adminModels.wizard.configure')
   const isCreate = mode === 'create'
@@ -206,16 +207,21 @@ export function ProviderConfigForm({
       onSubmit(body)
     } else {
       const body: ProviderUpdate = {
-        name: name.trim() || null,
-        provider_type: providerType,
-        base_url: baseUrl.trim() || null,
-        auth_type: authType,
-        // Blank = keep the existing key.
-        api_key: apiKey.trim() || null,
-        logo_url: logoUrl.trim() || null,
-        extra_headers: parsedHeaders ?? null,
-        capability,
-        model_capability_overrides: provider?.model_capability_overrides ?? {},
+        expected_configuration_revision: provider?.configuration_revision,
+      }
+      if (name.trim() !== provider?.name) body.name = name.trim()
+      if (providerType !== provider?.provider_type) body.provider_type = providerType
+      if (baseUrl.trim() !== provider?.base_url) body.base_url = baseUrl.trim()
+      if (authChoice !== (provider?.auth_type === 'none' ? 'none' : 'api_key')) {
+        body.auth_type = authType
+      }
+      if (apiKey.trim()) body.api_key = apiKey
+      if ((logoUrl.trim() || null) !== provider?.logo_url) body.logo_url = logoUrl.trim() || null
+      if (JSON.stringify(parsedHeaders ?? {}) !== JSON.stringify(provider?.extra_headers ?? {})) {
+        body.extra_headers = parsedHeaders ?? {}
+      }
+      if (JSON.stringify(capability) !== JSON.stringify(provider?.capability ?? {})) {
+        body.capability = capability
       }
       onSubmit(body)
     }

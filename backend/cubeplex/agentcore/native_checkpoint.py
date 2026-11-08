@@ -25,7 +25,9 @@ from cubeplex.agentcore.native_service import (
     callback_transaction,
     canonical,
     load_native_dispatch,
+    require_native_execution,
 )
+from cubeplex.cache import RedisHandle
 from cubeplex.db.engine import async_session_maker
 from cubeplex.models.agentcore_dispatch import AgentCoreDispatch
 
@@ -34,6 +36,7 @@ ARGUMENTS = {
     "append": {"messages"},
     "save_extra": {"extra"},
     "save_pending_request": {"request"},
+    "clear_pending_request_if_matches": {"question_id", "run_id"},
     "load_pending_request": set(),
     "load_pending": set(),
     "claim_run": set(),
@@ -104,7 +107,7 @@ async def _read(
 
 async def _mutate(
     session: AsyncSession, dispatch: AgentCoreDispatch, operation: str, args: dict[str, Any]
-) -> None:
+) -> bool | None:
     thread_id, run_id = dispatch.conversation_id, dispatch.run_id
     # Same advisory lock and storage representation as CubeLoop 0.14.1.
     await session.execute(
@@ -116,12 +119,28 @@ async def _mutate(
     thread = await session.get(CubeloopThread, thread_id)
     assert thread is not None
     run = await session.get(CubeloopRun, (thread_id, run_id))
+    if operation == "clear_pending_request_if_matches":
+        if not isinstance(args["question_id"], str) or not isinstance(args["run_id"], str):
+            raise NativeTaskError("native_question_invalid", 422)
+        if args["run_id"] != run_id:
+            return False
+        cleared = await session.execute(
+            update(CubeloopThread)
+            .where(
+                CubeloopThread.thread_id == thread_id,
+                CubeloopThread.run_id == run_id,
+                CubeloopThread.pending_request["question_id"].astext == args["question_id"],
+            )
+            .values(pending_request=null(), run_id=None, updated_at=datetime.now(UTC))
+            .returning(CubeloopThread.thread_id)
+        )
+        return cleared.scalar_one_or_none() is not None
     if operation == "claim_run":
         if run is not None:
             code = "native_run_completed" if run.completed_at else "native_run_already_claimed"
             raise NativeTaskError(code)
         session.add(CubeloopRun(thread_id=thread_id, run_id=run_id))
-        return
+        return None
     if operation == "append":
         if run is None or run.completed_at is not None:
             raise NativeTaskError("native_checkpoint_run_not_writable")
@@ -146,7 +165,7 @@ async def _mutate(
                     run_id=run_id,
                 )
             )
-        return
+        return None
     if operation == "mark_run_complete":
         if run is None:
             raise NativeTaskError("native_run_not_claimed")
@@ -157,13 +176,13 @@ async def _mutate(
                 )
             )
             run.completed_at, run.completion_seq = datetime.now(UTC), int(highest or 0) + 1
-        return
+        return None
     if operation == "save_extra":
         if not isinstance(args["extra"], dict):
             raise NativeTaskError("native_extra_invalid", 422)
         thread.extra = {**thread.extra, **args["extra"]}
         thread.updated_at = datetime.now(UTC)
-        return
+        return None
     if operation == "save_pending_request":
         supplied = args["request"]
         if thread.pending_request is not None and thread.run_id != run_id:
@@ -176,7 +195,7 @@ async def _mutate(
                 .where(CubeloopThread.thread_id == thread_id)
                 .values(pending_request=null(), run_id=None, updated_at=datetime.now(UTC))
             )
-            return
+            return None
         else:
             try:
                 request = HitlRequest.model_validate(supplied)
@@ -185,7 +204,7 @@ async def _mutate(
             thread.pending_request = request.model_dump(mode="json")
             thread.run_id = run_id
         thread.updated_at = datetime.now(UTC)
-        return
+        return None
     if operation == "save_hitl_answer":
         # The VM can persist the authorized answer for CubeLoop replay; it
         # cannot fabricate a decision or approve its own question.
@@ -208,7 +227,7 @@ async def _mutate(
                 set_={"answer": dispatch.request["answer"], "answered_at": datetime.now(UTC)},
             )
         )
-        return
+        return None
     question_ids = args["question_ids"]
     if question_ids is not None and (
         not isinstance(question_ids, list)
@@ -222,9 +241,16 @@ async def _mutate(
         statement = statement.where(CubeloopHitlAnswer.question_id.in_(question_ids))
     await session.execute(statement)
 
+    return None
+
 
 async def checkpoint_call(
-    dispatch_id: UUID, request_id: UUID, operation: str, args: dict[str, Any]
+    dispatch_id: UUID,
+    request_id: UUID,
+    operation: str,
+    args: dict[str, Any],
+    *,
+    run_store: RedisHandle | None = None,
 ) -> Any:
     validate_arguments(operation, args)
     if operation in READS:
@@ -232,12 +258,13 @@ async def checkpoint_call(
             dispatch = await load_native_dispatch(session, dispatch_id)
             if dispatch.status == "created":
                 raise NativeTaskError("native_task_not_claimed")
+            await require_native_execution(session, dispatch, run_store=run_store)
             return await _read(session, dispatch, operation, args)
     async with callback_transaction(
-        dispatch_id, request_id, f"checkpoint:{operation}", args
+        dispatch_id, request_id, f"checkpoint:{operation}", args, run_store=run_store
     ) as callback:
         if callback.replay:
             return (callback.result or {}).get("value")
-        await _mutate(callback.session, callback.dispatch, operation, args)
-        callback.complete({"value": None})
-        return None
+        value = await _mutate(callback.session, callback.dispatch, operation, args)
+        callback.complete({"value": value})
+        return value

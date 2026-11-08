@@ -13,26 +13,73 @@ import { streamRun } from './runStreams'
  * request rather than only when it changes.
  */
 export interface SendMessageRequest {
+  client_message_id: string
   content: string
   attachments?: string[]
   model_key?: string | null
-  reasoning?: ReasoningControl
+  reasoning?: ReasoningControl | null
 }
 
 export interface CancelRunResponse {
-  status: 'cancelled' | 'published' | 'no_active_run'
-  run_id: string | null
+  run_id: string
+  accepted: boolean
+  cleanup_pending: boolean
 }
 
 export async function cancelActiveRun(
   client: ApiClient,
   conversationId: string,
+  runId: string,
 ): Promise<CancelRunResponse> {
-  const res = await client.post(`/api/v1/conversations/${conversationId}/cancel`, {})
+  const res = await client.post(`/api/v1/conversations/${conversationId}/cancel`, {
+    run_id: runId,
+  })
   if (!res.ok) {
     throw await toApiError(res)
   }
   return (await res.json()) as CancelRunResponse
+}
+
+export interface StopAllResponse {
+  execution_generation: number
+  accepted: boolean
+  cleanup_pending: boolean
+}
+
+export async function getAdmittedRunId(
+  client: ApiClient,
+  conversationId: string,
+  clientMessageId: string,
+): Promise<string | null> {
+  const params = new URLSearchParams({ client_message_id: clientMessageId })
+  const res = await client.get(
+    `/api/v1/conversations/${encodeURIComponent(conversationId)}/admitted-run?${params.toString()}`,
+  )
+  if (!res.ok) throw await toApiError(res)
+  return ((await res.json()) as { run_id: string | null }).run_id
+}
+
+export async function getConversationExecutionGeneration(
+  client: ApiClient,
+  conversationId: string,
+): Promise<number> {
+  const res = await client.get(
+    `/api/v1/conversations/${encodeURIComponent(conversationId)}/execution-generation`,
+  )
+  if (!res.ok) throw await toApiError(res)
+  return ((await res.json()) as { execution_generation: number }).execution_generation
+}
+
+export async function stopAllConversationWork(
+  client: ApiClient,
+  conversationId: string,
+  executionGeneration: number,
+): Promise<StopAllResponse> {
+  const res = await client.post(`/api/v1/conversations/${conversationId}/stop-all`, {
+    execution_generation: executionGeneration,
+  })
+  if (!res.ok) throw await toApiError(res)
+  return (await res.json()) as StopAllResponse
 }
 
 export interface SteerRunResponse {
@@ -158,8 +205,9 @@ export async function* streamMessages(
   attachmentIds?: string[],
   signal?: AbortSignal,
   options?: {
+    client_message_id?: string
     model_key?: string | null
-    reasoning?: ReasoningControl
+    reasoning?: ReasoningControl | null
     /**
      * Fires as soon as the POST returns a run id, BEFORE any event is
      * yielded — only on the JSON-then-tail path (the production path
@@ -181,7 +229,10 @@ export async function* streamMessages(
   if (csrf) headers['X-CSRF-Token'] = csrf
 
   const path = client.resolvePath(`/api/v1/conversations/${conversationId}/messages`)
-  const requestBody: SendMessageRequest = { content }
+  const requestBody: SendMessageRequest = {
+    client_message_id: options?.client_message_id ?? globalThis.crypto.randomUUID(),
+    content,
+  }
   if (attachmentIds && attachmentIds.length) requestBody.attachments = attachmentIds
   // ``null`` is intentional: backend treats it the same as a missing key
   // (workspace default), but sending it explicitly lets us round-trip the

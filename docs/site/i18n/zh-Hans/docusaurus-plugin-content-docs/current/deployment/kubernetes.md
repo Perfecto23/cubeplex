@@ -6,7 +6,7 @@ title: Kubernetes（Helm）
 # 用 Kubernetes 部署 CubePlex
 
 一条 `helm upgrade --install` 命令即可将 CubePlex（backend + frontend +
-Postgres + Redis + rustfs + alibaba OpenSandbox 全家桶）部署到已有的
+Postgres + Redis + rustfs + Tempo + alibaba OpenSandbox 全家桶）部署到已有的
 Kubernetes 集群中。
 
 backend Deployment 需要两个标准 Kubernetes Pod 特性：**init container**
@@ -54,10 +54,12 @@ Namespace: cubeplex
 │  frontend Deployment (1 replica)                               │
 │    Next.js standalone runtime (node server.js)                 │
 ├──────────────┬─────────────┬───────────────┬──────────────────┤
-│ postgres SS  │ redis SS    │ rustfs SS     │ opensandbox      │
-│  + PVC       │  + PVC      │  + PVC + Job  │（内置 subchart） │
-│              │             │  (bucket init)│                  │
-└──────────────┴─────────────┴───────────────┴──────────────────┘
+│ postgres SS  │ redis SS    │ rustfs SS     │ tempo SS         │
+│  + PVC       │  + PVC      │  + PVC + Job  │  + PVC           │
+│              │             │  (bucket init)│  仅 ClusterIP    │
+├──────────────┴─────────────┴───────────────┴──────────────────┤
+│  opensandbox（内置 subchart）                                  │
+└───────────────────────────────────────────────────────────────┘
                                             │
                                             └── LLM providers（外部）
 ```
@@ -66,10 +68,11 @@ Namespace: cubeplex
 通过 `storageClass.basePath` 改成其他节点路径，或设置
 `storageClass.create: false` 让每个 StatefulSet 指向已有的 StorageClass。
 
-还有两个可选的命名空间内服务：egress 密钥注入 webhook
-（[§4.10](#410-egress-密钥注入可选)）和 docling-serve 文档解析服务
-（[§4.11](#411-docling-文档解析可选)，一个 Deployment + models PVC）。两者
-默认都是关闭的。
+Tempo（[§4.12](#412-tempo-tracing默认开启)）默认开启，仅 ClusterIP、不上
+Ingress，backend ConfigMap 会自动指向它。还有两个可选的命名空间内服务：
+egress 密钥注入 webhook（[§4.10](#410-egress-密钥注入可选)）和
+docling-serve 文档解析服务（[§4.11](#411-docling-文档解析可选)，一个
+Deployment + models PVC）。后两者默认关闭。
 
 ## 3. 镜像
 
@@ -170,8 +173,8 @@ $EDITOR deploy/kubernetes/charts/cubeplex/values.local.yaml
 ```yaml
 image:
   # 固定成与 chart appVersion 不同的镜像版本：
-  backend:  { tag: "v0.7.2" }
-  frontend: { tag: "v0.7.2" }
+  backend:  { tag: "v0.9.4" }
+  frontend: { tag: "v0.9.4" }
 ```
 
 自己构建 / 私有 registry 的镜像，则额外设置其位置：
@@ -300,8 +303,7 @@ OpenSandbox subchart 自己的镜像也需要同样加上 `docker.io/` 前缀，
 opensandbox:
   opensandbox-server:
     server:
-      image: { repository: "docker.io/opensandbox/server" }
-      ingress: { image: { repository: "docker.io/opensandbox/ingress" } }
+      image: { repository: "docker.io/opensandbox/server", tag: "release-1.1.1" }
     configToml: |
       [server]
       host = "0.0.0.0"
@@ -311,35 +313,47 @@ opensandbox:
       level = "INFO"
       [runtime]
       type = "kubernetes"
-      execd_image = "docker.io/opensandbox/execd:v1.0.19"
+      execd_image = "docker.io/opensandbox/execd:release-1.1.1"
       [kubernetes]
       namespace = "opensandbox"
-      informer_enabled = true
       informer_resync_seconds = 300
       informer_watch_timeout_seconds = 60
-      snapshot_create_timeout_seconds = 900
       workload_provider = "batchsandbox"
       batchsandbox_template_file = "/etc/opensandbox/example.batchsandbox-template.yaml"
       [egress]
-      image = "docker.io/opensandbox/egress:v1.0.12"
+      image = "docker.io/opensandbox/egress:release-1.1.1"
       mode = "dns+nft"
   opensandbox-controller:
     controller:
-      # Docker Hub 上的 v0.2.0 会崩溃，报
-      # `flag provided but not defined: -containerd-socket-path`——
-      # 这个发布出去的 tag 落后于 chart 自己的模板。暂时先 pin `latest`，
-      # 等上游重新出一个真正对得上的 v0.2.0。
-      image: { repository: "docker.io/opensandbox/controller", tag: "latest" }
+      image: { repository: "docker.io/opensandbox/controller", tag: "release-1.1.1" }
       snapshot:
-        imageCommitterImage: "docker.io/opensandbox/image-committer:v0.1.0"
+        imageCommitterImage: "docker.io/opensandbox/image-committer:release-1.1.1"
 ```
 
-装之前还要先建好 `opensandbox-system` 和 `opensandbox` 这两个命名空间——
-umbrella chart 和它的子 chart 都不会自动建：
+vendored chart 自己的默认值已经指向
+`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>`，
+tag 是 `release-1.1.1`（`tag` 留空就表示这个值）。只有节点拉不到默认仓库，
+或者 CRI-O 拒绝短镜像名时，才用上面的 `docker.io/` 写法。
+`egress.webhook.egressImage` 必须和 `[egress].image` 是同一个字符串。
+API key 为空时 server 会拒绝启动；也可以不写 `configToml` 里的 `api_key`，
+改为用 Secret 给 server 容器设置 `OPENSANDBOX_SERVER_API_KEY`。这个值按
+原文比较，Secret 里不能带末尾换行。
+
+装之前要先建好 `opensandbox-system` 和 `opensandbox`。CubePlex 关掉了 1.1.1
+base chart 的命名空间创建（`base.fastSandbox.namespaces.createSystem` 和
+`create` 都是 false）：已经存在、又没有 Helm 所有权的命名空间无法被接管，
+fast-sandbox 的数据面命名空间也不会用到。server chart 始终不会创建 sandbox
+工作负载命名空间：
+
 ```bash
 kubectl create namespace opensandbox-system
 kubectl create namespace opensandbox   # 实际跑每次对话 sandbox pod 的地方
 ```
+
+server 会等 60 秒（`[kubernetes] sandbox_create_timeout_seconds`）直到
+sandbox pod 变成 Running。第一次拉取 execd 或 egress 镜像可能超过这个时间，
+创建请求会返回 504。请先在节点上预拉这两个镜像，或者在 `configToml` 里把
+超时调大。
 
 ### 4.6 内置基础设施密码（必填）
 
@@ -432,12 +446,13 @@ rustfs:
 
 ### 4.9 OpenSandbox subchart
 
-chart 默认会在同一个 release 下打包 alibaba 的 OpenSandbox umbrella
-（controller + server）。它的 controller / server / execd / egress 镜像默认
-走 Docker Hub（`opensandbox/*`），集群节点需要能拉取到。国内集群可在 vendored
-子 chart 的 values 中，把每个镜像改用
-`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/` 前缀（镜像名和
-tag 相同）。
+chart 默认会在同一个 release 下打包 OpenSandbox 1.1.1 umbrella
+（controller + server）。ingress gateway、node agent 和 fast-sandbox 保持关闭。
+组件镜像默认是
+`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>`，
+tag 为 `release-1.1.1`。节点拉不到这个仓库，或者 CRI-O 强制短名检查时，把每个
+repository 改成 `docker.io/opensandbox/<component>`，并把 tag 设为
+`release-1.1.1`，包括 `configToml` 里的 `execd_image` 和 `[egress].image`。
 
 ```yaml
 opensandbox:
@@ -485,10 +500,10 @@ egress:
   sandboxNamespace: "opensandbox"
   webhook:
     image:
-      tag: "v0.7.2"             # 与 backend/frontend 相同的 release 版本
+      tag: "v0.9.4"             # 与 backend/frontend 相同的 release 版本
     # 必须与 opensandbox-server 配置的 egress.image 完全一致。
-    # 国内镜像源：sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.0.12
-    egressImage: "opensandbox/egress:v1.0.12"
+    # chart 默认值。Docker Hub 覆盖：docker.io/opensandbox/egress:release-1.1.1
+    egressImage: "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:release-1.1.1"
 
 backend:
   sandbox:
@@ -593,6 +608,59 @@ backend:
         base_url: "http://docling.example.internal:5001"
 ```
 
+### 4.12 Tempo tracing（默认开启）
+
+chart 会部署 Grafana Tempo 3.0.3 单进程（`-target=all`），本地文件系统后端，
+保留 7 天。backend ConfigMap 自动写入：
+
+- 写入：`tracing.otlp.endpoint` → `http://<release>-tempo:4318/v1/traces`
+- 查询：`tracing.tempo.query_endpoint` → `http://<release>-tempo:3200`
+
+admin 的 `/admin/traces` 读这个查询地址。返回 503 表示 Tempo 被关掉，或
+`query_endpoint` 仍是 null。
+
+Tempo 的查询 API 没有鉴权。组织隔离只在 CubePlex 里
+（`require_org_admin` + TraceQL `org_id` 条件）。ClusterIP 不是租户隔离。
+控制手段：
+
+- 不上 Ingress。
+- NetworkPolicy（默认开启）只允许带
+  `app.kubernetes.io/component: backend` 标签的 Pod 访问 3200 / 4318 /
+  4317。如果 kubelet 的 `/ready` 探针失败（探针来自节点 IP，不是 Pod），把
+  `tempo.networkPolicy.enabled` 设为 `false`。
+- `record_content` 默认 false，除非你主动打开。
+- 关闭磁盘 JSONL（`tracing.jsonl.enabled: false`），避免撑满 backend 可写层。
+
+```yaml
+tempo:
+  enabled: true
+  image: grafana/tempo:3.0.3
+  retention: 168h
+  recordContent: false
+  networkPolicy:
+    enabled: true
+  persistence:
+    storageClass: cubeplex-work-hostpath
+    size: 10Gi
+```
+
+关掉内置 Tempo、改用外部实例：
+
+```yaml
+tempo:
+  enabled: false
+backend:
+  configOverrides:
+    tracing:
+      enabled: true
+      jsonl:
+        enabled: false
+      otlp:
+        endpoint: "http://tempo.observability.svc:4318/v1/traces"
+      tempo:
+        query_endpoint: "http://tempo.observability.svc:3200"
+```
+
 ## 5. 安装
 
 ### 推荐：使用已发布的 chart
@@ -602,7 +670,7 @@ backend:
 
 ```bash
 helm upgrade --install cubeplex oci://ghcr.io/cubeplexai/charts/cubeplex \
-  --version 0.7.2 \
+  --version 0.9.4 \
   --namespace cubeplex --create-namespace \
   --values values.local.yaml \
   --wait --timeout 10m
@@ -634,6 +702,32 @@ helm upgrade --install cubeplex deploy/kubernetes/charts/cubeplex \
   --wait --timeout 10m
 ```
 
+### 升级任务生命周期切换前的数据库 {#upgrading-a-database-from-before-the-task-lifecycle-cutover}
+
+后端 init 容器会拒绝在滚动升级中直接完成这次切换，避免迁移期间旧 Pod 继续写入。已有部署需分两步执行维护升级：
+
+```bash
+# 先停止所有旧 API/worker，等待所有后端 Pod 删除。
+kubectl -n cubeplex scale deployment/cubeplex-backend --replicas=0
+kubectl -n cubeplex wait --for=delete pod \
+  -l app.kubernetes.io/component=backend --timeout=5m
+
+# 启用持有迁移锁的一次性维护 hook，保持后端副本数为 0。
+helm upgrade cubeplex oci://ghcr.io/cubeplexai/charts/cubeplex \
+  --version <new-version> --namespace cubeplex --values values.local.yaml \
+  --set backend.replicaCount=0 \
+  --set backend.lifecycleMaintenance.enabled=true \
+  --wait --timeout 20m
+
+# hook 成功后关闭维护模式，恢复 values.local.yaml 中设置的副本数。
+helm upgrade cubeplex oci://ghcr.io/cubeplexai/charts/cubeplex \
+  --version <new-version> --namespace cubeplex --values values.local.yaml \
+  --set backend.lifecycleMaintenance.enabled=false \
+  --wait --timeout 10m
+```
+
+维护 Job 遇到仍在运行的旧版 run-lifetime 命令、monitor，或未记录原 sandbox 实例和执行方进程句柄的命令时会停止。处理或停止这些项目后，再运行同一命令。未知的执行方句柄会被保留，不会通过猜测去查询或终止当前 sandbox。全新安装，以及已经完成这次切换的数据库，继续使用正常的一条命令安装或升级流程。
+
 ### 卸载
 
 ```bash
@@ -664,6 +758,17 @@ INGRESS_IP=<你的节点 IP> deploy/kubernetes/scripts/smoke-test.sh
 
 检查项：rollout 完成、健康检查端点有响应、ingress 正确路由 backend 和
 frontend、Next.js 能渲染 HTML。**不**会触发 LLM 调用。
+
+后端 Pod 带有 `prometheus.io/scrape`、`prometheus.io/path` 和
+`prometheus.io/port` 注解，可用于基于注解的 Pod 发现。请在 Prometheus 中配置使用这些注解。
+`/metrics` 可通过后端 ClusterIP Service 访问，不通过公共 Ingress 暴露。检查方式：
+
+```bash
+kubectl -n cubeplex port-forward svc/cubeplex-backend 18000:http
+curl http://localhost:18000/metrics
+```
+
+指标名称与统计规则见[指标列表](./overview.md#metrics)。
 
 ### 6.3 端到端测试（含 LLM 往返）
 
@@ -850,8 +955,23 @@ docling:                            # 可选，见 §4.11
   env: { }                          # 例如 HF_ENDPOINT、HF_TOKEN
   resources: { ... }
 
+tempo:                              # 默认开启，见 §4.12
+  enabled: true
+  image: "grafana/tempo:3.0.3"
+  retention: 168h
+  recordContent: false
+  networkPolicy: { enabled: true }
+  persistence: { storageClass, size }
+  resources: { ... }
+
 opensandbox:
   enabled: true
+  base:
+    fastSandbox:
+      namespaces: { createSystem: false, create: false }
+  ingress-gateway: { enabled: false }
+  opensandbox-node-agent: { enabled: false }
+  fast-sandbox: { enabled: false }
   opensandbox-server:     { server:     { replicaCount: 1 } }
   opensandbox-controller: { controller: { replicaCount: 1 } }
 ```
@@ -860,8 +980,8 @@ opensandbox:
 
 ```yaml
 image:
-  backend:  { tag: "v0.7.2" }
-  frontend: { tag: "v0.7.2" }
+  backend:  { tag: "v0.9.4" }
+  frontend: { tag: "v0.9.4" }
 
 backend:
   configOverrides:

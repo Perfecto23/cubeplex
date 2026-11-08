@@ -100,6 +100,7 @@ api:
   host: "0.0.0.0"
   port: 8000
   public_url: "https://cubeplex.example.com"
+  transport_shutdown_timeout_seconds: 10
 public_base_url: "https://cubeplex.example.com"
 frontend_base_url: "https://cubeplex.example.com"
 ```
@@ -109,6 +110,7 @@ frontend_base_url: "https://cubeplex.example.com"
 | `deployment.mode` | `single_tenant` | `single_tenant` auto-creates one org on first registration (OSS). `multi_tenant` mints a per-user org (cloud). |
 | `api.host` / `api.port` | `0.0.0.0` / `8000` | Bind address inside the container. |
 | `api.public_url` | `""` | The URL clients reach the backend at. Behind a reverse proxy, use the **proxy's** URL. |
+| `api.transport_shutdown_timeout_seconds` | `10` | Maximum wait for HTTP requests and SSE streams to close before agent draining begins. |
 | `public_base_url` | `http://localhost:8000` | Used to mint absolute URLs (OAuth redirects, etc.). |
 | `frontend_base_url` | `http://localhost:3000` | Where the backend redirects browsers. |
 
@@ -201,8 +203,9 @@ for the user-facing behaviour and each deployment guide for wiring it up.
 sandbox:
   enabled: true
   domain: "…"             # OpenSandbox API host:port (no scheme)
-  image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.7.2"
+  image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.9.4"
   api_key: "…"
+  command_default_timeout_seconds: 3600 # default for the new managed-task reservation layer
   use_server_proxy: false # true when the backend can't reach sandbox pods/ports directly
   secure_access: false    # required for docker-runtime OpenSandbox
   ttl: 1800               # idle seconds before cleanup
@@ -221,8 +224,22 @@ sandbox:
 | `sandbox.use_server_proxy` | `true` | Set `false` for direct pod access; `true` for Docker-bridge / isolated networks. |
 | `sandbox.secure_access` | `false` | Enables Kubernetes ingress-gateway signed URLs when `true`. **Must be `false`** on docker-runtime OpenSandbox. |
 | `sandbox.ttl` | `1800` | Idle sandbox is reaped after 30 min. |
+| `sandbox.command_default_timeout_seconds` | `3600` | Positive integer seconds, at most `2147483647` (the technical 32-bit seconds limit). The backend rejects out-of-range values, non-integers, booleans, and null at startup. Environment override: `CUBEPLEX_SANDBOX__COMMAND_DEFAULT_TIMEOUT_SECONDS`. |
 | `sandbox.run_user` / `run_uid` / `run_gid` | `cubeplex` / `1000` / `1000` | Agent commands and uploaded files run as this user. Match the sandbox image. Set `run_uid` to `null` to keep the previous root default. Browser stack still starts as root. |
 | `sandbox.resource.cpu` / `memory` | `2` / `4Gi` | Per-sandbox limits. |
+
+The background-task reservation layer uses `command_default_timeout_seconds` when
+an execute task omits `timeout_seconds`. An explicit positive timeout takes
+precedence and may exceed one hour, up to the same technical limit. Oversized values
+are rejected, not truncated or treated as unlimited. The absolute deadline is stored once;
+configuration changes do not extend existing reservations. Disabling completion
+notifications does not remove the deadline. Monitor deadlines, persistent monitors,
+HTTP timeouts, sandbox TTL, and the foreground waiting budget are separate settings.
+
+This is the storage/reservation foundation of the lifecycle rollout. The existing
+agent execute path and coordinator have not switched to it yet; adding this setting
+does not by itself change their behavior or enable conversation-owned background
+execution. Existing command records are not assigned a guessed deadline.
 
 ## Streaming
 
@@ -397,6 +414,8 @@ tracing:
   enabled: false
   directory: "./cubeloop-traces"
   record_content: false  # true captures full prompts/responses/tool I/O (larger, sensitive)
+  jsonl:
+    enabled: true        # local-dev JSONL; Helm/Compose set false
   otlp:
     endpoint: null       # e.g. http://localhost:4318/v1/traces to ship spans
     headers: null
@@ -404,9 +423,12 @@ tracing:
     query_endpoint: null # enables the admin trace viewer when set
 ```
 
-Writes per-run cubeloop spans to disk when enabled, and optionally ships them to
-an OTLP collector (Grafana Tempo, etc.). `record_content: true` is powerful for
-debugging but captures potentially sensitive prompt/tool data.
+Writes per-run cubeloop spans to disk when JSONL is on, and optionally ships
+them to an OTLP collector (Grafana Tempo, etc.). Helm and Compose fill
+`otlp.endpoint` and `tempo.query_endpoint` when bundled Tempo is on, and set
+`jsonl.enabled: false` so the backend writable layer is not filled.
+`query_endpoint` null still means admin traces 503. `record_content: true` is
+powerful for debugging but captures potentially sensitive prompt/tool data.
 
 ## Logging
 
@@ -420,6 +442,16 @@ logging:
 Set `access_log: false` behind a proxy that already logs requests. Add partial
 logger names to `verbose_modules` to selectively re-enable DEBUG.
 
+During shutdown, HTTP requests and SSE streams that exceed
+`api.transport_shutdown_timeout_seconds` are cancelled by Uvicorn. Its ASGI
+exception report is logged at INFO without a traceback only when the exception
+is `CancelledError` with the exact reason
+`Task cancelled, timeout graceful shutdown exceeded`. Other cancellations and
+application exceptions keep their original level and traceback. Uvicorn's
+timeout summary (`Cancel N running task(s), timeout graceful shutdown exceeded`)
+remains ERROR so forced transport shutdown stays visible. This changes logging
+only; cancellation still propagates and agent run drain is unchanged.
+
 ## Lifecycle
 
 ```yaml
@@ -430,7 +462,8 @@ lifecycle:
 
 `graceful_drain_timeout_seconds` bounds how long the backend waits for active
 agent runs to finish before shutting down — align it with your longest expected
-run and the orchestrator's termination grace period.
+run. The orchestrator's termination grace period must also include the shorter
+HTTP transport timeout and final resource cleanup.
 
 ## Egress secret-injection listener
 

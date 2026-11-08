@@ -38,12 +38,24 @@ class TeamsOpDispatcher:
         s = self._state
         # No updateActivity → don't post a partial first token; finalize will
         # send the full reply once (avoids a stuck "你好" with no follow-up).
+        # A pending ask has no later edit to ride on when this channel never
+        # creates a card, so deliver that prompt now.
         if not self._can_edit():
+            await self.dispatch_patch(state)
             return True
-        text = s.card_state.streaming_content
-        if not text:
-            text = "..."
+        text = s.card_state.streaming_content or ""
         current_segment = text[self.sent_char_offset :]
+        if not current_segment:
+            # A resolved HITL clears card_id and parks the offset at the end
+            # of the prior text. The next ask arrives as create with nothing
+            # new to post; an empty send is rejected and the prompt is lost.
+            pending = s.card_state.pending_input
+            if pending is not None and pending.resolved_choice is None:
+                await self.dispatch_patch(state)
+                return False
+            if text:
+                return False
+            current_segment = "..."
         sealed_prefix = False
         if len(current_segment) > _SPLIT_THRESHOLD:
             split_at = find_split_point(current_segment, _SPLIT_THRESHOLD)
@@ -105,15 +117,24 @@ class TeamsOpDispatcher:
     async def dispatch_patch(self, state: Any) -> bool:
         s = self._state
         pending = s.card_state.pending_input
-        pending_id = f"{pending.kind}:{pending.run_id}" if pending else None
+        # question_id keeps a later ask in the same run from being dropped.
+        pending_id = (
+            f"{pending.kind}:{pending.run_id}:{pending.question_id or ''}" if pending else None
+        )
         if (
             pending is not None
             and pending.resolved_choice is None
-            and pending.choices
             and pending_id != self._pending_input_sent_id
         ):
-            await self._send_pending_input_card(pending)
-            self._pending_input_sent_id = pending_id
+            if pending.choices:
+                await self._send_pending_input_card(pending)
+                self._pending_input_sent_id = pending_id
+            elif pending.needs_form():
+                # allow_input / free-text / multi-question cannot be buttons.
+                # ``question`` already includes the web-client notice.
+                text = pending.question or "_(Please continue in the CubePlex web UI.)_"
+                await self._connector.send_message(text)
+                self._pending_input_sent_id = pending_id
         if pending is not None and pending.resolved_choice is not None:
             s.card_id = None
             s.bot_message_id = None

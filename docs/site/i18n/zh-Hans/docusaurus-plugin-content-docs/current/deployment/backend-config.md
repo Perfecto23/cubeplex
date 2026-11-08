@@ -94,6 +94,7 @@ api:
   host: "0.0.0.0"
   port: 8000
   public_url: "https://cubeplex.example.com"
+  transport_shutdown_timeout_seconds: 10
 public_base_url: "https://cubeplex.example.com"
 frontend_base_url: "https://cubeplex.example.com"
 ```
@@ -103,6 +104,7 @@ frontend_base_url: "https://cubeplex.example.com"
 | `deployment.mode` | `single_tenant` | `single_tenant` 首次注册时自动建一个 org（OSS）。`multi_tenant` 每个用户一个 org（云端）。 |
 | `api.host` / `api.port` | `0.0.0.0` / `8000` | 容器内绑定地址。 |
 | `api.public_url` | `""` | 客户端访问后端的 URL。有反代时用**反代**的 URL。 |
+| `api.transport_shutdown_timeout_seconds` | `10` | 进入 Agent drain 前，等待 HTTP 请求和 SSE 流关闭的最长时间。 |
 | `public_base_url` | `http://localhost:8000` | 用于生成绝对 URL（OAuth 重定向等）。 |
 | `frontend_base_url` | `http://localhost:3000` | 后端重定向浏览器的目标。 |
 
@@ -191,7 +193,7 @@ objectstore:
 sandbox:
   enabled: true
   domain: "…"             # OpenSandbox API 地址（不带 schema）
-  image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.7.2"
+  image: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.9.4"
   api_key: "…"
   use_server_proxy: false # 后端无法直连 sandbox pod/端口时设为 true
   secure_access: false    # docker-runtime OpenSandbox 下必须为 false
@@ -377,6 +379,8 @@ tracing:
   enabled: false
   directory: "./cubeloop-traces"
   record_content: false  # true 会捕获完整 prompt/响应/工具 I/O（更大、敏感）
+  jsonl:
+    enabled: true        # 本地开发 JSONL；Helm/Compose 会设为 false
   otlp:
     endpoint: null       # 如 http://localhost:4318/v1/traces 以外发 span
     headers: null
@@ -384,9 +388,12 @@ tracing:
     query_endpoint: null # 设置后启用 admin trace 查看器
 ```
 
-开启后把每次 run 的 cubeloop span 写到磁盘，并可选外发到 OTLP collector（Grafana
-Tempo 等）。`record_content: true` 对调试很有用，但会捕获可能敏感的 prompt/工具
-数据。
+JSONL 开启时把每次 run 的 cubeloop span 写到磁盘，并可选外发到 OTLP
+collector（Grafana Tempo 等）。Helm / Compose 在内置 Tempo 开启时会填好
+`otlp.endpoint` 和 `tempo.query_endpoint`，并把 `jsonl.enabled` 设为
+`false`，避免撑满 backend 可写层。`query_endpoint` 为 null 时 admin traces
+仍返回 503。`record_content: true` 对调试很有用，但会捕获可能敏感的
+prompt/工具数据。
 
 ## 日志
 
@@ -400,6 +407,14 @@ logging:
 前面已有反代记录请求时，把 `access_log` 设为 `false`。往 `verbose_modules` 加
 部分 logger 名可选择性重开 DEBUG。
 
+关机时，超过 `api.transport_shutdown_timeout_seconds` 仍未结束的 HTTP 请求和
+SSE 流会被 Uvicorn 取消。只有异常类型为 `CancelledError`，且取消原因恰好为
+`Task cancelled, timeout graceful shutdown exceeded` 时，Uvicorn 的 ASGI 异常
+日志才会以 INFO 级别输出，不附带堆栈。其他取消和应用异常保留原来的级别与堆栈。
+Uvicorn 的超时摘要（`Cancel N running task(s), timeout graceful shutdown exceeded`）
+仍为 ERROR，让强制关闭传输连接的情况保持可见。这只改变日志；取消仍会继续传播，
+agent run 的排空流程不变。
+
 ## 生命周期
 
 ```yaml
@@ -409,7 +424,8 @@ lifecycle:
 ```
 
 `graceful_drain_timeout_seconds` 限定后端关机前等待活动 agent run 完成的时长——
-与你预期的最长 run 及编排器的终止宽限期对齐。
+请根据最长预期 run 设置。编排器的终止宽限期还必须包含较短的 HTTP 传输关闭时间
+和最终资源清理时间。
 
 ## Egress 密钥注入监听器
 

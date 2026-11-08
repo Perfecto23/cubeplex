@@ -7,6 +7,11 @@ title: Conversation Basics
 
 Conversations are where you interact with the AI agent. Each conversation is a persistent message thread scoped to your workspace, with full context carried across turns.
 
+While a conversation is visible, CubePlex periodically checks for new messages and
+background results. When nothing has changed, it skips downloading the history again
+and keeps your reading position and expanded message cards. Checks pause while the
+tab is hidden and resume when you return.
+
 ## Starting a conversation
 
 When you open a workspace, you land on the home page with an empty input bar. Type a message and press **Enter** (or click the send button) to start a new conversation. CubePlex creates the conversation automatically and routes you to it.
@@ -21,7 +26,28 @@ The layout has three main areas:
 - **Chat area** (center) — the message thread and input bar.
 - **Side panel** (right, opens on demand) — previews artifacts, attachment images, tool call details, or the sandbox browser. When the agent uses the browser skill, this panel opens on the **Browser** tab by itself and the live view follows the tab the agent is operating on. You can still take over at any time, or close the panel if you do not want to watch.
 
+When the agent starts a **write** call, its tool row appears before the file content has finished generating. If the side panel is available, the file preview opens immediately and updates as the content arrives. The preview shows content being generated; the file is saved when the tool successfully executes.
+
+If several files are being written at once, each tool row tracks its own content. The file already open in the preview stays selected as other calls update or finish. Click another write row to follow that file; later updates from other calls will not switch your selection.
+
 ![Conversation view with the chat thread and an artifact preview panel](/img/conversations/conversation-layout.png)
+
+### Turn navigation
+
+On a wide window, the left edge of the chat shows a column of short ticks. Each tick is one turn: your message and the agent's reply. The column stays quiet until you need to move through a long thread.
+
+- A resting tick is a short, faint line.
+- Moving the pointer onto a tick lengthens that tick and brightens it. The tick above it and the tick below it lengthen halfway, so the column ripples as you move.
+- The preview waits a brief moment before it opens, so a quick pass along the column does not flash a card. Your question is bold and stays on one line, ending in an ellipsis when it does not fit. The start of the reply sits under it in regular type.
+- Click a tick to scroll that turn into view. The turn is centered when it fits on screen, and it flashes so you can see where you landed.
+- A long conversation opens on its latest messages. A small mark above the first tick means earlier turns are still unloaded. Click it to load them; the new ticks appear at the top of the column.
+
+The column is hidden on a narrow window, and it is absent until the conversation has a turn to show.
+
+:::info 📸 Screenshot placeholder
+**Capture:** Chat with several turns. The pointer rests on one left-edge tick so that tick is long, the ticks above and below it are a little longer, and the preview card shows the start of the user message and the agent reply.
+**Asset:** `/img/conversations/turn-nav-rail.png`
+:::
 
 The input bar sits at the bottom. It includes:
 
@@ -53,10 +79,13 @@ dismiss. Client commands never create a user message bubble for the slash text.
 | `/mcp` | Open workspace MCP connectors |
 | `/compact` | Force-compact older context for this conversation (idle only) |
 
-`/compact` does **not** post a chat bubble with the text `/compact`. When
-compaction succeeds, the timeline shows a centered **Context compacted** marker
-(and a short toast). That marker is stored in conversation history so it
-remains visible after reload — it is not a user message.
+`/compact` does **not** post a chat bubble with the text `/compact`. It asks
+the compaction model to summarize older turns. If that takes a moment, the
+timeline shows a centered **Compacting context…** line and the composer stays
+locked. When the summary is saved, that line becomes one stored **Context
+compacted** marker, which remains visible after reload — it is not a user
+message. If there is not enough history, or compaction fails, the waiting line
+goes away and a short toast explains why.
 
 Unknown text like `/zzzzz` with no match sends as a normal message (or steers
 while streaming). Type a space after `/` to write a literal leading slash.
@@ -66,7 +95,7 @@ while streaming). Type a space after `/` to write a literal leading slash.
 During a conversation, the agent can:
 
 - **Respond with text** — standard conversational replies with markdown formatting.
-- **Think** — show its reasoning process in a collapsible "thinking" block (when thinking is enabled).
+- **Think** — show its reasoning in a collapsible block when thinking is enabled. Thinking that sits next to tool calls is inside the collapsed tool summary; thinking with no tool calls stays its own block.
 - **Call tools** — invoke MCP connectors to reach external services (databases, APIs, SaaS products).
 - **Execute code** — run commands in a sandboxed environment.
 - **Generate artifacts** — produce downloadable files, live website previews, images, data files, and more. See [Artifacts](./artifacts.md).
@@ -95,6 +124,41 @@ When the agent needs your input (for example, a confirmation before proceeding),
 
 Attachments remain unavailable while a run is active, including while an input or confirmation card is waiting. If you hard-stop a run, the composer shows cancellation progress and stays locked until the previous run has fully stopped.
 
+Pressing the main **Stop** button while a question or confirmation is waiting
+cancels that paused run without another model response. It clears the waiting
+card and cancels guidance that has not reached the conversation history; input
+already recorded in history stays there. This differs from answering or denying
+a confirmation, which can let the agent continue. A successful Stop request
+means cleanup was accepted; the composer waits for the server to confirm it is idle.
+
+Stopping the current response and stopping background work are separate actions.
+The main **Stop** button targets only the response whose Run ID is shown in the
+conversation. Work that was already handed to the background continues. Open
+**Background tasks** from the button after **Share** in the conversation header;
+its badge counts unfinished tasks, and the right panel shows active and recent
+completed tasks. Expand **View tool call and output** on a task to inspect its original
+tool arguments and response, saved command, exit code, and execution output. Output
+loads when you expand the task and refreshes while it is running. If the original
+message is outside the loaded history, the saved command remains available. Use **Stop task** for one item, or **Stop all** when you intend
+to stop the current response and all background work that belongs to the
+conversation.
+
+A successful Stop request means CubePlex durably accepted it; remote cleanup may
+still be in progress. The UI keeps showing **Stopping** until the execution provider
+confirms the result. Stop requests carry the run ID or conversation execution
+generation, so retrying an old request cannot stop work that started later.
+
+Background results appear as compact system events in the timeline, separate from
+messages you send while steering a response. A task or monitor produces at most one
+final event: success, failure, cancellation, or timeout. Expand a result event to
+inspect the same task details and output, including calls made by subagents. Output
+comes from the original task sandbox, even if the conversation later changes its
+sandbox scope. Completed logs remain readable from that sandbox's persistent storage
+after its container is restarted or reaped. Logs above the preview limit have a download link. If the backend
+marks output unavailable, the details show the reason; temporary read failures
+offer retry. See
+[Sandboxes](./sandboxes.md) for command deadlines and recovery behavior.
+
 ## Managing conversations
 
 Right-click (or click the three-dot menu) on any conversation in the sidebar to access these actions:
@@ -102,7 +166,7 @@ Right-click (or click the three-dot menu) on any conversation in the sidebar to 
 - **Rename** — give the conversation a descriptive title. By default, CubePlex auto-generates a title from your first message.
 - **Pin** — pinned conversations stick to the top of the sidebar list so you can find them quickly.
 - **Unpin** — remove a conversation from the pinned section.
-- **Delete** — asks for confirmation, then soft-deletes the conversation. It leaves the sidebar; messages are no longer available in that conversation; related artifacts leave the library and conversation surfaces. Rows and stored files are retained for integrity, cost audit, and future cleanup — not hard-wiped. There is no user-facing restore. Existing share links are not revoked by delete.
+- **Delete** — asks for confirmation, then soft-deletes the conversation and stops its active responses and background work. It leaves the sidebar immediately; if process cleanup is still running, CubePlex shows a one-time notice that the background work is still stopping. Messages are no longer available in that conversation; related artifacts leave the library and conversation surfaces. Rows and stored files are retained for integrity, cost audit, and future cleanup — not hard-wiped. There is no user-facing restore. Existing share links are not revoked by delete.
 
 ## Auto-generated titles
 

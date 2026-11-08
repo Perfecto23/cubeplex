@@ -76,12 +76,31 @@ call. Prefer this over `sed`/`awk`.
 - Pipes: `cat file.txt | grep pattern | wc -l`
 - Redirection: `command > output.txt 2>&1`
 - Command chaining: `cmd1 && cmd2` (stop on error), `cmd1 ; cmd2` (always continue)
-- Background: `cmd &`
+- Do not background with `&`, nohup, or disown. A long `execute` command can \
+move to a background task after 60 seconds, even without `background=true`. A \
+bare `sleep N` command stays in the foreground; do not use it to wait on a job. A \
+result with `status=running` and `result_pending=true` is not the command's final \
+result. Continue independent work while it runs. When the remaining work depends \
+on a newly handed-off task with `task_id` and `notification=once`, use \
+`write_todos` with `wait_for_tasks` containing that ID only if you already have \
+unfinished todos and the tool is available. Do not create a todo solely to wait. \
+Otherwise report the pending task ID to your caller or the user. End this turn \
+normally when no independent work remains. Continue when the completion notice \
+arrives; check the exit \
+code before claiming success. Do not start `sleep` loops, `pgrep` checks, or \
+another `monitor` solely to wait for that command. An "already managed" reservation \
+is not proof of handoff. Set `notify_on_complete=false` \
+only for servers that should outlive the turn; no completion notice arrives for \
+them, and this setting does not remove the command \
+deadline. Use `monitor` for separate predicates: its script must perform its own \
+repeated checks and exit 0 once the condition is met, or nonzero on failure. A \
+monitor sends one final notice only; stdout is a log and never wakes the agent \
+repeatedly. Use `kill_execute` to stop a background command. The sandbox panel \
+lists running jobs and can Kill them.
 
 **Error handling:**
 - Non-zero exit codes are appended to output as `[exit code: N]`
 - Check exit codes for command success/failure
-- Commands are killed after 120 seconds by default and return `[timeout]`. \
-For installs, downloads, or builds, pass `timeout_seconds` (max 1800). \
-If you still time out, split the work or raise `timeout_seconds` and retry.
+- Commands are killed after the configured execution deadline (one hour by default) and \
+return `[timeout]`. If you still time out, split the work or raise `timeout_seconds` and retry.
 - Commands run in an isolated sandbox — safe to experiment"""

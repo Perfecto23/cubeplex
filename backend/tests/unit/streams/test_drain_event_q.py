@@ -26,7 +26,12 @@ from cubeplex.agents.schemas import (
     TextDeltaEvent,
     ToolResultEvent,
 )
-from cubeplex.streams.run_manager import _drain_subagent_citation_queue
+from cubeplex.streams.execution_adapter import EventProjectionError
+from cubeplex.streams.run_manager import (
+    RunManager,
+    _drain_subagent_citation_queue,
+    _finish_subagent_citation_queue,
+)
 
 
 @pytest.mark.asyncio
@@ -161,8 +166,8 @@ async def test_drainer_skips_unknown_kinds() -> None:
 @pytest.mark.asyncio
 async def test_drainer_skips_subagent_dicts_with_unmappable_type() -> None:
     """Subagent SSE dicts that the cubeloop→AgentEvent translator can't map
-    (e.g. tool_call_delta, done) are silently dropped, mirroring
-    _drain_cubeloop_sse_queue's behavior for the main agent stream."""
+    (e.g. tool_call_delta, done) are silently dropped, matching the main
+    Session consumer's conversion behavior."""
     queue: asyncio.Queue[tuple[str, Any, Any] | None] = asyncio.Queue()
     published: list[Any] = []
 
@@ -180,3 +185,37 @@ async def test_drainer_skips_subagent_dicts_with_unmappable_type() -> None:
     assert len(published) == 1
     assert isinstance(published[0], TextDeltaEvent)
     assert published[0].data["content"] == "after"
+
+
+@pytest.mark.asyncio
+async def test_finish_queue_times_out_and_cancels_stopped_drainer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cubeplex.streams import run_manager
+
+    queue: asyncio.Queue[tuple[str, Any, Any] | None] = asyncio.Queue(maxsize=1)
+    queue.put_nowait(("subagent", "blocked", {}))
+    drainer = asyncio.create_task(asyncio.Event().wait())
+    monkeypatch.setattr(run_manager, "HOST_EVENT_ENQUEUE_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await _finish_subagent_citation_queue(queue, drainer)  # type: ignore[arg-type]
+
+    assert drainer.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_append_event_rejects_oversized_projected_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cubeplex.streams import execution_adapter
+
+    monkeypatch.setattr(execution_adapter, "MAX_EVENT_BYTES", 1)
+    manager = RunManager.__new__(RunManager)  # type: ignore[call-arg]
+
+    with pytest.raises(EventProjectionError, match="maximum projected event size"):
+        await manager._append_event(
+            "run-1",
+            "conversation-1",
+            TextDeltaEvent(timestamp="2026-09-15T00:00:00Z", data={"content": "large"}),
+        )

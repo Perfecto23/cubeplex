@@ -32,6 +32,10 @@ function parseAnswers(raw: string | null): ParsedAnswers {
   }
 }
 
+function questionAllowsCustom(question: AskQuestion): boolean {
+  return question.options?.some((opt) => opt.allow_input) ?? false
+}
+
 function selectedValues(value: unknown): Set<string> {
   if (Array.isArray(value)) return new Set(value.map(String))
   if (value === undefined || value === null) return new Set()
@@ -97,9 +101,11 @@ export function AskUserResolvedCard({ questions, resultContent }: AskUserResolve
         return (
           <div key={q.key} className="flex flex-col gap-1.5">
             <div className="text-sm font-medium text-foreground">{q.prompt}</div>
-            {q.options && q.options.length > 0 ? (
+            {q.options && q.options.length > 0 && !questionAllowsCustom(q) ? (
               <OptionsList question={q} answer={answer} hasAnswer={hasAnswer} />
             ) : (
+              // A custom answer is the typed string, which can equal another
+              // option's value. Showing that string avoids marking the wrong option.
               <FreeTextAnswer answer={answer} hasAnswer={hasAnswer} />
             )}
           </div>

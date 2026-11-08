@@ -81,6 +81,23 @@ class RemoteCheckpointer:
             raise ValueError("pending_request_invalid")
         return HitlRequest.model_validate(result)
 
+    async def clear_pending_request_if_matches(
+        self,
+        thread_id: str,
+        *,
+        question_id: str,
+        run_id: str,
+    ) -> bool:
+        if thread_id != self.thread_id:
+            raise ValueError("thread_id_mismatch")
+        result = await self.client.checkpoint(
+            "clear_pending_request_if_matches",
+            {"question_id": question_id, "run_id": run_id},
+        )
+        if not isinstance(result, bool):
+            raise ValueError("pending_clear_result_invalid")
+        return result
+
     async def load_pending(self, thread_id: str) -> tuple[HitlRequest, str | None] | None:
         if thread_id != self.thread_id:
             raise ValueError("thread_id_mismatch")

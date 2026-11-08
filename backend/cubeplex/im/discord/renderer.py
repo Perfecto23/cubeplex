@@ -40,10 +40,19 @@ class DiscordOpDispatcher:
 
     async def dispatch_create(self, state: Any) -> bool:
         s = self._state
-        text = s.card_state.streaming_content
-        if not text:
-            text = "..."
+        text = s.card_state.streaming_content or ""
         current_segment = text[self.sent_char_offset :]
+        if not current_segment:
+            # A resolved HITL clears card_id and parks the offset at the end
+            # of the prior text. The next ask arrives as create with nothing
+            # new to post; an empty send is rejected and the prompt is lost.
+            pending = s.card_state.pending_input
+            if pending is not None and pending.resolved_choice is None:
+                await self.dispatch_patch(state)
+                return False
+            if text:
+                return False
+            current_segment = "..."
         sealed_prefix = False
         if len(current_segment) > _SPLIT_THRESHOLD:
             split_at = find_split_point(current_segment, _SPLIT_THRESHOLD)
@@ -99,15 +108,24 @@ class DiscordOpDispatcher:
         s = self._state
         # Render AskUser/SandboxConfirm buttons when pending_input is set.
         pending = s.card_state.pending_input
-        pending_id = f"{pending.kind}:{pending.run_id}" if pending else None
+        # question_id keeps a later ask in the same run from being dropped.
+        pending_id = (
+            f"{pending.kind}:{pending.run_id}:{pending.question_id or ''}" if pending else None
+        )
         if (
             pending is not None
             and pending.resolved_choice is None
-            and pending.choices
             and pending_id != self._pending_input_sent_id
         ):
-            await self._send_pending_input_buttons(pending)
-            self._pending_input_sent_id = pending_id
+            if pending.choices:
+                await self._send_pending_input_buttons(pending)
+                self._pending_input_sent_id = pending_id
+            elif pending.needs_form():
+                # allow_input / free-text / multi-question cannot be buttons.
+                # ``question`` already includes the web-client notice.
+                text = pending.question or "_(请在 CubePlex 网页端继续。)_"
+                await self._connector.send_message(text)
+                self._pending_input_sent_id = pending_id
         # When the user answers a pending input, reset card state so the
         # follow-up reply appears as a NEW message below the buttons
         # instead of being edited into the old message above them.

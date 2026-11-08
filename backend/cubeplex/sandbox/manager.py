@@ -19,6 +19,8 @@ import asyncio
 import hashlib
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,21 +35,34 @@ from opensandbox.exceptions import (
     SandboxException as ProviderSandboxError,
 )
 from opensandbox.models.sandboxes import PVC, Volume
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlmodel import col
 
 from cubeplex.config import config
 from cubeplex.credentials.encryption import EncryptionBackend
 from cubeplex.models import EgressRef
+from cubeplex.models.background_task import BackgroundTask, TaskStopReason
+from cubeplex.models.sandbox_command import SandboxCommand
 from cubeplex.models.user_sandbox import UserSandbox
 from cubeplex.repositories.credential import CredentialRepository
 from cubeplex.repositories.egress_ref import EgressRefRepository
 from cubeplex.repositories.sandbox_env import SandboxEnvRepository
 from cubeplex.repositories.sandbox_policy import SandboxPolicyRepository
-from cubeplex.repositories.user_sandbox import UserSandboxRepository
-from cubeplex.sandbox.base import Sandbox, SandboxConflictError, SandboxError
+from cubeplex.repositories.user_sandbox import (
+    SandboxCleanupRequestedError,
+    UserSandboxRepository,
+)
+from cubeplex.sandbox.base import (
+    Sandbox,
+    SandboxConflictError,
+    SandboxError,
+    SandboxInstanceGoneError,
+)
 from cubeplex.sandbox.opensandbox import OpenSandbox
 from cubeplex.sandbox_env.injector import InjectionResult, SandboxEnvInjector
 from cubeplex.sandbox_policy.rules import build_network_policy
+from cubeplex.services.background_tasks import BackgroundTaskService
 from cubeplex.services.credential import CredentialService
 from cubeplex.services.sandbox_env import SANDBOX_ENV_KIND, ResolvedEnv, SandboxEnvResolver
 from cubeplex.services.sandbox_policy import EffectivePolicy, SandboxPolicyResolver
@@ -294,6 +309,75 @@ class SandboxManager:
             run_gid=self._run_gid,
             run_user=self._run_user,
         )
+
+    @asynccontextmanager
+    async def connect_command_instance(
+        self, *, command_id: str, org_id: str, workspace_id: str
+    ) -> AsyncIterator[Sandbox]:
+        """Attach only to the immutable instance recorded for a managed task."""
+        async with self._session_factory() as session:
+            command = (
+                await session.execute(
+                    select(SandboxCommand)
+                    .join(BackgroundTask, col(BackgroundTask.id) == col(SandboxCommand.task_id))
+                    .join(UserSandbox, col(UserSandbox.id) == col(SandboxCommand.user_sandbox_id))
+                    .where(
+                        col(SandboxCommand.id) == command_id,
+                        col(SandboxCommand.org_id) == org_id,
+                        col(SandboxCommand.workspace_id) == workspace_id,
+                        col(BackgroundTask.org_id) == org_id,
+                        col(BackgroundTask.workspace_id) == workspace_id,
+                        col(UserSandbox.org_id) == org_id,
+                        col(UserSandbox.workspace_id) == workspace_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if command is None:
+                raise LookupError("command not found")
+            instance_id, provider = command.sandbox_instance_id, command.provider
+        if not instance_id:
+            raise SandboxError("original command instance is unknown")
+        if provider != "opensandbox":
+            raise SandboxError(f"{provider} does not support cross-worker process reconnect")
+
+        control: opensandbox.SandboxManager | None = None
+        raw: opensandbox.Sandbox | None = None
+        try:
+            async with asyncio.timeout(10):
+                control = await opensandbox.SandboxManager.create(
+                    connection_config=self._build_connection_config(request_timeout=10)
+                )
+                try:
+                    info = await control.get_sandbox_info(instance_id)
+                except ProviderApiError as exc:
+                    if exc.status_code == 404:
+                        raise SandboxInstanceGoneError(instance_id) from exc
+                    raise
+                provider_state = info.status.state
+                if provider_state in ("Failed", "Terminated", "Succeed"):
+                    raise SandboxInstanceGoneError(instance_id)
+                if provider_state != "Running":
+                    raise SandboxError(f"original sandbox instance is {provider_state}")
+            # An endpoint/command 404 is not proof the instance itself is gone.
+            async with asyncio.timeout(10):
+                raw = await opensandbox.Sandbox.connect(
+                    instance_id,
+                    connection_config=self._build_connection_config(request_timeout=10),
+                    skip_health_check=True,
+                )
+            if raw.id != instance_id:
+                raise SandboxError("provider attached a different sandbox instance")
+            yield self._wrap_backend(raw)
+        except (ProviderSandboxError, TimeoutError) as exc:
+            raise SandboxError(f"could not observe original sandbox instance: {exc}") from exc
+        finally:
+            for client in (raw, control):
+                if client is not None:
+                    try:
+                        async with asyncio.timeout(5):
+                            await client.close()
+                    except Exception:
+                        logger.warning("failed to close command observer for {}", instance_id)
 
     async def _renew_provider_ttl(self, sandbox_id: str) -> None:
         """Best-effort extend the provider-side expiration so the OpenSandbox
@@ -821,6 +905,14 @@ class SandboxManager:
                 else:
                     await self._release_failed_provisioning(repo, record.id, is_revive)
             raise SandboxError(str(exc)) from exc
+        except SandboxCleanupRequestedError as exc:
+            if sandbox_id:
+                logger.warning(
+                    "Sandbox {} finished creating after cleanup was requested; "
+                    "the cleanup path owns that recorded instance",
+                    sandbox_id,
+                )
+            raise SandboxConflictError(str(exc)) from exc
         except Exception:
             if not promoted:
                 if sandbox_id:
@@ -1123,75 +1215,129 @@ class SandboxManager:
                 await repo.release_in_use(record.id)
 
     async def restart_user_sandbox(self, user_sandbox_id: str) -> None:
-        """User-initiated soft restart: kill the current container, keep the
-        row + PVC so the next ``get_or_create`` revives it in place.
-
-        Per-status semantics (spec §4.6):
-        - ``provisioning``                       -> ``SandboxConflictError``
-        - running / paused / pausing / resuming  -> atomic ``claim_for_kill``
-          (guards double-click) then ``_kill_record``
-        - terminated / failed / kill_pending     -> no-op (idempotent)
-
-        ``get_by_id_system`` is a cross-scope PK lookup (no org/ws context at
-        the call site); the row's own org/ws re-scope the repo for ``_kill_record``.
-        """
-        conn_config = self._build_connection_config()
-        async with self._session_factory() as session:
-            row = await UserSandboxRepository.get_by_id_system(session, user_sandbox_id)
-            if row is None or row.deleted_at is not None:
-                return
-            if row.status == "provisioning":
-                raise SandboxConflictError("sandbox is provisioning; retry shortly")
-            if row.status in ("running", "paused", "pausing", "resuming"):
-                repo = UserSandboxRepository(
-                    session, org_id=row.org_id, workspace_id=row.workspace_id
-                )
-                claimed = await repo.claim_for_kill(row.id)
-                if not claimed:
-                    return  # another restart already killing
-                await self._kill_record(session, repo, row, conn_config)
-            # terminated / failed / kill_pending: no-op (idempotent)
-            await session.commit()
-
-    async def delete_user_sandbox(self, user_sandbox_id: str) -> None:
-        """User-initiated hard delete: kill the container, soft-delete the row.
-        PVC is left as an orphan for operator cleanup. Kill failure does NOT
-        block soft-delete — user intent is clear and the row should disappear
-        regardless (spec §5.3).
-
-        ``claim_for_soft_delete`` is the atomic double-click guard and also
-        performs the soft-delete (it aliases ``soft_delete``); on a failed
-        claim we return idempotently.
-        """
+        """Request restart, fence new work, then stop the original instance."""
         conn_config = self._build_connection_config()
         async with self._session_factory() as session:
             row = await UserSandboxRepository.get_by_id_system(session, user_sandbox_id)
             if row is None or row.deleted_at is not None:
                 return
             repo = UserSandboxRepository(session, org_id=row.org_id, workspace_id=row.workspace_id)
-            claimed = await repo.claim_for_soft_delete(row.id)
-            if not claimed:
-                return  # another delete already soft-deleted
-            if row.sandbox_id:
-                try:
-                    await self._kill_record(session, repo, row, conn_config)
-                except Exception:
-                    logger.exception(
-                        "kill failed during delete of {}; soft-deleting anyway",
-                        user_sandbox_id,
-                    )
-            await session.commit()
-            logger.warning(
-                "UserSandbox {} soft-deleted; PVC {} is now orphan — operator "
-                "must `kubectl delete pvc` to reclaim storage",
-                user_sandbox_id,
-                build_sandbox_pvc_name(
-                    self._volume_pvc_prefix,
-                    row.workspace_id,
-                    row.scope_type,
-                    row.scope_id,
-                ),
+            requested_at = datetime.now(UTC)
+            if not await repo.request_cleanup(
+                row.id,
+                action="restart",
+                requested_at=requested_at,
+            ):
+                if row.status == "kill_pending" and row.cleanup_action == "delete":
+                    raise SandboxConflictError("sandbox deletion is already pending")
+                return
+            instance_id = self._cleanup_instance_id(row.sandbox_id)
+            if instance_id is None:
+                await self._finalize_cleanup_without_instance(
+                    repo,
+                    row,
+                    action="restart",
+                    now=requested_at,
+                )
+                return
+            await self._request_managed_task_stop(
+                row,
+                sandbox_instance_id=instance_id,
+                now=requested_at,
             )
+            await self._kill_record(
+                session,
+                repo,
+                row,
+                conn_config,
+                delete_on_success=False,
+            )
+
+    async def delete_user_sandbox(self, user_sandbox_id: str) -> None:
+        """Request deletion and hide the row only after provider cleanup."""
+        conn_config = self._build_connection_config()
+        async with self._session_factory() as session:
+            row = await UserSandboxRepository.get_by_id_system(session, user_sandbox_id)
+            if row is None or row.deleted_at is not None:
+                return
+            repo = UserSandboxRepository(session, org_id=row.org_id, workspace_id=row.workspace_id)
+            requested_at = datetime.now(UTC)
+            if not await repo.request_cleanup(
+                row.id,
+                action="delete",
+                requested_at=requested_at,
+            ):
+                return
+            instance_id = self._cleanup_instance_id(row.sandbox_id)
+            if instance_id is None:
+                await self._finalize_cleanup_without_instance(
+                    repo,
+                    row,
+                    action="delete",
+                    now=requested_at,
+                )
+                return
+            await self._request_managed_task_stop(
+                row,
+                sandbox_instance_id=instance_id,
+                now=requested_at,
+            )
+            await self._kill_record(
+                session,
+                repo,
+                row,
+                conn_config,
+                delete_on_success=True,
+            )
+
+    @staticmethod
+    def _cleanup_instance_id(sandbox_id: str | None) -> str | None:
+        if not sandbox_id or sandbox_id.startswith("pending-"):
+            return None
+        return sandbox_id
+
+    async def _finalize_cleanup_without_instance(
+        self,
+        repo: UserSandboxRepository,
+        row: UserSandbox,
+        *,
+        action: str,
+        now: datetime,
+    ) -> bool:
+        safe_without_provider = row.status in ("terminated", "failed")
+        if row.status == "kill_pending" and row.cleanup_requested_at is not None:
+            requested_at = row.cleanup_requested_at
+            if requested_at.tzinfo is None:
+                requested_at = requested_at.replace(tzinfo=UTC)
+            safe_without_provider = (now - requested_at).total_seconds() >= (
+                self._create_timeout + self._ready_timeout
+            )
+        if not safe_without_provider:
+            return False
+        await repo.mark_terminated(row.id, clear_sandbox_id=True)
+        if action == "delete":
+            await repo.soft_delete(row.id)
+        return True
+
+    async def _request_managed_task_stop(
+        self,
+        row: UserSandbox,
+        *,
+        sandbox_instance_id: str,
+        now: datetime,
+    ) -> None:
+        async with self._session_factory() as session:
+            await BackgroundTaskService(
+                session,
+                org_id=row.org_id,
+                workspace_id=row.workspace_id,
+            ).request_environment_stop(
+                user_sandbox_id=row.id,
+                sandbox_instance_id=sandbox_instance_id,
+                reason=TaskStopReason.user_stop,
+                now=now,
+            )
+            await session.commit()
 
     async def cleanup_expired(self) -> None:
         """Find and terminate sandboxes that exceeded their TTL.
@@ -1231,6 +1377,17 @@ class SandboxManager:
                     if current is None:
                         continue
                     record = current
+                    if (
+                        record.cleanup_action is not None
+                        and self._cleanup_instance_id(record.sandbox_id) is None
+                    ):
+                        await self._finalize_cleanup_without_instance(
+                            scoped_repo,
+                            record,
+                            action=record.cleanup_action,
+                            now=datetime.now(UTC),
+                        )
+                        continue
                     # A live create (fresh reserve or revive) is `provisioning`
                     # through Sandbox.create + check_ready. If ttl is shorter
                     # than that budget, the TTL filter still matches mid-create;
@@ -1766,6 +1923,8 @@ class SandboxManager:
         scoped_repo: UserSandboxRepository,
         record: UserSandbox,
         conn_config: ConnectionConfig,
+        *,
+        delete_on_success: bool = False,
     ) -> None:
         """Kill + revoke egress + mark terminated. Shared by cleanup_expired,
         pause_idle fallback, and reconciler paths.
@@ -1809,11 +1968,33 @@ class SandboxManager:
                         exc,
                     )
         if killed:
+            try:
+                from cubeplex.sandbox.command_coordinator import kill_sandbox_commands
+
+                async def _no_sandbox(_row: object) -> None:
+                    return None
+
+                await kill_sandbox_commands(session, record.id, get_sandbox=_no_sandbox)
+            except Exception:
+                logger.exception("failed to mark sandbox commands killed for {}", record.id)
             # clear_sandbox_id frees the provider id for reuse on the next
             # provision and matches the spec invariant (terminal rows carry
             # sandbox_id=None); the in-memory ``record.sandbox_id`` used for
             # revoke below is unaffected (mark_terminated mutates a fresh row).
             await scoped_repo.mark_terminated(record.id, clear_sandbox_id=True)
+            if delete_on_success or record.cleanup_action == "delete":
+                await scoped_repo.soft_delete(record.id)
+                logger.warning(
+                    "UserSandbox {} soft-deleted after provider cleanup; PVC {} is now "
+                    "orphaned for operator reclamation",
+                    record.id,
+                    build_sandbox_pvc_name(
+                        self._volume_pvc_prefix,
+                        record.workspace_id,
+                        record.scope_type,
+                        record.scope_id,
+                    ),
+                )
             if self._exchange_host and record.sandbox_id:
                 await self._revoke_egress(session, record.sandbox_id)
         else:
