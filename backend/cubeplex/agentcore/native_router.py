@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypedDict
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -103,7 +103,12 @@ def wrapped(result: Any) -> dict[str, Any]:
     return {"version": 1, "result": result}
 
 
-def stream_settings() -> dict[str, int]:
+class StreamSettings(TypedDict):
+    ttl_seconds: int
+    maxlen: int
+
+
+def stream_settings() -> StreamSettings:
     return {
         "ttl_seconds": int(config.get("streaming.run_event_ttl_seconds", 43200)),
         "maxlen": int(config.get("streaming.run_stream_max_events", 1000000)),
